@@ -1,5 +1,5 @@
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.1';
+const SCHEMA_VERSION = '1.2';
 
 async function withD1(env) {
   if (!env.DB) throw new Error('D1 binding DB is missing.');
@@ -114,21 +114,76 @@ class TextCollector {
 }
 
 async function fetchPage(url){
-  const r=await fetch(url,{headers:{'User-Agent':'OTB-Scout-AI/1.1 (+FPL research)','Accept':'text/html,application/xhtml+xml'},redirect:'follow'});
+  const r=await fetch(url,{headers:{'User-Agent':'OTB-Scout-AI/1.2 (+FPL research)','Accept':'text/html,application/xhtml+xml'},redirect:'follow'});
   if(!r.ok)throw new Error(`${url} returned HTTP ${r.status}`);
   const ct=r.headers.get('content-type')||'';
-  if(!ct.includes('text/html'))return {url:r.url,text:cleanText(await r.text()).slice(0,50000),links:[]};
+  if(!ct.includes('text/html'))return {url:r.url,text:cleanText(await r.text()).slice(0,50000),links:[],mode:'fetch'};
   const c=new TextCollector(r.url);
   await new HTMLRewriter()
     .on('title,h1,h2,h3,h4,p,li,time,a', {element:e=>c.element(e),text:t=>c.textChunk(t)})
     .transform(r).text();
-  return {url:r.url,text:cleanText(c.text.join(' ')).slice(0,65000),links:[...new Set(c.links)]};
+  return {url:r.url,text:cleanText(c.text.join(' ')).slice(0,65000),links:[...new Set(c.links)],mode:'fetch'};
+}
+
+async function quickActionJson(env,action,payload){
+  if(!env.BROWSER?.quickAction)throw new Error('Browser Run quickAction binding is unavailable.');
+  const response=await env.BROWSER.quickAction(action,payload);
+  if(!response?.ok)throw new Error(`Browser Run ${action} returned HTTP ${response?.status||'unknown'}`);
+  const data=await response.json();
+  if(data?.success===false)throw new Error(data?.errors?.[0]?.message||`Browser Run ${action} failed.`);
+  return data?.result ?? data;
+}
+
+async function browserLinks(env,url){
+  const result=await quickActionJson(env,'links',{url,visibleLinksOnly:false,gotoOptions:{waitUntil:'networkidle0',timeout:20000}});
+  return Array.isArray(result)?result:[];
+}
+
+async function browserMarkdown(env,url){
+  const result=await quickActionJson(env,'markdown',{url,gotoOptions:{waitUntil:'networkidle0',timeout:20000}});
+  const markdown=typeof result==='string'?result:(result?.markdown||result?.content||'');
+  return {url,text:cleanText(markdown).slice(0,65000),links:[],mode:'browser-markdown'};
+}
+
+async function discoverLanding(env,url){
+  const landing=await fetchPage(url);
+  let links=landing.links;
+  let mode='fetch';
+  if(links.length<4&&env.BROWSER?.quickAction){
+    try{
+      const rendered=await browserLinks(env,url);
+      if(rendered.length){links=[...new Set([...links,...rendered])];mode='browser-links'}
+    }catch(e){landing.browserError=e.message}
+  }
+  return {...landing,links,mode};
+}
+
+async function fetchArticle(env,url){
+  try{
+    const page=await fetchPage(url);
+    if(page.text.length>=900)return page;
+  }catch(e){
+    if(!env.BROWSER?.quickAction)throw e;
+  }
+  if(env.BROWSER?.quickAction)return browserMarkdown(env,url);
+  throw new Error(`${url} did not expose enough readable article text.`);
 }
 
 function likelyArticleLinks(base,links,limit){
-  const host=new URL(base).hostname;
-  const scored=links.map(url=>{let score=0;try{const u=new URL(url);if(u.hostname!==host)return {url,score:-99};const p=u.pathname.toLowerCase();if(/news|article|story|press|interview|team-news|transfer|sign|pre-season|preseason|match/.test(p))score+=4;if(/\/\d{4}\//.test(p)||p.split('/').filter(Boolean).length>=3)score+=2;if(/privacy|ticket|shop|account|login|video|gallery|women|academy/.test(p))score-=3}catch{score=-99}return{url,score}})
-    .filter(x=>x.score>0).sort((a,b)=>b.score-a.score);
+  const host=new URL(base).hostname.replace(/^www\./,'');
+  const currentYear=new Date().getUTCFullYear();
+  const scored=links.map((url,index)=>{let score=0;try{
+    const u=new URL(url);if(u.hostname.replace(/^www\./,'')!==host)return {url,score:-99};
+    const p=decodeURIComponent(u.pathname).toLowerCase();
+    if(/\/news\//.test(p))score+=7;
+    if(/article|story|press|interview|team-news|transfer|sign|pre-season|preseason|friendly|match-report|line-up|lineup/.test(p))score+=5;
+    if(new RegExp(`/${currentYear}/`).test(p))score+=5;
+    if(new RegExp(`/${currentYear-1}/`).test(p))score-=2;
+    const depth=p.split('/').filter(Boolean).length;if(depth>=4)score+=2;
+    if(/privacy|ticket|shop|account|login|video|gallery|women|academy|hospitality|commercial|foundation/.test(p))score-=5;
+    if(p==='/'||/\/news\/?$/.test(p))score-=6;
+  }catch{score=-99}return{url,score,index}})
+    .filter(x=>x.score>1).sort((a,b)=>b.score-a.score||a.index-b.index);
   return [...new Set(scored.map(x=>x.url))].slice(0,limit);
 }
 
@@ -158,23 +213,25 @@ async function aiExtract(env,team,clubName,players,documents,rosterDelta){
   const playerList=players.map(p=>`${p.name} [${p.fplPosition}]`).join(', ');
   const docs=documents.map((d,i)=>`SOURCE ${i+1}: ${d.url}\n${d.text.slice(0,12000)}`).join('\n\n');
   const prompt=`You are the OTB football role-intelligence extractor. Analyse only the supplied official-club text and FPL roster evidence for ${clubName} (${team}).
-Return structured events that can change EXPECTED MINUTES for players registered in FPL.
+Return only current, source-grounded structured events that can materially change EXPECTED MINUTES for players registered in FPL.
 
 CURRENT FPL PLAYERS: ${playerList}
 ROSTER ADDED: ${rosterDelta.added.map(p=>p.name).join(', ')||'none'}
 ROSTER MISSING SINCE LAST SNAPSHOT: ${rosterDelta.missing.map(p=>p.name).join(', ')||'none'}
 
 RULES:
-- Use observed_role when a named FPL player is reported or listed as starting/playing in a tactical role, including out-of-position use.
+- Use observed_role when a named CURRENT FPL player is explicitly reported, quoted, or shown in a lineup as starting/playing in a tactical role, including out-of-position use. Repeated recent lineup evidence should be stronger than a single mention.
 - Use departure/signing/injury/return for a competitor event and name the FPL player(s) whose minutes are likely affected.
 - Use manager_positive/manager_negative only for direct role/minutes language.
 - affected MUST exactly match one CURRENT FPL player name from the list.
 - role is the football role involved, not the FPL position.
 - Do not infer a transfer from roster absence alone. Roster absence is unresolved unless official text confirms it.
-- Ignore vague rumours, fan opinion, historical stories and unrelated teams.
+- Ignore vague rumours, fan opinion, historical stories, academy-only evidence, unrelated teams, and material older than 120 days unless it confirms a still-current transfer or injury status.
+- A player's FPL position is not his football role. A DEF may legitimately be observed at RW, LW, AM or ST.
+- For departure/injury events, affected is the beneficiary. For signing/return events, affected is the threatened incumbent. Do not apply an injury event to the injured player himself.
 - Confirmed official statements: confidence 0.9-1.0. Repeated official preseason lineup evidence: 0.70-0.90. One ambiguous mention: <=0.55.
 - overlap measures direct role competition. hierarchy measures expected selection strength of subject/role evidence.
-- Include a concise reason and the exact source URL.
+- Include a concise reason citing the concrete evidence (for example: started two consecutive friendlies at RW, manager named him first choice, competitor signed). Include the exact source URL and an ISO evidenceDate when available.
 - Return no event when evidence is insufficient.
 
 OFFICIAL MATERIAL:\n${docs}`;
@@ -189,9 +246,11 @@ OFFICIAL MATERIAL:\n${docs}`;
 }
 
 function validateEvents(team,players,events){
-  const byName=new Map(players.map(p=>[normal(p.name),p]));const out=[];
+  const byName=new Map;for(const p of players){byName.set(normal(p.name),p);byName.set(normal(p.fullName),p)}const out=[];
   for(const e of events||[]){const p=byName.get(normal(e.affected));if(!p||!EVENT_VALUES.has(e.type)||!ROLE_VALUES.has(e.role))continue;
     const source=String(e.source||'');if(!/^https?:\/\//i.test(source))continue;
+    if(e.type==='injury'&&normal(e.subject)===normal(p.name))continue;
+    const evidenceTime=Date.parse(e.evidenceDate||'');if(Number.isFinite(evidenceTime)&&Date.now()-evidenceTime>120*86400000&&!['departure','signing'].includes(e.type))continue;
     out.push({id:`auto-${hashString([team,e.type,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:e.type,subject:cleanText(e.subject).slice(0,120),role:e.role,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate:cleanText(e.evidenceDate).slice(0,40),auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
   }
   const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),normal(e.affected),e.role,e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
@@ -204,11 +263,18 @@ async function scanTeam(env,team,{force=false}={}){
     const cached=await env.ROLE_KV.get(cacheKey,'json');
     if(cached)return {...cached,cache:'HIT'};
   }
-  const roster=await fplContext(env,team);const max=Math.max(2,Math.min(12,Number(env.MAX_ARTICLES_PER_SCAN)||8));const documents=[];const errors=[];
-  for(const source of club.urls){try{const landing=await fetchPage(source);documents.push({url:landing.url,text:landing.text.slice(0,16000)});const links=likelyArticleLinks(landing.url,landing.links,max);for(const url of links){try{documents.push(await fetchPage(url))}catch(e){errors.push(e.message)}}}catch(e){errors.push(e.message)}}
-  const raw=await aiExtract(env,team,club.name,roster.current.players,documents,roster);
+  const roster=await fplContext(env,team);const max=Math.max(3,Math.min(12,Number(env.MAX_ARTICLES_PER_SCAN)||8));const documents=[];const errors=[];const discovery=[];
+  for(const source of club.urls){try{
+    const landing=await discoverLanding(env,source);
+    discovery.push({source:landing.url,mode:landing.mode,linksFound:landing.links.length,browserError:landing.browserError||null});
+    documents.push({url:landing.url,text:landing.text.slice(0,16000),mode:landing.mode});
+    const links=likelyArticleLinks(landing.url,landing.links,max);
+    for(const url of links){try{documents.push(await fetchArticle(env,url))}catch(e){errors.push(e.message)}}
+  }catch(e){errors.push(e.message)}}
+  const useful=documents.filter(d=>d.text&&d.text.length>=250);
+  const raw=useful.length?await aiExtract(env,team,club.name,roster.current.players,useful,roster):[];
   const events=validateEvents(team,roster.current.players,raw);
-  const payload={status:'ok',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',team,club:club.name,generatedAt:new Date().toISOString(),cache:'MISS',sourcesScanned:documents.map(d=>d.url),sourceErrors:errors.slice(0,10),roster:{players:roster.current.players.length,added:roster.added.map(p=>p.name),missingUnresolved:roster.missing.map(p=>p.name)},events};
+  const payload={status:'ok',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',team,club:club.name,generatedAt:new Date().toISOString(),cache:'MISS',sourcesScanned:useful.map(d=>d.url),sourceErrors:errors.slice(0,10),diagnostics:{discovery,documentsRead:useful.length,browserFallbackUsed:useful.some(d=>String(d.mode||'').startsWith('browser')),rawEvents:Array.isArray(raw)?raw.length:0,acceptedEvents:events.length},roster:{players:roster.current.players.length,added:roster.added.map(p=>p.name),missingUnresolved:roster.missing.map(p=>p.name)},events};
   await env.ROLE_KV.put(cacheKey,JSON.stringify(payload),{expirationTtl:60*60*24*14});return payload;
 }
 
@@ -253,6 +319,10 @@ export default {
         return json(await scanTeam(env,body.team,{force:true}),200,env);
       }
       if(u.pathname==='/api/role-latest')return json({status:'ok',generatedAt:new Date().toISOString(),teams:await allLatest(env)},200,env);
+      if(u.pathname==='/api/scout/diagnostics'){
+        const team=String(u.searchParams.get('team')||'').toUpperCase();if(!team)return json({error:'team is required'},400,env);
+        const report=await env.ROLE_KV.get(`latest:${team}`,'json');return json({status:'ok',team,report:report||null},200,env);
+      }
       return json({error:'not found'},404,env);
     }catch(e){return json({status:'error',error:e?.message||String(e),generatedAt:new Date().toISOString()},500,env)}
   },
