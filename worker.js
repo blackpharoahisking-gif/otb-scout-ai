@@ -14,13 +14,15 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.3';
+const SCHEMA_VERSION = '1.4';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
 const LANDING_MIN_CHARS = 800;     // below this, the landing page is a JS shell
-const DEFAULT_BROWSER_BUDGET = 5;  // max Browser Run calls per scan
+const DEFAULT_BROWSER_BUDGET = 3;  // max Browser Run calls per scan (see notes: free tier = 3 new instances/min)
+const DEFAULT_BROWSER_SPACING_MS = 2500; // Browser Run enforces a per-second fill rate, not a burst allowance
 const DEFAULT_SCAN_BUDGET_MS = 45000;
+const ARTICLE_CACHE_DAYS = 45;     // articles are immutable; render each URL at most once
 
 /* ---------------------------------------------------------------- storage */
 
@@ -138,13 +140,31 @@ function hostOf(url){try{return new URL(url).hostname.replace(/^www\./,'')}catch
 function makeBudget(env){
   const started=Date.now();
   const deadline=started+Math.max(10000,Number(env.SCAN_BUDGET_MS)||DEFAULT_SCAN_BUDGET_MS);
-  let browserCalls=0;
+  const spacing=Math.max(0,Number(env.BROWSER_MIN_SPACING_MS ?? DEFAULT_BROWSER_SPACING_MS));
   const browserMax=Math.max(0,Number(env.BROWSER_BUDGET ?? DEFAULT_BROWSER_BUDGET));
+  let browserCalls=0,lastCallAt=0,quotaExhausted=false,rateLimitHits=0;
   return {
     expired(){return Date.now()>=deadline},
-    canBrowse(env2){return !!env2?.BROWSER?.quickAction && browserCalls<browserMax && !this.expired()},
-    spendBrowser(){browserCalls++},
+    remainingMs(){return Math.max(0,deadline-Date.now())},
+    canBrowse(env2){
+      if(quotaExhausted)return false;
+      if(!env2?.BROWSER?.quickAction)return false;
+      if(browserCalls>=browserMax)return false;
+      return !this.expired();
+    },
+    /** Browser Run bills a per-second fill rate; back-to-back calls return 429. */
+    async pace(){
+      if(!lastCallAt||!spacing)return;
+      const wait=Math.min(spacing-(Date.now()-lastCallAt),this.remainingMs());
+      if(wait>0)await new Promise(r=>setTimeout(r,wait));
+    },
+    spendBrowser(){browserCalls++;lastCallAt=Date.now()},
+    noteRateLimit(){rateLimitHits++},
+    markQuotaExhausted(){quotaExhausted=true},
+    get quotaExhausted(){return quotaExhausted},
+    get rateLimitHits(){return rateLimitHits},
     get browserCalls(){return browserCalls},
+    get browserMax(){return browserMax},
     get elapsedMs(){return Date.now()-started}
   };
 }
@@ -199,16 +219,44 @@ async function fetchPage(url){
 async function quickActionJson(env,action,payload){
   if(!env.BROWSER?.quickAction)throw new Error('Browser Run quickAction binding is unavailable.');
   const response=await env.BROWSER.quickAction(action,payload);
-  // quickAction resolves to a Response.
   if(response && typeof response.json==='function'){
-    if(!response.ok)throw new Error(`Browser Run ${action} returned HTTP ${response.status||'unknown'}`);
+    if(!response.ok){
+      let body='';try{body=cleanText(await response.text()).slice(0,240)}catch{}
+      const err=new Error(`Browser Run ${action} returned HTTP ${response.status}${body?`: ${body}`:''}`);
+      err.status=response.status;
+      // Two very different 429s: the daily browser-time cap (Workers Free is
+      // 10 minutes/day, resets at UTC midnight) versus the per-minute instance
+      // fill rate. The first means stop; the second means slow down.
+      err.quotaExhausted=response.status===429&&/time limit|exceeded for today|daily|per day/i.test(body);
+      err.rateLimited=response.status===429&&!err.quotaExhausted;
+      throw err;
+    }
     const data=await response.json();
     if(data?.success===false)throw new Error(data?.errors?.[0]?.message||`Browser Run ${action} failed.`);
     return data?.result ?? data;
   }
-  // Defensive: tolerate a plain object if the binding shape ever changes.
   if(response?.success===false)throw new Error(response?.errors?.[0]?.message||`Browser Run ${action} failed.`);
   return response?.result ?? response;
+}
+
+/** Paces calls, retries once on a rate-limit 429, and stops dead on a quota 429. */
+async function browserCall(env,budget,action,payload){
+  for(let attempt=0;attempt<2;attempt++){
+    await budget.pace();
+    budget.spendBrowser();
+    try{
+      return await quickActionJson(env,action,payload);
+    }catch(e){
+      if(e.quotaExhausted){budget.markQuotaExhausted();throw e}
+      if(e.rateLimited&&attempt===0&&budget.remainingMs()>8000){
+        budget.noteRateLimit();
+        await new Promise(r=>setTimeout(r,Math.min(5000,budget.remainingMs()-2000)));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error(`Browser Run ${action} failed after retry.`);
 }
 
 const GOTO = {waitUntil:'networkidle2',timeout:15000};
@@ -231,8 +279,7 @@ function normaliseLinks(result,base){
  * JS-rendered landing page could gain links but never gain text.
  */
 async function browserRender(env,url,budget){
-  budget.spendBrowser();
-  const html=await quickActionJson(env,'content',{url,gotoOptions:GOTO});
+  const html=await browserCall(env,budget,'content',{url,gotoOptions:GOTO});
   const markup=typeof html==='string'?html:(html?.content||html?.html||'');
   if(!markup)throw new Error('Browser Run content returned no markup.');
   const response=new Response(markup,{headers:{'content-type':'text/html; charset=utf-8'}});
@@ -241,10 +288,34 @@ async function browserRender(env,url,budget){
 }
 
 async function browserMarkdown(env,url,budget){
-  budget.spendBrowser();
-  const result=await quickActionJson(env,'markdown',{url,gotoOptions:GOTO});
+  const result=await browserCall(env,budget,'markdown',{url,gotoOptions:GOTO});
   const markdown=typeof result==='string'?result:(result?.markdown||result?.content||'');
   return {url,text:cleanText(markdown).slice(0,65000),links:[],mode:'browser-markdown',status:200,redirected:false};
+}
+
+/* --------------------------------------------------------- article cache */
+// News articles are immutable once published. Rendering the same URL on every
+// scan is what burns the Browser Run allowance: a club's news index shows the
+// same eight stories for days. Caching the extracted text means each article is
+// rendered at most once, ever, and a warm scan spends near-zero browser time.
+
+function articleKey(url){return `article:${hashString(url)}`}
+
+async function cachedArticle(env,url){
+  try{
+    const hit=await env.ROLE_KV.get(articleKey(url),'json');
+    if(hit?.text&&hit.text.length>=AI_MIN_DOC_CHARS)return hit;
+  }catch{}
+  return null;
+}
+
+async function storeArticle(env,url,doc){
+  if(!doc?.text||doc.text.length<AI_MIN_DOC_CHARS)return;
+  try{
+    await env.ROLE_KV.put(articleKey(url),JSON.stringify({
+      url,text:doc.text,mode:doc.mode,fetchedAt:new Date().toISOString()
+    }),{expirationTtl:60*60*24*ARTICLE_CACHE_DAYS});
+  }catch{}
 }
 
 /* ----------------------------------------------------- link candidate scoring */
@@ -351,9 +422,11 @@ async function discoverLanding(env,url,budget){
         record.browserError=e?.message||String(e);
       }
     }else{
-      record.browserError=env.BROWSER?.quickAction
-        ? 'browser budget exhausted'
-        : 'Browser Run binding unavailable';
+      record.browserError=!env.BROWSER?.quickAction
+        ? 'Browser Run binding unavailable'
+        : (budget.quotaExhausted
+            ? 'Browser Run daily allowance exhausted'
+            : 'per-scan browser budget reached');
     }
   }
 
@@ -364,9 +437,18 @@ async function discoverLanding(env,url,budget){
 /* ---------------------------------------------------------- article reading */
 
 async function readArticle(env,url,budget){
-  const entry={url,status:'pending',mode:null,chars:0,httpStatus:null,error:null,browserUsed:false};
+  const entry={url,status:'pending',mode:null,chars:0,httpStatus:null,error:null,browserUsed:false,cached:false};
+
+  // 1. Cache. Costs nothing and is the reason a warm scan needs no browser.
+  const hit=await cachedArticle(env,url);
+  if(hit){
+    entry.status='cached';entry.mode=hit.mode||'cache';entry.chars=hit.text.length;entry.cached=true;
+    return {doc:{url,text:hit.text,mode:'cache',status:200},entry};
+  }
+
   let page=null;
 
+  // 2. Plain fetch. No browser time, and some clubs are server-rendered.
   try{
     page=await fetchPage(url);
     entry.httpStatus=page.status;
@@ -374,6 +456,7 @@ async function readArticle(env,url,budget){
     entry.chars=page.text.length;
     if(page.text.length>=ARTICLE_MIN_CHARS){
       entry.status='accepted';
+      await storeArticle(env,url,page);
       return {doc:page,entry};
     }
     entry.status='thin';
@@ -383,6 +466,7 @@ async function readArticle(env,url,budget){
     entry.status=e.kind==='blocked'?'blocked':'fetch-error';
   }
 
+  // 3. Browser render, if the allowance permits.
   if(budget.canBrowse(env)){
     try{
       const rendered=await browserMarkdown(env,url,budget);
@@ -391,22 +475,38 @@ async function readArticle(env,url,budget){
       entry.chars=rendered.text.length;
       if(rendered.text.length>=AI_MIN_DOC_CHARS){
         entry.status='accepted-browser';
+        await storeArticle(env,url,rendered);
         return {doc:rendered,entry};
       }
       entry.status='too-short';
       return {doc:rendered.text?rendered:null,entry};
     }catch(e){
-      entry.status='browser-error';
+      entry.browserUsed=true;
+      entry.status=e.quotaExhausted?'browser-quota-exhausted':(e.rateLimited?'browser-rate-limited':'browser-error');
       entry.error=[entry.error,e?.message||String(e)].filter(Boolean).join(' | ');
       return {doc:page&&page.text?page:null,entry};
     }
   }
 
-  if(entry.status==='thin'){
-    entry.status = page.text.length>=AI_MIN_DOC_CHARS ? 'accepted-thin' : 'too-short';
-    return {doc:page.text?page:null,entry};
+  // 4. No browser available. Say WHY — a silent 'too-short' hides a quota wall.
+  if(!env.BROWSER?.quickAction){
+    entry.status='deferred-no-browser';
+    entry.error=entry.error||'Browser Run binding unavailable';
+  }else if(budget.quotaExhausted){
+    entry.status='deferred-browser-quota';
+    entry.error=entry.error||'Browser Run daily allowance exhausted; this URL will be retried on a later scan';
+  }else if(budget.expired()){
+    entry.status='deferred-time-budget';
+    entry.error=entry.error||'scan time budget reached; this URL will be retried on a later scan';
+  }else{
+    entry.status='deferred-browser-budget';
+    entry.error=entry.error||`per-scan browser budget of ${budget.browserMax} reached; this URL will be retried on a later scan`;
   }
-  if(!entry.error)entry.error='no browser fallback available';
+
+  if(page&&page.text&&page.text.length>=AI_MIN_DOC_CHARS){
+    entry.status='accepted-thin';
+    return {doc:page,entry};
+  }
   return {doc:null,entry};
 }
 
@@ -559,11 +659,14 @@ async function scanTeam(env,team,{force=false}={}){
         for(const r of rejected.slice(0,10))perUrl.push({url:r.url,status:r.status,kind:'article',score:r.score,chars:0});
       }
 
-      for(const url of candidates){
-        if(budget.expired()){
-          perUrl.push({url,status:'skipped-budget',kind:'article',chars:0});
-          continue;
-        }
+      // Cached articles cost nothing, so read them before spending any budget.
+      const cacheHits=await Promise.all(candidates.map(u=>cachedArticle(env,u)));
+      const ordered=[
+        ...candidates.filter((u,i)=>cacheHits[i]),
+        ...candidates.filter((u,i)=>!cacheHits[i])
+      ];
+
+      for(const url of ordered){
         attempted++;
         const {doc,entry}=await readArticle(env,url,budget);
         perUrl.push({...entry,kind:'article'});
@@ -588,20 +691,23 @@ async function scanTeam(env,team,{force=false}={}){
   const browserFallbackUsed=perUrl.some(x=>x.browserUsed)||discovery.some(d=>d.browserUsed);
 
   // ---- Evidence authority -------------------------------------------------
-  // A scan is AUTHORITATIVE only if it actually read at least one article
-  // document. An authoritative scan that finds nothing legitimately clears the
-  // club's evidence. A NON-authoritative scan (every source blocked, JS shell
-  // unrendered, budget exhausted) must not be allowed to erase good evidence,
-  // so the last known-good events are carried forward until they age out.
-  const evidenceAuthoritative=articleDocs.length>0;
+  // A scan is AUTHORITATIVE only if it read a meaningful share of the articles
+  // it set out to read. Reading 1 of 8 because the browser allowance ran out is
+  // NOT grounds for clearing evidence that an earlier full scan gathered.
+  const coverage=attempted?articleDocs.length/attempted:0;
+  const evidenceAuthoritative=articleDocs.length>0
+    && !budget.quotaExhausted
+    && (articleDocs.length>=3 || coverage>=0.5);
   const maxCarryMs=Math.max(1,Number(env.MAX_CARRY_DAYS)||7)*86400000;
 
   let finalEvents=events;
   let evidenceGeneratedAt=new Date().toISOString();
   let evidenceCarriedForward=false;
   let evidenceNote=evidenceAuthoritative
-    ? `Evidence derived from ${articleDocs.length} article document(s) read in this scan.`
-    : 'This scan read no article documents.';
+    ? `Evidence derived from ${articleDocs.length} of ${attempted} article document(s) read in this scan.`
+    : (budget.quotaExhausted
+        ? 'The Browser Run daily allowance was exhausted during this scan, so coverage was incomplete.'
+        : `This scan read only ${articleDocs.length} of ${attempted} article document(s).`);
 
   if(!evidenceAuthoritative){
     const prior=await env.ROLE_KV.get(cacheKey,'json');
@@ -626,12 +732,12 @@ async function scanTeam(env,team,{force=false}={}){
       evidenceCarriedForward=true;
       const ageDays=Math.floor((Date.now()-anchor)/86400000);
       const dropped=priorEvents.length-stillValid.length;
-      evidenceNote=`This scan read no article documents, so ${stillValid.length} evidence item(s) from ${ageDays} day(s) ago were retained rather than cleared`
+      evidenceNote=`Coverage was incomplete, so ${stillValid.length} evidence item(s) from ${ageDays} day(s) ago were retained rather than cleared`
         +(dropped?`; ${dropped} were dropped because the player is no longer in the club's FPL roster.`:'.');
     }else if(priorEvents.length){
       evidenceNote=withinCarryWindow
-        ? 'This scan read no article documents, and no previous evidence remained valid against the current roster.'
-        : 'This scan read no article documents, and the previous evidence has aged out of the carry-forward window.';
+        ? 'Coverage was incomplete, and no previous evidence remained valid against the current roster.'
+        : 'Coverage was incomplete, and the previous evidence has aged out of the carry-forward window.';
     }
   }
 
@@ -663,6 +769,11 @@ async function scanTeam(env,team,{force=false}={}){
       articleDocuments:articleDocs.length,
       browserFallbackUsed,
       browserCalls:budget.browserCalls,
+      browserBudget:budget.browserMax,
+      browserRateLimitHits:budget.rateLimitHits,
+      browserQuotaExhausted:budget.quotaExhausted,
+      cacheHits:perUrl.filter(x=>x.cached).length,
+      coverage:Number(coverage.toFixed(2)),
       browserAvailable:!!env.BROWSER?.quickAction,
       elapsedMs:budget.elapsedMs,
       budgetExpired:budget.expired(),
@@ -744,6 +855,6 @@ export default {
   },
   async scheduled(event,env,ctx){
     env = await withD1(env);
-    ctx.waitUntil((async()=>{const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.max(1,Math.min(4,Number(env.CRON_TEAMS_PER_RUN)||2));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeam(env,team,{force:true})}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
+    ctx.waitUntil((async()=>{const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.max(1,Math.min(4,Number(env.CRON_TEAMS_PER_RUN)||1));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeam(env,team,{force:true})}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
   }
 };
