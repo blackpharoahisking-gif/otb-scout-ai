@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.5.2';
+const SCHEMA_VERSION = '1.7';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -64,6 +64,13 @@ async function withD1(env) {
       }
 
       return row.value;
+    },
+
+    async list(prefix) {
+      const { results } = await env.DB.prepare(
+        'SELECT key FROM otb_store WHERE key LIKE ? LIMIT 5000'
+      ).bind(String(prefix) + '%').all();
+      return (results || []).map(r => r.key);
     },
 
     async put(key, value, options = {}) {
@@ -402,6 +409,16 @@ function scoreLink(url,host,currentYear){
   const depth=p.split('/').filter(Boolean).length;
   if(depth>=4)score+=2;
   if(depth>=2)score+=1;
+  if(/press-conference|injury-update|starting-xi|confirmed-line-up|team-news|squad-news/.test(p))score+=4;
+  // Listings, TV guides, fixture lists and highlight reels rank highly on the
+  // old keyword rules (/news/ +7, "pre-season" +5) but contain no selection
+  // evidence. A "how to watch" page outranking a match report is why the
+  // extractor was handed goalscoring instead of team news.
+  // Tier 1: pages that structurally cannot contain selection evidence.
+  // Penalty is heavy enough to push them below the acceptance threshold.
+  if(/how-to-watch|watch-live|live-stream|tv-guide|broadcast|listen-live|quiz|competition-|matchday-guide|where-to-watch/.test(p))score-=12;
+  // Tier 2: sometimes carries a lineup mention, so demoted rather than rejected.
+  if(/preview|fixtures|highlights|\/watch-|watch--|match-gallery|photos/.test(p))score-=8;
   if(/privacy|cookie|terms|ticket|shop|store|account|login|register|video|gallery|women|academy|hospitality|commercial|foundation|sitemap|contact/.test(p))score-=6;
   if(p==='/'||/\/news\/?$/.test(p))score-=8;
   return {score,reason:score>1?'candidate':'low-score',depth};
@@ -586,16 +603,17 @@ async function fplContext(env,team){
   const data=await r.json();const teamRow=(data.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
   if(!teamRow)throw new Error(`Club ${team} is not present in the current FPL bootstrap.`);
   const pos=Object.fromEntries((data.element_types||[]).map(x=>[x.id,x.singular_name_short]));
+  const currentRound=Number((data.events||[]).find(e=>e.is_current)?.id)||Number((data.events||[]).filter(e=>e.finished).pop()?.id)||0;
   const players=(data.elements||[]).filter(p=>p.team===teamRow.id).map(p=>({id:p.id,name:p.web_name,fullName:`${p.first_name||''} ${p.second_name||''}`.trim(),fplPosition:pos[p.element_type]||'',status:p.status,chance:p.chance_of_playing_next_round,news:p.news||'',price:(p.now_cost||0)/10,minutes:p.minutes||0,starts:p.starts||0}));
   const key=`roster:${team}`;let previous=null;try{previous=JSON.parse(await env.ROLE_KV.get(key)||'null')}catch{}
-  const current={team,teamName:teamRow.name,fetchedAt:new Date().toISOString(),players};
+  const current={team,teamName:teamRow.name,fetchedAt:new Date().toISOString(),currentRound,players};
   await env.ROLE_KV.put(key,JSON.stringify(current),{expirationTtl:60*60*24*120});
   const oldNames=new Set((previous?.players||[]).map(p=>normal(p.fullName||p.name))),newNames=new Set(players.map(p=>normal(p.fullName||p.name)));
   // With no previous snapshot there is nothing to diff against. Reporting the
   // entire squad as "added" is false, and worse, it enters the model prompt as
   // ROSTER ADDED and biases extraction toward signing events.
-  if(!previous)return {current,previous:null,added:[],missing:[]};
-  return {current,previous,added:players.filter(p=>!oldNames.has(normal(p.fullName||p.name))),missing:(previous?.players||[]).filter(p=>!newNames.has(normal(p.fullName||p.name)))};
+  if(!previous)return {current,previous:null,added:[],missing:[],currentRound};
+  return {current,previous,currentRound,added:players.filter(p=>!oldNames.has(normal(p.fullName||p.name))),missing:(previous?.players||[]).filter(p=>!newNames.has(normal(p.fullName||p.name)))};
 }
 
 /* ------------------------------------------------------------- extraction */
@@ -620,7 +638,9 @@ ROSTER ADDED: ${rosterDelta.added.map(p=>p.name).join(', ')||'none'}
 ROSTER MISSING SINCE LAST SNAPSHOT: ${rosterDelta.missing.map(p=>p.name).join(', ')||'none'}
 
 RULES:
-- Use observed_role when a named CURRENT FPL player is explicitly reported, quoted, or shown in a lineup as starting/playing in a tactical role, including out-of-position use. Repeated recent lineup evidence should be stronger than a single mention.
+- Use observed_role ONLY for SELECTION or MINUTES language: started, named in the starting XI, played 90 minutes, was deployed at, lined up at, first choice, kept his place, benched, rested, substituted on/off, came off after X minutes. Repeated recent lineup evidence should be stronger than a single mention.
+- GOALS, ASSISTS, AND PERFORMANCE QUALITY ARE NOT ROLE EVIDENCE. A player scoring, assisting, playing well, or being praised for a performance tells you nothing about expected minutes on its own. A substitute who scores must NOT produce an observed_role event. Only create an event from a goal or performance mention if the SAME text also states that the player started, or states the position he played in.
+- Fixture lists, TV and "how to watch" guides, ticket news, kit launches, competition or quiz pages, and community or commercial stories contain no role evidence. Return no event from them even if current FPL players are named.
 - Use departure/signing/injury/return for a competitor event and name the FPL player(s) whose minutes are likely affected.
 - Use manager_positive/manager_negative only for direct role/minutes language.
 - affected MUST exactly match one CURRENT FPL player name from the list.
@@ -661,7 +681,115 @@ function validateEvents(team,players,events,allowedSources){
   const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),normal(e.affected),e.role,e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
 }
 
-/* ------------------------------------------------------------------- scan */
+/* ---------------------------------------------------- calibration ledger */
+// The log-odds coefficients in the frontend (observed_role +1.0, signing -1.2,
+// and so on) are PRIORS. They can only become measurements by comparing what an
+// event predicted against what the player actually did afterwards.
+//
+// One row is written per accepted event, capturing the player's cumulative
+// minutes and starts AT THE MOMENT the event fired. After CALIB_WINDOW_ROUNDS
+// gameweeks the row is resolved by diffing against the current bootstrap. The
+// result is a dataset you can fit directly:
+//     started ~ logit(p0) + type x (overlap . hierarchy . confidence)
+
+const CALIB_WINDOW_ROUNDS = 2;
+const CALIB_TTL_DAYS = 400;
+
+function calibKey(id){return `calib:${id}`}
+
+async function recordCalibrationRows(env,team,events,roster){
+  const round=Number(roster.currentRound)||0;
+  const byId=new Map(roster.current.players.map(p=>[p.id,p]));
+  for(const e of events){
+    try{
+      if(await env.ROLE_KV.get(calibKey(e.id),'json'))continue;   // already logged
+      const p=byId.get(e.affectedApiId);
+      if(!p)continue;
+      await env.ROLE_KV.put(calibKey(e.id),JSON.stringify({
+        eventId:e.id,team,type:e.type,role:e.role,
+        subject:e.subject,affected:e.affected,affectedApiId:e.affectedApiId,
+        overlap:e.overlap,hierarchy:e.hierarchy,confidence:e.confidence,
+        strength:Number((e.overlap*e.hierarchy*e.confidence).toFixed(4)),
+        source:e.source,evidenceDate:e.evidenceDate,
+        recordedAt:new Date().toISOString(),
+        roundAtEvent:round,
+        minutesAtEvent:p.minutes,startsAtEvent:p.starts,
+        fplPositionAtEvent:p.fplPosition,
+        resolved:false
+      }),{expirationTtl:60*60*24*CALIB_TTL_DAYS});
+    }catch{}
+  }
+}
+
+/** Diffs due rows against the live bootstrap and writes the observed outcome. */
+async function resolveCalibration(env,{limit=200}={}){
+  const r=await fetch(FPL_BOOTSTRAP,{headers:{Accept:'application/json'}});
+  if(!r.ok)throw new Error(`FPL bootstrap HTTP ${r.status}`);
+  const data=await r.json();
+  const round=Number((data.events||[]).find(e=>e.is_current)?.id)
+    ||Number((data.events||[]).filter(e=>e.finished).pop()?.id)||0;
+  const live=new Map((data.elements||[]).map(p=>[p.id,p]));
+
+  const keys=(await env.ROLE_KV.list('calib:')).slice(0,limit);
+  let resolved=0,pending=0,missing=0;
+
+  for(const key of keys){
+    const row=await env.ROLE_KV.get(key,'json');
+    if(!row||row.resolved){continue}
+    const elapsed=round-Number(row.roundAtEvent||0);
+    if(elapsed<CALIB_WINDOW_ROUNDS){pending++;continue}
+    const p=live.get(row.affectedApiId);
+    if(!p){missing++;continue}
+
+    const startsAfter=Math.max(0,(p.starts||0)-(row.startsAtEvent||0));
+    const minutesAfter=Math.max(0,(p.minutes||0)-(row.minutesAtEvent||0));
+    const out={...row,
+      resolved:true,
+      resolvedAt:new Date().toISOString(),
+      roundAtResolve:round,
+      roundsElapsed:elapsed,
+      startsAfter,minutesAfter,
+      // The two fitting targets.
+      startRate:elapsed?Number((startsAfter/elapsed).toFixed(4)):null,
+      minutesPerRound:elapsed?Number((minutesAfter/elapsed).toFixed(2)):null
+    };
+    await env.ROLE_KV.put(key,JSON.stringify(out),{expirationTtl:60*60*24*CALIB_TTL_DAYS});
+    resolved++;
+  }
+  return {round,scanned:keys.length,resolved,pending,playerMissing:missing};
+}
+
+async function calibrationExport(env,{team=null,resolvedOnly=false}={}){
+  const keys=await env.ROLE_KV.list('calib:');
+  const rows=[];
+  for(const key of keys){
+    const row=await env.ROLE_KV.get(key,'json');
+    if(!row)continue;
+    if(team&&row.team!==team)continue;
+    if(resolvedOnly&&!row.resolved)continue;
+    rows.push(row);
+  }
+  rows.sort((a,b)=>String(a.recordedAt).localeCompare(String(b.recordedAt)));
+  const done=rows.filter(r=>r.resolved);
+  const byType={};
+  for(const r of done){
+    const t=byType[r.type]||(byType[r.type]={n:0,meanStartRate:0,meanStrength:0});
+    t.n++;t.meanStartRate+=Number(r.startRate)||0;t.meanStrength+=Number(r.strength)||0;
+  }
+  for(const t of Object.values(byType)){
+    t.meanStartRate=Number((t.meanStartRate/t.n).toFixed(3));
+    t.meanStrength=Number((t.meanStrength/t.n).toFixed(3));
+  }
+  return {
+    total:rows.length,resolved:done.length,pending:rows.length-done.length,
+    // Rough guide only: a real fit needs the logistic regression described above.
+    // 30+ resolved rows per event type before any coefficient is worth trusting.
+    readyToFit:done.length>=50,
+    byType,rows
+  };
+}
+
+
 
 async function scanTeam(env,team,{force=false}={}){
   team=String(team||'').toUpperCase();
@@ -892,6 +1020,10 @@ async function scanTeam(env,team,{force=false}={}){
     events:finalEvents
   };
 
+  // Log predictions for later calibration. Only events THIS scan produced —
+  // carried-forward events were already logged when first discovered.
+  if(events.length){try{await recordCalibrationRows(env,team,events,roster)}catch{}}
+
   await env.ROLE_KV.put(cacheKey,JSON.stringify(payload),{expirationTtl:60*60*24*14});
   return payload;
 }
@@ -943,6 +1075,14 @@ export default {
         const team=String(u.searchParams.get('team')||'').toUpperCase();if(!team)return json({error:'team is required'},400,env);
         const report=await env.ROLE_KV.get(`latest:${team}`,'json');return json({status:'ok',team,report:report||null},200,env);
       }
+      if(u.pathname==='/api/scout/calibration'){
+        const team=String(u.searchParams.get('team')||'').toUpperCase()||null;
+        const resolvedOnly=u.searchParams.get('resolved')==='1';
+        return json({status:'ok',windowRounds:CALIB_WINDOW_ROUNDS,...await calibrationExport(env,{team,resolvedOnly})},200,env);
+      }
+      if(u.pathname==='/api/scout/calibration/resolve'){
+        return json({status:'ok',...await resolveCalibration(env,{limit:Number(u.searchParams.get('limit'))||200})},200,env);
+      }
       // Single-URL probe: isolates fetch vs browser behaviour for one article.
       if(u.pathname==='/api/scout/probe'){
         const target=u.searchParams.get('url');if(!target)return json({error:'url is required'},400,env);
@@ -955,6 +1095,6 @@ export default {
   },
   async scheduled(event,env,ctx){
     env = await withD1(env);
-    ctx.waitUntil((async()=>{const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.max(1,Math.min(4,Number(env.CRON_TEAMS_PER_RUN)||1));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeam(env,team,{force:true})}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
+    ctx.waitUntil((async()=>{try{await resolveCalibration(env,{limit:200})}catch{}const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.max(1,Math.min(4,Number(env.CRON_TEAMS_PER_RUN)||1));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeam(env,team,{force:true})}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
   }
 };
