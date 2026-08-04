@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v1.3 — article-discovery repair + per-URL diagnostics
+// v1.5 — boilerplate stripping + hard browser budget
 //
 // Changes vs v1.2 (all additive to the response contract):
 //   1. Browser fallback is gated on ARTICLE CANDIDATES and landing text length,
@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.4';
+const SCHEMA_VERSION = '1.5';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -131,6 +131,9 @@ function cors(env){return {
 function json(data,status=200,env={}){return new Response(JSON.stringify(data,null,2),{status,headers:{'Content-Type':'application/json; charset=utf-8',...cors(env)}})}
 function clamp(x,a,b){return Math.max(a,Math.min(b,Number(x)||0))}
 function cleanText(s){return String(s||'').replace(/\s+/g,' ').trim()}
+/** Collapses horizontal whitespace but KEEPS newlines — line structure is what
+ *  makes cross-document boilerplate detection possible. */
+function cleanLines(s){return String(s||'').replace(/[ \t\u00a0]+/g,' ').replace(/\n{2,}/g,'\n').split('\n').map(l=>l.trim()).filter(Boolean).join('\n')}
 function normal(s){return cleanText(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9 ]/g,'')}
 function hashString(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return (h>>>0).toString(16)}
 function teamCodeFromFplTeam(t){return TEAM_ALIASES[normal(t?.name)] || TEAM_ALIASES[normal(t?.short_name)] || String(t?.short_name||'').toUpperCase()}
@@ -174,7 +177,16 @@ function makeBudget(env){
 class TextCollector {
   constructor(base){this.base=base;this.text=[];this.links=[];this.current=''}
   element(el){const href=el.getAttribute('href');if(href){try{const u=new URL(href,this.base);if(u.protocol.startsWith('http')){u.hash='';this.links.push(u.toString())}}catch{}}}
-  textChunk(t){const v=cleanText(t.text);if(v)this.text.push(v)}
+  // HTMLRewriter can split one text node across several chunks. Buffer until
+  // lastInTextNode so a line is a whole line, not a fragment.
+  textChunk(t){
+    this.current+=t.text;
+    if(t.lastInTextNode){
+      const v=cleanText(this.current);
+      if(v)this.text.push(v);
+      this.current='';
+    }
+  }
 }
 
 async function parseHtmlResponse(response,baseUrl){
@@ -182,7 +194,7 @@ async function parseHtmlResponse(response,baseUrl){
   await new HTMLRewriter()
     .on('title,h1,h2,h3,h4,p,li,time,a', {element:e=>c.element(e),text:t=>c.textChunk(t)})
     .transform(response).text();
-  return {text:cleanText(c.text.join(' ')).slice(0,65000),links:[...new Set(c.links)]};
+  return {text:cleanLines(c.text.join('\n')).slice(0,65000),links:[...new Set(c.links)]};
 }
 
 async function fetchPage(url){
@@ -242,6 +254,9 @@ async function quickActionJson(env,action,payload){
 /** Paces calls, retries once on a rate-limit 429, and stops dead on a quota 429. */
 async function browserCall(env,budget,action,payload){
   for(let attempt=0;attempt<2;attempt++){
+    // Re-checked every attempt, so a 429 retry can no longer push the scan
+    // past BROWSER_BUDGET (v1.4 reached 4 calls against a budget of 3).
+    if(!budget.canBrowse(env))throw new Error(`Browser Run ${action} skipped: browser budget exhausted.`);
     await budget.pace();
     budget.spendBrowser();
     try{
@@ -290,7 +305,7 @@ async function browserRender(env,url,budget){
 async function browserMarkdown(env,url,budget){
   const result=await browserCall(env,budget,'markdown',{url,gotoOptions:GOTO});
   const markdown=typeof result==='string'?result:(result?.markdown||result?.content||'');
-  return {url,text:cleanText(markdown).slice(0,65000),links:[],mode:'browser-markdown',status:200,redirected:false};
+  return {url,text:cleanLines(markdown).slice(0,65000),links:[],mode:'browser-markdown',status:200,redirected:false};
 }
 
 /* --------------------------------------------------------- article cache */
@@ -318,7 +333,58 @@ async function storeArticle(env,url,doc){
   }catch{}
 }
 
-/* ----------------------------------------------------- link candidate scoring */
+/* --------------------------------------------------- boilerplate stripping */
+// A club article page is ~85% site furniture: nav, menus, cookie notices,
+// related-article teasers, footers. That furniture is IDENTICAL across every
+// page on the host, so lines that recur across documents are by definition
+// chrome, and lines unique to one page are its actual content. The landing
+// page is pure chrome plus headlines, which makes it an excellent reference
+// corpus even when only one article was read.
+//
+// This runs on text already in hand — no extra fetches, no extra browser time.
+
+function splitLines(text){
+  return String(text||'').split('\n').map(l=>l.trim()).filter(Boolean);
+}
+
+function buildBoilerplateSet(docs){
+  const counts=new Map();
+  for(const d of docs){
+    for(const line of new Set(splitLines(d.text))){
+      counts.set(line,(counts.get(line)||0)+1);
+    }
+  }
+  // Recurring in at least two documents, scaling up with corpus size so a
+  // quote legitimately shared by two of six articles is not mistaken for nav.
+  const threshold=Math.max(2,Math.ceil(docs.length*0.4));
+  const set=new Set();
+  for(const [line,count] of counts){
+    if(count>=threshold)set.add(line);
+  }
+  return set;
+}
+
+function stripBoilerplate(text,boilerplate){
+  const original=String(text||'');
+  const kept=[];
+  let previous=null;
+  for(const line of splitLines(original)){
+    if(boilerplate.has(line))continue;
+    if(line===previous)continue;   // collapse repeated adjacent lines
+    kept.push(line);
+    previous=line;
+  }
+  const stripped=kept.join('\n');
+  // Safety valve only for total loss. A page that genuinely IS 97% chrome
+  // should be stripped to 3%; and a stub that falls under AI_MIN_DOC_CHARS
+  // after stripping should be DROPPED as thin, not rescued by re-adding nav.
+  if(!stripped.length){
+    return {text:original,stripped:false,before:original.length,after:original.length};
+  }
+  return {text:stripped,stripped:true,before:original.length,after:stripped.length};
+}
+
+
 
 function scoreLink(url,host,currentYear){
   let score=0;
@@ -678,13 +744,34 @@ async function scanTeam(env,team,{force=false}={}){
     }
   }
 
+  // Strip site furniture before anything is measured or sent to the model.
+  // Documents are cached RAW, so improving this heuristic later costs no
+  // re-rendering — the next scan simply strips better.
+  const boilerplate=buildBoilerplateSet(documents);
+  let boilerplateBefore=0,boilerplateAfter=0,strippedDocs=0;
+  for(const d of documents){
+    const r=stripBoilerplate(d.text,boilerplate);
+    d.text=r.text;
+    d.charsBefore=r.before;
+    d.charsAfter=r.after;
+    boilerplateBefore+=r.before;
+    boilerplateAfter+=r.after;
+    if(r.stripped)strippedDocs++;
+  }
+  for(const entry of perUrl){
+    const match=documents.find(d=>d.url===entry.url);
+    if(match)entry.charsAfterStrip=match.charsAfter;
+  }
+
   const retrieved=documents.filter(d=>d.text&&d.text.length>0);
   const useful=documents.filter(d=>d.text&&d.text.length>=AI_MIN_DOC_CHARS);
   const articleDocs=useful.filter(d=>d.kind==='article');
 
-  // Only run the model when at least one real article was read. A listing page
-  // alone is not grounds for an inference.
-  const modelInput=articleDocs.length?useful:[];
+  // Only run the model when at least one real article was read, and send ONLY
+  // the articles. The landing page is a headline list whose every line recurs
+  // across the site, so it survives boilerplate stripping intact and would
+  // otherwise dominate the model input with ~26k chars of teasers.
+  const modelInput=articleDocs;
   const raw=modelInput.length?await aiExtract(env,team,club.name,roster.current.players,modelInput,roster):[];
   const events=validateEvents(team,roster.current.players,raw,new Set(modelInput.map(d=>d.url)));
 
@@ -773,6 +860,11 @@ async function scanTeam(env,team,{force=false}={}){
       browserRateLimitHits:budget.rateLimitHits,
       browserQuotaExhausted:budget.quotaExhausted,
       cacheHits:perUrl.filter(x=>x.cached).length,
+      boilerplateLines:boilerplate.size,
+      charsBeforeStrip:boilerplateBefore,
+      charsAfterStrip:boilerplateAfter,
+      strippedDocuments:strippedDocs,
+      strippedPct:boilerplateBefore?Number((100*(1-boilerplateAfter/boilerplateBefore)).toFixed(1)):0,
       coverage:Number(coverage.toFixed(2)),
       browserAvailable:!!env.BROWSER?.quickAction,
       elapsedMs:budget.elapsedMs,
