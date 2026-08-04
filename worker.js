@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.5.1';
+const SCHEMA_VERSION = '1.5.2';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -591,6 +591,10 @@ async function fplContext(env,team){
   const current={team,teamName:teamRow.name,fetchedAt:new Date().toISOString(),players};
   await env.ROLE_KV.put(key,JSON.stringify(current),{expirationTtl:60*60*24*120});
   const oldNames=new Set((previous?.players||[]).map(p=>normal(p.fullName||p.name))),newNames=new Set(players.map(p=>normal(p.fullName||p.name)));
+  // With no previous snapshot there is nothing to diff against. Reporting the
+  // entire squad as "added" is false, and worse, it enters the model prompt as
+  // ROSTER ADDED and biases extraction toward signing events.
+  if(!previous)return {current,previous:null,added:[],missing:[]};
   return {current,previous,added:players.filter(p=>!oldNames.has(normal(p.fullName||p.name))),missing:(previous?.players||[]).filter(p=>!newNames.has(normal(p.fullName||p.name)))};
 }
 
