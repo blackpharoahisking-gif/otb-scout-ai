@@ -1,0 +1,14 @@
+{
+  "name": "otb-scout-ai",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Cache-first OTB team role intelligence Worker",
+  "main": "worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "preview": "wrangler versions upload"
+  },
+  "devDependencies": {
+    "wrangler": "^4.68.0"
+  }
+}
