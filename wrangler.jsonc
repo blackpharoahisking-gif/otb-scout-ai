@@ -1,6 +1,23 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
+  "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "otb-role-intelligence",
-  "main": "worker.js",
-  "compatibility_date": "2026-08-04"
+  "main": "./worker.js",
+  "compatibility_date": "2026-08-04",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "otb-role-graph",
+      "database_id": "229e216a-6db2-4b64-bcff-d492b93e6bd8"
+    }
+  ],
+
+  "ai": {
+    "binding": "AI"
+  },
+
+  "browser": {
+    "binding": "BROWSER"
+  }
 }
