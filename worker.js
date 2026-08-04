@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.5';
+const SCHEMA_VERSION = '1.5.1';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -22,7 +22,10 @@ const LANDING_MIN_CHARS = 800;     // below this, the landing page is a JS shell
 const DEFAULT_BROWSER_BUDGET = 3;  // max Browser Run calls per scan (see notes: free tier = 3 new instances/min)
 const DEFAULT_BROWSER_SPACING_MS = 2500; // Browser Run enforces a per-second fill rate, not a burst allowance
 const DEFAULT_SCAN_BUDGET_MS = 45000;
-const ARTICLE_CACHE_DAYS = 45;     // articles are immutable; render each URL at most once
+const ARTICLE_CACHE_DAYS = 45;
+// Bump when the TEXT FORMAT changes. v1 flattened documents to a single line,
+// which makes line-based boilerplate detection impossible; v2 preserves lines.
+const CACHE_FORMAT = 'v2';     // articles are immutable; render each URL at most once
 
 /* ---------------------------------------------------------------- storage */
 
@@ -314,7 +317,7 @@ async function browserMarkdown(env,url,budget){
 // same eight stories for days. Caching the extracted text means each article is
 // rendered at most once, ever, and a warm scan spends near-zero browser time.
 
-function articleKey(url){return `article:${hashString(url)}`}
+function articleKey(url){return `article:${CACHE_FORMAT}:${hashString(url)}`}
 
 async function cachedArticle(env,url){
   try{
@@ -861,6 +864,7 @@ async function scanTeam(env,team,{force=false}={}){
       browserQuotaExhausted:budget.quotaExhausted,
       cacheHits:perUrl.filter(x=>x.cached).length,
       boilerplateLines:boilerplate.size,
+      unsplittableDocuments:documents.filter(d=>d.text&&d.text.length>5000&&splitLines(d.text).length<3).length,
       charsBeforeStrip:boilerplateBefore,
       charsAfterStrip:boilerplateAfter,
       strippedDocuments:strippedDocs,
