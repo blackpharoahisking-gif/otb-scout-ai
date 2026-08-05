@@ -4,7 +4,26 @@
   "main": "./worker.js",
   "compatibility_date": "2026-08-04",
   "compatibility_flags": ["nodejs_compat"],
-
+  "vars": {
+    // Browser Run allowance tuning (Workers Paid).
+    // Paid raises the instance fill rate from 3/min to 10/min — still a fill
+    // rate, so roughly one call every 6s. 2500ms tripped the limiter on free.
+    "BROWSER_MIN_SPACING_MS": "6000",
+    // Coverage builds across scans via the article cache, so this does not need
+    // to cover every candidate in one run.
+    "BROWSER_BUDGET": "6",
+    // 6 calls at 6s spacing plus render time will not fit in the 45s default.
+    "SCAN_BUDGET_MS": "90000",
+    // Clubs refreshed per cron tick. Set to 0 to disable the sweep entirely and
+    // rely on manual Fresh live scan.
+    "CRON_TEAMS_PER_RUN": "2",
+    // Articles read per scan before scoring cuts the list off.
+    "MAX_ARTICLES_PER_SCAN": "8",
+    // How long a cached report is served before a background refresh fires.
+    "STALE_AFTER_MINUTES": "360",
+    // Carry-forward window for evidence when a scan cannot read its sources.
+    "MAX_CARRY_DAYS": "7"
+  },
   "d1_databases": [
     {
       "binding": "DB",
@@ -12,12 +31,7 @@
       "database_id": "229e216a-6db2-4b64-bcff-d492b93e6bd8"
     }
   ],
-
-  "ai": {
-    "binding": "AI"
-  },
-
-  "browser": {
-    "binding": "BROWSER"
-  }
+  "ai": { "binding": "AI" },
+  "browser": { "binding": "BROWSER" },
+  "triggers": { "crons": ["*/30 * * * *"] }
 }
