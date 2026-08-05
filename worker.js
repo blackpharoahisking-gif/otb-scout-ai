@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.9.1';
+const SCHEMA_VERSION = '1.9.2';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -72,10 +72,18 @@ async function withD1(env) {
       return row.value;
     },
 
+    /* LIKE 'prefix%' compiles to a full index SCAN in SQLite because the
+       default LIKE is case-insensitive, so the optimiser cannot use the
+       key index. Measured at ~20k rows read per call against a populated
+       article cache. A half-open range is an indexed SEARCH instead and
+       is exactly equivalent for the ASCII, wildcard-free prefixes used
+       here, e.g. 'calib:'. */
     async list(prefix) {
+      const lo = String(prefix);
+      const hi = lo.slice(0, -1) + String.fromCharCode(lo.charCodeAt(lo.length - 1) + 1);
       const { results } = await env.DB.prepare(
-        'SELECT key FROM otb_store WHERE key LIKE ? LIMIT 5000'
-      ).bind(String(prefix) + '%').all();
+        'SELECT key FROM otb_store WHERE key >= ? AND key < ? LIMIT 5000'
+      ).bind(lo, hi).all();
       return (results || []).map(r => r.key);
     },
 
@@ -686,9 +694,26 @@ async function readArticle(env,url,budget){
 
 /* ---------------------------------------------------------------- FPL data */
 
+/* bootstrap-static is ~1.5MB. A cron sweep previously fetched and parsed it
+   once per team plus once for calibration — six times per tick, ~9MB and six
+   JSON.parse passes for data that changes at most a few times an hour.
+   Memoised per isolate with a short TTL: correctness is unaffected because
+   every consumer only reads player status, prices and event metadata. */
+let BOOTSTRAP_MEMO = null;
+const BOOTSTRAP_MEMO_MS = 90000;
+
+async function getBootstrap(env){
+  const now=Date.now();
+  if(BOOTSTRAP_MEMO&&now-BOOTSTRAP_MEMO.at<BOOTSTRAP_MEMO_MS)return BOOTSTRAP_MEMO.data;
+  const r=await fetch(FPL_BOOTSTRAP,{headers:{Accept:'application/json'}});
+  if(!r.ok)throw new Error(`FPL bootstrap HTTP ${r.status}`);
+  const data=await r.json();
+  BOOTSTRAP_MEMO={at:now,data};
+  return data;
+}
+
 async function fplContext(env,team){
-  const r=await fetch(FPL_BOOTSTRAP,{headers:{Accept:'application/json'}});if(!r.ok)throw new Error(`FPL bootstrap HTTP ${r.status}`);
-  const data=await r.json();const teamRow=(data.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
+  const data=await getBootstrap(env);const teamRow=(data.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
   if(!teamRow)throw new Error(`Club ${team} is not present in the current FPL bootstrap.`);
   const pos=Object.fromEntries((data.element_types||[]).map(x=>[x.id,x.singular_name_short]));
   const currentRound=Number((data.events||[]).find(e=>e.is_current)?.id)||Number((data.events||[]).filter(e=>e.finished).pop()?.id)||0;
@@ -817,9 +842,7 @@ async function recordCalibrationRows(env,team,events,roster){
 
 /** Diffs due rows against the live bootstrap and writes the observed outcome. */
 async function resolveCalibration(env,{limit=200}={}){
-  const r=await fetch(FPL_BOOTSTRAP,{headers:{Accept:'application/json'}});
-  if(!r.ok)throw new Error(`FPL bootstrap HTTP ${r.status}`);
-  const data=await r.json();
+  const data=await getBootstrap(env);
   const round=Number((data.events||[]).find(e=>e.is_current)?.id)
     ||Number((data.events||[]).filter(e=>e.finished).pop()?.id)||0;
   const live=new Map((data.elements||[]).map(p=>[p.id,p]));
