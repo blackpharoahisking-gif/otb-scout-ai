@@ -21,7 +21,7 @@
     // header (address bar, curl) are still allowed so debugging works.
     "ALLOWED_ORIGIN": "https://blackpharoahisking-gif.github.io",
     // Cost controls on public forced scans.
-    "FORCE_COOLDOWN_MINUTES": "10",
+    "FORCE_COOLDOWN_MINUTES": "2",
     "FORCE_DAILY_CAP": "60",
     // Articles read per scan before scoring cuts the list off.
     "MAX_ARTICLES_PER_SCAN": "8",

@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.8';
+const SCHEMA_VERSION = '1.9';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -29,9 +29,13 @@ const CACHE_FORMAT = 'v2';     // articles are immutable; render each URL at mos
 
 /* ---------------------------------------------------------------- storage */
 
+let TABLE_READY = false;
+
 async function withD1(env) {
   if (!env.DB) throw new Error('D1 binding DB is missing.');
 
+  // Ran on EVERY request before; once per isolate is enough.
+  if (!TABLE_READY) {
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS otb_store (
       key TEXT PRIMARY KEY,
@@ -40,6 +44,8 @@ async function withD1(env) {
       updated_at INTEGER NOT NULL
     )
   `).run();
+    TABLE_READY = true;
+  }
 
   const store = {
     async get(key, type) {
@@ -199,7 +205,7 @@ function makeBudget(env){
 // reserved for routes the browser app never calls, because a secret shipped
 // inside public HTML is not a secret.
 
-const DEFAULT_FORCE_COOLDOWN_MIN = 10;
+const DEFAULT_FORCE_COOLDOWN_MIN = 2;   // 10 was hostile to normal re-scanning
 const DEFAULT_FORCE_DAILY_CAP = 60;
 const SCAN_LOCK_TTL_MS = 150000;
 
@@ -371,18 +377,6 @@ async function browserCall(env,budget,action,payload){
 }
 
 const GOTO = {waitUntil:'networkidle2',timeout:15000};
-
-/** /links may return strings or objects ({url}|{href}); normalise to strings. */
-function normaliseLinks(result,base){
-  const raw=Array.isArray(result)?result:(Array.isArray(result?.links)?result.links:[]);
-  const out=[];
-  for(const item of raw){
-    const candidate=typeof item==='string'?item:(item?.url||item?.href||item?.link||'');
-    if(!candidate)continue;
-    try{const u=new URL(candidate,base);if(u.protocol.startsWith('http')){u.hash='';out.push(u.toString())}}catch{}
-  }
-  return [...new Set(out)];
-}
 
 /**
  * One browser call that yields BOTH rendered text and rendered links.
@@ -614,7 +608,7 @@ async function readArticle(env,url,budget){
   // 1. Cache. Costs nothing and is the reason a warm scan needs no browser.
   const hit=await cachedArticle(env,url);
   if(hit){
-    entry.status='cached';entry.mode=hit.mode||'cache';entry.chars=hit.text.length;entry.cached=true;
+    entry.status='cached';entry.mode=hit.mode||'cache';entry.cachedAt=hit.fetchedAt||null;entry.chars=hit.text.length;entry.cached=true;
     return {doc:{url,text:hit.text,mode:'cache',status:200},entry};
   }
 
@@ -1128,7 +1122,7 @@ function reportAgeMs(report){
 async function scanTeamGuarded(env,team){
   if(!(await acquireScanLock(env,team))){
     const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
-    if(cached)return {...cached,cache:'HIT',refreshing:true,lockNote:'a scan for this club was already in progress'};
+    if(cached)return {status:'ok',scanLocked:true,lockNote:'a scan for this club was already in progress',...cached,cache:'HIT',refreshing:true};
     throw new Error(`A scan for ${team} is already in progress. Try again shortly.`);
   }
   try{return await scanTeam(env,team,{force:true})}
@@ -1171,7 +1165,7 @@ export default {
           if(!gate.allowed){
             // Never fail a user outright: serve what we have and explain.
             const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
-            if(cached)return json({...cached,cache:'HIT',forceThrottled:true,forceThrottleReason:gate.reason},200,env);
+            if(cached)return json({status:'ok',forceThrottled:true,forceThrottleReason:gate.reason,retryAfterSec:gate.retryAfterSec,...cached,cache:'HIT'},200,env);
             return json({status:'error',error:gate.reason,retryAfterSec:gate.retryAfterSec},429,env);
           }
           await noteForcedScan(env,team);
