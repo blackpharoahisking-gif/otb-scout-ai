@@ -12,8 +12,11 @@
     // Coverage builds across scans via the article cache, so this does not need
     // to cover every candidate in one run.
     "BROWSER_BUDGET": "6",
-    // 6 calls at 6s spacing plus render time will not fit in the 45s default.
-    "SCAN_BUDGET_MS": "90000",
+    // 6 calls at 6s spacing plus render time. 90000 was measured hitting the
+    // wall at 93.2s with 3 articles unread on a cold cache, so 120s it is.
+    // A cold scan only happens after a CACHE_FORMAT bump; warm scans finish
+    // in well under half this.
+    "SCAN_BUDGET_MS": "120000",
     // Clubs refreshed per cron tick. 0 genuinely disables the sweep (fixed in
     // v1.8 — the previous expression silently forced a minimum of 1).
     "CRON_TEAMS_PER_RUN": "2",
