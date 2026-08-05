@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.7';
+const SCHEMA_VERSION = '1.8';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -145,7 +145,16 @@ function cleanText(s){return String(s||'').replace(/\s+/g,' ').trim()}
  *  makes cross-document boilerplate detection possible. */
 function cleanLines(s){return String(s||'').replace(/[ \t\u00a0]+/g,' ').replace(/\n{2,}/g,'\n').split('\n').map(l=>l.trim()).filter(Boolean).join('\n')}
 function normal(s){return cleanText(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9 ]/g,'')}
-function hashString(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return (h>>>0).toString(16)}
+function hashString(s){
+  // Two independent FNV-1a passes -> 64 bits. A single 32-bit pass collides with
+  // ~0.3% probability across a season of article URLs, and a collision would
+  // silently serve the WRONG cached article text for a URL.
+  let a=2166136261,b=2166136261^0x9e3779b9;
+  for(let i=0;i<s.length;i++){const c=s.charCodeAt(i);
+    a^=c;a=Math.imul(a,16777619);
+    b^=c+i;b=Math.imul(b,16777639)}
+  return ((a>>>0).toString(16).padStart(8,'0'))+((b>>>0).toString(16).padStart(8,'0'));
+}
 function teamCodeFromFplTeam(t){return TEAM_ALIASES[normal(t?.name)] || TEAM_ALIASES[normal(t?.short_name)] || String(t?.short_name||'').toUpperCase()}
 function hostOf(url){try{return new URL(url).hostname.replace(/^www\./,'')}catch{return ''}}
 
@@ -180,6 +189,83 @@ function makeBudget(env){
     get browserMax(){return browserMax},
     get elapsedMs(){return Date.now()-started}
   };
+}
+
+/* ------------------------------------------------------------ perimeter */
+// Threat model note: the realistic risk here is not a determined attacker, it
+// is an accidental loop, a crawler, or a stray script hitting force=1 and
+// burning the Browser Run allowance overnight. So the controls are cost
+// controls first: cooldown, daily cap and a scan lock. A shared secret is
+// reserved for routes the browser app never calls, because a secret shipped
+// inside public HTML is not a secret.
+
+const DEFAULT_FORCE_COOLDOWN_MIN = 10;
+const DEFAULT_FORCE_DAILY_CAP = 60;
+const SCAN_LOCK_TTL_MS = 150000;
+
+function adminAuthorised(request,env){
+  const expected=String(env.SCOUT_ADMIN_TOKEN||'');
+  if(!expected)return false;                       // fail closed when unset
+  const url=new URL(request.url);
+  const supplied=request.headers.get('x-otb-token')
+    ||(request.headers.get('authorization')||'').replace(/^Bearer\s+/i,'')
+    ||url.searchParams.get('key')||'';
+  if(supplied.length!==expected.length)return false;
+  // Constant-time-ish compare.
+  let diff=0;
+  for(let i=0;i<expected.length;i++)diff|=expected.charCodeAt(i)^supplied.charCodeAt(i);
+  return diff===0;
+}
+
+/** Origin is a weak filter, not authentication. Direct address-bar requests
+ *  send no Origin header, so those are allowed through for debugging. */
+function originAllowed(request,env){
+  const allowed=String(env.ALLOWED_ORIGIN||'').trim();
+  if(!allowed||allowed==='*')return true;
+  const origin=request.headers.get('origin');
+  if(!origin)return true;
+  return allowed.split(',').map(x=>x.trim()).includes(origin);
+}
+
+function dayStamp(){return new Date().toISOString().slice(0,10)}
+
+/** Per-team cooldown plus a global daily ceiling on forced scans. */
+async function forcedScanAllowed(env,team){
+  const cooldownMs=Math.max(0,Number(env.FORCE_COOLDOWN_MINUTES ?? DEFAULT_FORCE_COOLDOWN_MIN))*60000;
+  const cap=Math.max(0,Number(env.FORCE_DAILY_CAP ?? DEFAULT_FORCE_DAILY_CAP));
+
+  if(cap>0){
+    const key=`forcecount:${dayStamp()}`;
+    const used=Number(await env.ROLE_KV.get(key))||0;
+    if(used>=cap)return {allowed:false,reason:`daily forced-scan cap of ${cap} reached; cached reports are still served`,retryAfterSec:3600};
+  }
+  if(cooldownMs>0){
+    const last=Number(await env.ROLE_KV.get(`forcelast:${team}`))||0;
+    const since=Date.now()-last;
+    if(last&&since<cooldownMs){
+      return {allowed:false,reason:`a forced scan for ${team} ran ${Math.round(since/1000)}s ago; cooldown is ${Math.round(cooldownMs/1000)}s`,retryAfterSec:Math.ceil((cooldownMs-since)/1000)};
+    }
+  }
+  return {allowed:true};
+}
+
+async function noteForcedScan(env,team){
+  const key=`forcecount:${dayStamp()}`;
+  const used=Number(await env.ROLE_KV.get(key))||0;
+  await env.ROLE_KV.put(key,String(used+1),{expirationTtl:60*60*36});
+  await env.ROLE_KV.put(`forcelast:${team}`,String(Date.now()),{expirationTtl:60*60*24});
+}
+
+/** Prevents cron and a user (or two users) scanning the same club at once. */
+async function acquireScanLock(env,team){
+  const key=`lock:scan:${team}`;
+  const held=Number(await env.ROLE_KV.get(key))||0;
+  if(held&&Date.now()-held<SCAN_LOCK_TTL_MS)return false;
+  await env.ROLE_KV.put(key,String(Date.now()),{expirationTtl:Math.ceil(SCAN_LOCK_TTL_MS/1000)+30});
+  return true;
+}
+async function releaseScanLock(env,team){
+  try{await env.ROLE_KV.put(`lock:scan:${team}`,'0',{expirationTtl:60})}catch{}
 }
 
 /* ------------------------------------------------------------ page reading */
@@ -1037,17 +1123,29 @@ function reportAgeMs(report){
   return Number.isFinite(t)?Math.max(0,Date.now()-t):Infinity;
 }
 
+/** Wraps scanTeam so two callers cannot burn the browser allowance twice on the
+ *  same club. A blocked caller gets the cached report rather than an error. */
+async function scanTeamGuarded(env,team){
+  if(!(await acquireScanLock(env,team))){
+    const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
+    if(cached)return {...cached,cache:'HIT',refreshing:true,lockNote:'a scan for this club was already in progress'};
+    throw new Error(`A scan for ${team} is already in progress. Try again shortly.`);
+  }
+  try{return await scanTeam(env,team,{force:true})}
+  finally{await releaseScanLock(env,team)}
+}
+
 async function cacheFirstTeamReport(env,team,ctx,{force=false}={}){
   team=String(team||'').toUpperCase();
-  if(force)return scanTeam(env,team,{force:true});
+  if(force)return scanTeamGuarded(env,team);
 
   const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
-  if(!cached)return scanTeam(env,team,{force:true});
+  if(!cached)return scanTeamGuarded(env,team);
 
   const staleAfterMs=Math.max(15,Number(env.STALE_AFTER_MINUTES)||360)*60*1000;
   const stale=reportAgeMs(cached)>staleAfterMs;
   if(stale&&ctx?.waitUntil){
-    ctx.waitUntil(scanTeam(env,team,{force:true}).catch(async error=>{
+    ctx.waitUntil(scanTeamGuarded(env,team).catch(async error=>{
       await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:error?.message||String(error)}),{expirationTtl:86400});
     }));
   }
@@ -1060,32 +1158,61 @@ export default {
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
       if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
+      if(!originAllowed(request,env))return json({status:'error',error:'origin not allowed'},403,env);
+
       if(u.pathname==='/api/role-intelligence'||u.pathname.startsWith('/api/scout/team/')){
         const pathTeam=u.pathname.startsWith('/api/scout/team/')?u.pathname.split('/').filter(Boolean).pop():null;
-        const team=u.searchParams.get('team')||pathTeam;if(!team)return json({error:'team is required'},400,env);
+        const team=String(u.searchParams.get('team')||pathTeam||'').toUpperCase();
+        if(!team)return json({error:'team is required'},400,env);
+        if(!CLUB_SOURCES[team])return json({error:`unsupported team code: ${team}`},400,env);
         const force=u.searchParams.get('force')==='1'||u.searchParams.get('fresh')==='1';
+        if(force&&!adminAuthorised(request,env)){
+          const gate=await forcedScanAllowed(env,team);
+          if(!gate.allowed){
+            // Never fail a user outright: serve what we have and explain.
+            const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
+            if(cached)return json({...cached,cache:'HIT',forceThrottled:true,forceThrottleReason:gate.reason},200,env);
+            return json({status:'error',error:gate.reason,retryAfterSec:gate.retryAfterSec},429,env);
+          }
+          await noteForcedScan(env,team);
+        }
         return json(await cacheFirstTeamReport(env,team,ctx,{force}),200,env);
       }
       if(u.pathname==='/api/role-sync'&&request.method==='POST'){
+        if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
         const body=await request.json().catch(()=>({}));if(!body.team)return json({error:'team is required'},400,env);
-        return json(await scanTeam(env,body.team,{force:true}),200,env);
+        return json(await scanTeamGuarded(env,String(body.team).toUpperCase()),200,env);
       }
-      if(u.pathname==='/api/role-latest')return json({status:'ok',generatedAt:new Date().toISOString(),teams:await allLatest(env)},200,env);
+      if(u.pathname==='/api/role-latest'){
+        if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
+        return json({status:'ok',generatedAt:new Date().toISOString(),teams:await allLatest(env)},200,env);
+      }
       if(u.pathname==='/api/scout/diagnostics'){
         const team=String(u.searchParams.get('team')||'').toUpperCase();if(!team)return json({error:'team is required'},400,env);
         const report=await env.ROLE_KV.get(`latest:${team}`,'json');return json({status:'ok',team,report:report||null},200,env);
       }
       if(u.pathname==='/api/scout/calibration'){
+        if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
         const team=String(u.searchParams.get('team')||'').toUpperCase()||null;
         const resolvedOnly=u.searchParams.get('resolved')==='1';
         return json({status:'ok',windowRounds:CALIB_WINDOW_ROUNDS,...await calibrationExport(env,{team,resolvedOnly})},200,env);
       }
       if(u.pathname==='/api/scout/calibration/resolve'){
+        // Mutating, so POST only: GET is fetched by crawlers and prefetchers.
+        if(request.method!=='POST')return json({status:'error',error:'use POST'},405,env);
+        if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
         return json({status:'ok',...await resolveCalibration(env,{limit:Number(u.searchParams.get('limit'))||200})},200,env);
       }
-      // Single-URL probe: isolates fetch vs browser behaviour for one article.
+      // Probe was an open SSRF and cost sink: arbitrary URLs went straight into
+      // fetch and Browser Run. Now admin-only AND restricted to configured club
+      // hosts, so it can only ever touch domains the scanner already visits.
       if(u.pathname==='/api/scout/probe'){
+        if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
         const target=u.searchParams.get('url');if(!target)return json({error:'url is required'},400,env);
+        let parsed;try{parsed=new URL(target)}catch{return json({error:'url is not valid'},400,env)}
+        if(parsed.protocol!=='https:')return json({error:'https is required'},400,env);
+        const allowedHosts=new Set(Object.values(CLUB_SOURCES).flatMap(c=>c.urls.map(hostOf)));
+        if(!allowedHosts.has(hostOf(target)))return json({error:'host is not a configured club source'},400,env);
         const budget=makeBudget(env);
         const {entry}=await readArticle(env,target,budget);
         return json({status:'ok',probe:entry,browserAvailable:!!env.BROWSER?.quickAction,browserCalls:budget.browserCalls},200,env);
@@ -1095,6 +1222,11 @@ export default {
   },
   async scheduled(event,env,ctx){
     env = await withD1(env);
-    ctx.waitUntil((async()=>{try{await resolveCalibration(env,{limit:200})}catch{}const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.max(1,Math.min(4,Number(env.CRON_TEAMS_PER_RUN)||1));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeam(env,team,{force:true})}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
+    ctx.waitUntil((async()=>{try{await resolveCalibration(env,{limit:200})}catch{}const configured=Number(env.CRON_TEAMS_PER_RUN);
+      // 0 must genuinely disable the sweep. The old expression was
+      // Math.max(1,...Number(x)||1), so 0 became 1 and the documented
+      // escape hatch did nothing.
+      if(Number.isFinite(configured)&&configured<=0)return;
+      const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.min(4,Math.max(1,Number.isFinite(configured)?configured:1));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeamGuarded(env,team)}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
   }
 };
