@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.9.2';
+const SCHEMA_VERSION = '1.9.3';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -1183,6 +1183,235 @@ async function cacheFirstTeamReport(env,team,ctx,{force=false}={}){
   return {...cached,cache:'HIT',stale,refreshing:stale};
 }
 
+/* ==================================================================
+   MARKET PROBE  —  VERIFICATION ONLY
+   ------------------------------------------------------------------
+   Fetches EPL match odds, strips the bookmaker margin, and inverts the
+   result into team goal expectations and clean-sheet probabilities.
+
+   This is deliberately NOT wired into projections, and NOT wired into
+   cron. It exists to answer three questions that documentation cannot:
+     1. What does a call actually cost against the free quota?
+     2. How many UK bookmakers really come back on the free tier?
+     3. Do the recovered numbers look sane on live fixtures?
+
+   It is inert unless MARKET_API_KEY is set, and admin-only regardless,
+   so it cannot burn quota by accident.
+
+   Only the h2h market is requested. The docs note that totals coverage
+   is mainly a US-sports thing, and h2h alone is exactly identified:
+   two free probabilities (H, D, A sum to 1) determine two unknowns
+   (home and away goal expectation). Requesting one market also keeps
+   the cost at 1 credit per call rather than 2.
+   ================================================================== */
+
+const MARKET_HOST = 'https://api.the-odds-api.com';
+const MARKET_SPORT = 'soccer_epl';
+
+/* Dixon-Coles low-score correction. Independent Poisson under-predicts
+   0-0 and 1-1; rho < 0 pushes probability back into those scores. */
+const DC_RHO = -0.03;
+const MAX_GOALS = 12;
+
+function mFact(n) { let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; }
+function mPois(k, l) { return Math.exp(-l) * Math.pow(l, k) / mFact(k); }
+
+function dcTau(x, y, lh, la, rho) {
+  if (x === 0 && y === 0) return 1 - lh * la * rho;
+  if (x === 0 && y === 1) return 1 + lh * rho;
+  if (x === 1 && y === 0) return 1 + la * rho;
+  if (x === 1 && y === 1) return 1 - rho;
+  return 1;
+}
+
+/** Full match outcome distribution from two goal expectations. */
+function matchOutcomes(lh, la, rho = DC_RHO, M = MAX_GOALS) {
+  let H = 0, D = 0, A = 0, csH = 0, csA = 0, o25 = 0;
+  for (let x = 0; x <= M; x++) {
+    for (let y = 0; y <= M; y++) {
+      const p = mPois(x, lh) * mPois(y, la) * dcTau(x, y, lh, la, rho);
+      if (x > y) H += p; else if (x === y) D += p; else A += p;
+      if (y === 0) csH += p;          // home team keeps a clean sheet
+      if (x === 0) csA += p;
+      if (x + y > 2.5) o25 += p;
+    }
+  }
+  const s = H + D + A || 1;
+  return { H: H / s, D: D / s, A: A / s, csH: csH / s, csA: csA / s, over25: o25 / s };
+}
+
+/** Newton solve for the goal expectations implied by H/D/A. */
+function invertToGoals(tH, tA) {
+  let lh = 1.4, la = 1.2;
+  for (let it = 0; it < 60; it++) {
+    const o = matchOutcomes(lh, la);
+    const eH = o.H - tH, eA = o.A - tA;
+    if (Math.abs(eH) < 1e-9 && Math.abs(eA) < 1e-9) break;
+    const h = 1e-4;
+    const oh = matchOutcomes(lh + h, la), oa = matchOutcomes(lh, la + h);
+    const j00 = (oh.H - o.H) / h, j01 = (oa.H - o.H) / h;
+    const j10 = (oh.A - o.A) / h, j11 = (oa.A - o.A) / h;
+    const det = j00 * j11 - j01 * j10;
+    if (!det || !Number.isFinite(det)) break;
+    lh -= (j11 * eH - j01 * eA) / det;
+    la -= (-j10 * eH + j00 * eA) / det;
+    lh = Math.max(.05, Math.min(6, lh));
+    la = Math.max(.05, Math.min(6, la));
+  }
+  return { lh, la };
+}
+
+/** Naive margin removal: scale implied probabilities to sum to 1. */
+function devigProportional(oH, oD, oA) {
+  const q = [1 / oH, 1 / oD, 1 / oA], s = q[0] + q[1] + q[2];
+  return { H: q[0] / s, D: q[1] / s, A: q[2] / s, overround: (s - 1) * 100 };
+}
+
+/** Shin: assumes a fraction z of volume is informed, which shifts margin
+    away from longshots. Diverges most on lopsided fixtures, which is
+    exactly where the naive method is worst. */
+function devigShin(oH, oD, oA) {
+  const q = [1 / oH, 1 / oD, 1 / oA], s = q[0] + q[1] + q[2];
+  const probs = z => {
+    const p = q.map(qi => (Math.sqrt(z * z + 4 * (1 - z) * qi * qi / s) - z) / (2 * (1 - z)));
+    const t = p[0] + p[1] + p[2];
+    return { p, t };
+  };
+  let lo = 0, hi = .25;
+  for (let i = 0; i < 80; i++) {
+    const mid = (lo + hi) / 2;
+    if (probs(mid).t > 1) lo = mid; else hi = mid;
+  }
+  const z = (lo + hi) / 2, { p, t } = probs(z);
+  return { H: p[0] / t, D: p[1] / t, A: p[2] / t, z };
+}
+
+function median(xs) {
+  const a = xs.filter(Number.isFinite).sort((x, y) => x - y);
+  if (!a.length) return null;
+  const m = a.length >> 1;
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+/** Median price per outcome across books: one stale book cannot skew it. */
+function consensusPrices(ev) {
+  const home = [], draw = [], away = [], names = [];
+  for (const bk of ev.bookmakers || []) {
+    const mkt = (bk.markets || []).find(m => m.key === 'h2h');
+    if (!mkt) continue;
+    const g = n => (mkt.outcomes || []).find(o => o.name === n)?.price;
+    const h = g(ev.home_team), a = g(ev.away_team), d = g('Draw');
+    if (!(h > 1 && a > 1 && d > 1)) continue;
+    home.push(h); draw.push(d); away.push(a); names.push(bk.key);
+  }
+  return { h: median(home), d: median(draw), a: median(away), books: names };
+}
+
+/**
+ * Fetch, de-vig and invert. Returns diagnostics, never throws for
+ * ordinary failures.
+ */
+async function marketProbe(env, { regions = 'uk' } = {}) {
+  const key = env.MARKET_API_KEY;
+  if (!key) return { status: 'disabled', reason: 'MARKET_API_KEY not set' };
+
+  const url = `${MARKET_HOST}/v4/sports/${MARKET_SPORT}/odds`
+    + `?regions=${encodeURIComponent(regions)}&markets=h2h&oddsFormat=decimal`
+    + `&apiKey=${encodeURIComponent(key)}`;
+
+  let res;
+  try {
+    res = await fetch(url, { headers: { accept: 'application/json' } });
+  } catch (e) {
+    return { status: 'error', stage: 'fetch', error: e?.message || String(e) };
+  }
+
+  /* These headers are the whole point of the probe: they report the real
+     quota cost rather than what the docs imply. */
+  const credits = {
+    used: res.headers.get('x-requests-used'),
+    remaining: res.headers.get('x-requests-remaining'),
+    lastCost: res.headers.get('x-requests-last')
+  };
+
+  if (!res.ok) {
+    return {
+      status: 'error', stage: 'http', httpStatus: res.status, credits,
+      body: (await res.text()).slice(0, 400)
+    };
+  }
+
+  let events;
+  try { events = await res.json(); }
+  catch (e) { return { status: 'error', stage: 'parse', credits, error: e?.message }; }
+
+  if (!Array.isArray(events)) {
+    return { status: 'error', stage: 'shape', credits, got: typeof events };
+  }
+
+  const allBooks = new Set();
+  const fixtures = [];
+
+  for (const ev of events) {
+    const px = consensusPrices(ev);
+    px.books.forEach(b => allBooks.add(b));
+    if (!(px.h && px.d && px.a)) {
+      fixtures.push({
+        home: ev.home_team, away: ev.away_team, commence: ev.commence_time,
+        skipped: 'no usable h2h prices', bookCount: px.books.length
+      });
+      continue;
+    }
+
+    const prop = devigProportional(px.h, px.d, px.a);
+    const shin = devigShin(px.h, px.d, px.a);
+    const gP = invertToGoals(prop.H, prop.A);
+    const gS = invertToGoals(shin.H, shin.A);
+    const oP = matchOutcomes(gP.lh, gP.la);
+    const oS = matchOutcomes(gS.lh, gS.la);
+
+    fixtures.push({
+      home: ev.home_team, away: ev.away_team, commence: ev.commence_time,
+      bookCount: px.books.length,
+      medianPrices: { home: px.h, draw: px.d, away: px.a },
+      overroundPct: Number(prop.overround.toFixed(2)),
+      proportional: {
+        H: +prop.H.toFixed(4), D: +prop.D.toFixed(4), A: +prop.A.toFixed(4),
+        xgHome: +gP.lh.toFixed(3), xgAway: +gP.la.toFixed(3),
+        csHome: +oP.csH.toFixed(4), csAway: +oP.csA.toFixed(4),
+        over25: +oP.over25.toFixed(4)
+      },
+      shin: {
+        z: +shin.z.toFixed(4),
+        xgHome: +gS.lh.toFixed(3), xgAway: +gS.la.toFixed(3),
+        csHome: +oS.csH.toFixed(4), csAway: +oS.csA.toFixed(4)
+      },
+      // If this is large the margin method matters more than the model.
+      devigDivergencePP: +(Math.abs(oP.csH - oS.csH) * 100).toFixed(2),
+      // Sanity: does the fitted pair reproduce the input probabilities?
+      refitErrorPP: +(Math.max(
+        Math.abs(oP.H - prop.H), Math.abs(oP.D - prop.D), Math.abs(oP.A - prop.A)
+      ) * 100).toFixed(6)
+    });
+  }
+
+  const scored = fixtures.filter(f => !f.skipped);
+  return {
+    status: 'ok',
+    sport: MARKET_SPORT,
+    regions,
+    credits,
+    fetchedAt: new Date().toISOString(),
+    eventCount: events.length,
+    usableFixtures: scored.length,
+    distinctBookmakers: [...allBooks].sort(),
+    bookmakerCount: allBooks.size,
+    maxRefitErrorPP: scored.length ? Math.max(...scored.map(f => f.refitErrorPP)) : null,
+    maxDevigDivergencePP: scored.length ? Math.max(...scored.map(f => f.devigDivergencePP)) : null,
+    fixtures
+  };
+}
+
 export default {
   async fetch(request,env,ctx){
     env = await withD1(env);
@@ -1247,6 +1476,13 @@ export default {
         const budget=makeBudget(env);
         const {entry}=await readArticle(env,target,budget);
         return json({status:'ok',probe:entry,browserAvailable:!!env.BROWSER?.quickAction,browserCalls:budget.browserCalls},200,env);
+      }
+      // Market probe: admin-only, no cron, inert without MARKET_API_KEY.
+      // Verification tool only - nothing downstream consumes it yet.
+      if(u.pathname==='/api/market/probe'){
+        if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
+        const regions=(u.searchParams.get('regions')||'uk').slice(0,32);
+        return json(await marketProbe(env,{regions}),200,env);
       }
       return json({error:'not found'},404,env);
     }catch(e){return json({status:'error',error:e?.message||String(e),generatedAt:new Date().toISOString()},500,env)}
