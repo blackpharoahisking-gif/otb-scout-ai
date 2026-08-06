@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.9.3';
+const SCHEMA_VERSION = '1.10.0';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -1349,6 +1349,128 @@ function analysePrices(px) {
   };
 }
 
+/* ---- team matching -------------------------------------------------
+   The odds feed names teams in prose ("Nott'm Forest", "Man Utd"); the
+   engine keys everything on three-letter codes. A silent mismatch would
+   quietly drop a fixture from the blend and nobody would notice, so the
+   matcher is explicit and every failure is reported. */
+const MARKET_TEAM_ALIASES = {
+  ARS:['arsenal'], AVL:['aston villa','villa'], BOU:['bournemouth','afc bournemouth'],
+  BRE:['brentford'], BHA:['brighton','brighton and hove albion','brighton & hove albion'],
+  CHE:['chelsea'], COV:['coventry','coventry city'], CRY:['crystal palace','palace'],
+  EVE:['everton'], FUL:['fulham'], HUL:['hull','hull city'],
+  IPS:['ipswich','ipswich town'], LEE:['leeds','leeds united'], LIV:['liverpool'],
+  MCI:['manchester city','man city'], MUN:['manchester united','man utd','man united'],
+  NEW:['newcastle','newcastle united'], NFO:['nottingham forest',"nott'm forest",'notts forest','forest'],
+  SUN:['sunderland'], TOT:['tottenham','tottenham hotspur','spurs']
+};
+
+function normaliseTeamName(n) {
+  return String(n || '').toLowerCase()
+    .replace(/[^a-z ]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+/* Aliases are normalised too. Comparing a normalised input against a raw
+   alias silently failed on "Nott'm Forest": the input became "nottm forest"
+   while the alias still carried its apostrophe. */
+const MARKET_ALIAS_INDEX = (() => {
+  const idx = new Map();
+  for (const [code, aliases] of Object.entries(MARKET_TEAM_ALIASES)) {
+    for (const a of aliases) idx.set(normaliseTeamName(a), code);
+  }
+  return idx;
+})();
+
+function marketTeamCode(name) {
+  const n = normaliseTeamName(name);
+  if (!n) return null;
+  const exact = MARKET_ALIAS_INDEX.get(n);
+  if (exact) return exact;
+  // Fallback: unique prefix match, so "coventry city fc" still resolves.
+  const hits = new Set();
+  for (const [alias, code] of MARKET_ALIAS_INDEX) {
+    if (n.startsWith(alias) || alias.startsWith(n)) hits.add(code);
+  }
+  return hits.size === 1 ? [...hits][0] : null;
+}
+
+/* ---- cached public team data --------------------------------------
+   Credits are the scarce resource, so only cron refreshes. User requests
+   read the cache and never trigger a fetch. */
+const MARKET_CACHE_KEY = 'market:teams';
+
+function marketRefreshMinutes(env) {
+  const v = Number(env.MARKET_REFRESH_MINUTES);
+  return Number.isFinite(v) && v > 0 ? v : 180;   // 8/day -> 240/month
+}
+function marketDailyCap(env) {
+  const v = Number(env.MARKET_DAILY_CAP);
+  return Number.isFinite(v) && v >= 0 ? v : 12;
+}
+
+/** Derived team numbers only: no odds, no bookmaker names. */
+function deriveTeamFixtures(probe) {
+  const fixtures = [], unmatched = [];
+  for (const f of probe.fixtures || []) {
+    if (f.skipped) continue;
+    const home = marketTeamCode(f.home), away = marketTeamCode(f.away);
+    if (!home || !away) {
+      unmatched.push({ home: f.home, away: f.away, resolvedHome: home, resolvedAway: away });
+      continue;
+    }
+    fixtures.push({
+      home, away, commence: f.commence, basis: f.primary,
+      xgHome: f.xgHome, xgAway: f.xgAway,
+      csHome: f.csHome, csAway: f.csAway,
+      over25: f.over25
+    });
+  }
+  return { fixtures, unmatched };
+}
+
+/**
+ * Cron-only refresh. Respects a hard daily cap so a misconfigured
+ * schedule cannot drain the monthly quota.
+ */
+async function refreshMarketData(env, now = Date.now()) {
+  if (!env.MARKET_API_KEY) return { status: 'disabled' };
+
+  const cached = await env.ROLE_KV.get(MARKET_CACHE_KEY, 'json');
+  const ageMin = cached ? (now - Date.parse(cached.fetchedAt)) / 60000 : Infinity;
+  if (ageMin < marketRefreshMinutes(env)) {
+    return { status: 'fresh', ageMinutes: Math.round(ageMin) };
+  }
+
+  const day = new Date(now).toISOString().slice(0, 10);
+  const capKey = `market:calls:${day}`;
+  const usedToday = Number(await env.ROLE_KV.get(capKey) || 0);
+  if (usedToday >= marketDailyCap(env)) {
+    return { status: 'capped', usedToday, cap: marketDailyCap(env) };
+  }
+
+  const probe = await marketProbe(env, { regions: 'uk' });
+  if (probe.status !== 'ok') {
+    return { status: 'error', detail: probe.status, httpStatus: probe.httpStatus || null };
+  }
+
+  await env.ROLE_KV.put(capKey, String(usedToday + 1), { expirationTtl: 172800 });
+
+  const { fixtures, unmatched } = deriveTeamFixtures(probe);
+  const payload = {
+    fetchedAt: new Date(now).toISOString(),
+    fixtureCount: fixtures.length,
+    exchangeCoverage: probe.exchangeCoverage,
+    devigDivergencePP: probe.devigDivergencePP,
+    unmatched,
+    fixtures
+  };
+  await env.ROLE_KV.put(MARKET_CACHE_KEY, JSON.stringify(payload), { expirationTtl: 604800 });
+  return {
+    status: 'refreshed', fixtures: fixtures.length,
+    unmatched: unmatched.length, credits: probe.credits
+  };
+}
+
 /**
  * Fetch, de-vig and invert. Returns diagnostics, never throws for
  * ordinary failures.
@@ -1465,6 +1587,14 @@ export default {
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
       if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
+      // Derived team numbers for the projection engine. Public and
+      // read-only: it never triggers a fetch, so it cannot burn credits.
+      if(u.pathname==='/api/market/teams'){
+        const d=await env.ROLE_KV.get('market:teams','json');
+        if(!d)return json({status:'ok',available:false,fixtures:[]},200,env);
+        const ageMin=Math.round((Date.now()-Date.parse(d.fetchedAt))/60000);
+        return json({status:'ok',available:true,ageMinutes:ageMin,...d},200,env);
+      }
       if(!originAllowed(request,env))return json({status:'error',error:'origin not allowed'},403,env);
 
       if(u.pathname==='/api/role-intelligence'||u.pathname.startsWith('/api/scout/team/')){
@@ -1536,7 +1666,8 @@ export default {
   },
   async scheduled(event,env,ctx){
     env = await withD1(env);
-    ctx.waitUntil((async()=>{try{await resolveCalibration(env,{limit:200})}catch{}const configured=Number(env.CRON_TEAMS_PER_RUN);
+    ctx.waitUntil((async()=>{try{const mr=await refreshMarketData(env);if(mr.status!=='fresh'&&mr.status!=='disabled')await env.ROLE_KV.put('market:lastrun',JSON.stringify({at:new Date().toISOString(),...mr}),{expirationTtl:604800})}catch(e){await env.ROLE_KV.put('market:error',JSON.stringify({at:new Date().toISOString(),error:e?.message||String(e)}),{expirationTtl:604800})}
+      try{await resolveCalibration(env,{limit:200})}catch{}const configured=Number(env.CRON_TEAMS_PER_RUN);
       // 0 must genuinely disable the sweep. The old expression was
       // Math.max(1,...Number(x)||1), so 0 became 1 and the documented
       // escape hatch did nothing.
