@@ -1293,10 +1293,21 @@ function median(xs) {
   return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
 }
 
-/** Median price per outcome across books: one stale book cannot skew it. */
-function consensusPrices(ev) {
+/* Betting exchanges are peer-to-peer: they take commission on winnings
+   rather than building margin into the price. Their overround is typically
+   1-2% against 6-8% for a sportsbook, so there is far less margin to strip
+   and the choice of de-vig method matters far less. The live probe measured
+   6.35pp of clean-sheet disagreement between proportional and Shin on a
+   lopsided fixture when pooling all 20 books — larger than most model
+   improvements are worth. Preferring exchanges attacks that at source. */
+const EXCHANGE_BOOKS = ['betfair_ex_uk', 'smarkets'];
+
+/** Median price per outcome across a chosen subset of books.
+    Median rather than mean so one stale book cannot skew the result. */
+function consensusPrices(ev, only = null) {
   const home = [], draw = [], away = [], names = [];
   for (const bk of ev.bookmakers || []) {
+    if (only && !only.includes(bk.key)) continue;
     const mkt = (bk.markets || []).find(m => m.key === 'h2h');
     if (!mkt) continue;
     const g = n => (mkt.outcomes || []).find(o => o.name === n)?.price;
@@ -1305,6 +1316,37 @@ function consensusPrices(ev) {
     home.push(h); draw.push(d); away.push(a); names.push(bk.key);
   }
   return { h: median(home), d: median(draw), a: median(away), books: names };
+}
+
+/** Full de-vig + inversion for one price set. */
+function analysePrices(px) {
+  if (!(px.h && px.d && px.a)) return null;
+  const prop = devigProportional(px.h, px.d, px.a);
+  const shin = devigShin(px.h, px.d, px.a);
+  const gP = invertToGoals(prop.H, prop.A);
+  const gS = invertToGoals(shin.H, shin.A);
+  const oP = matchOutcomes(gP.lh, gP.la);
+  const oS = matchOutcomes(gS.lh, gS.la);
+  return {
+    books: px.books, bookCount: px.books.length,
+    medianPrices: { home: px.h, draw: px.d, away: px.a },
+    overroundPct: +prop.overround.toFixed(2),
+    proportional: {
+      H: +prop.H.toFixed(4), D: +prop.D.toFixed(4), A: +prop.A.toFixed(4),
+      xgHome: +gP.lh.toFixed(3), xgAway: +gP.la.toFixed(3),
+      csHome: +oP.csH.toFixed(4), csAway: +oP.csA.toFixed(4),
+      over25: +oP.over25.toFixed(4)
+    },
+    shin: {
+      z: +shin.z.toFixed(4),
+      xgHome: +gS.lh.toFixed(3), xgAway: +gS.la.toFixed(3),
+      csHome: +oS.csH.toFixed(4), csAway: +oS.csA.toFixed(4)
+    },
+    devigDivergencePP: +(Math.abs(oP.csH - oS.csH) * 100).toFixed(2),
+    refitErrorPP: +(Math.max(
+      Math.abs(oP.H - prop.H), Math.abs(oP.D - prop.D), Math.abs(oP.A - prop.A)
+    ) * 100).toFixed(6)
+  };
 }
 
 /**
@@ -1349,53 +1391,48 @@ async function marketProbe(env, { regions = 'uk' } = {}) {
     return { status: 'error', stage: 'shape', credits, got: typeof events };
   }
 
-  const allBooks = new Set();
+  const allBooksSeen = new Set();
   const fixtures = [];
 
   for (const ev of events) {
-    const px = consensusPrices(ev);
-    px.books.forEach(b => allBooks.add(b));
-    if (!(px.h && px.d && px.a)) {
+    const allPx = consensusPrices(ev);
+    const exPx = consensusPrices(ev, EXCHANGE_BOOKS);
+    allPx.books.forEach(b => allBooksSeen.add(b));
+
+    const all = analysePrices(allPx);
+    const exch = analysePrices(exPx);
+
+    if (!all && !exch) {
       fixtures.push({
         home: ev.home_team, away: ev.away_team, commence: ev.commence_time,
-        skipped: 'no usable h2h prices', bookCount: px.books.length
+        skipped: 'no usable h2h prices', bookCount: allPx.books.length
       });
       continue;
     }
 
-    const prop = devigProportional(px.h, px.d, px.a);
-    const shin = devigShin(px.h, px.d, px.a);
-    const gP = invertToGoals(prop.H, prop.A);
-    const gS = invertToGoals(shin.H, shin.A);
-    const oP = matchOutcomes(gP.lh, gP.la);
-    const oS = matchOutcomes(gS.lh, gS.la);
+    // Exchange prices win when available; soft-book median is the fallback.
+    const primary = exch ? 'exchange' : 'allBooks';
+    const use = exch || all;
 
     fixtures.push({
       home: ev.home_team, away: ev.away_team, commence: ev.commence_time,
-      bookCount: px.books.length,
-      medianPrices: { home: px.h, draw: px.d, away: px.a },
-      overroundPct: Number(prop.overround.toFixed(2)),
-      proportional: {
-        H: +prop.H.toFixed(4), D: +prop.D.toFixed(4), A: +prop.A.toFixed(4),
-        xgHome: +gP.lh.toFixed(3), xgAway: +gP.la.toFixed(3),
-        csHome: +oP.csH.toFixed(4), csAway: +oP.csA.toFixed(4),
-        over25: +oP.over25.toFixed(4)
-      },
-      shin: {
-        z: +shin.z.toFixed(4),
-        xgHome: +gS.lh.toFixed(3), xgAway: +gS.la.toFixed(3),
-        csHome: +oS.csH.toFixed(4), csAway: +oS.csA.toFixed(4)
-      },
-      // If this is large the margin method matters more than the model.
-      devigDivergencePP: +(Math.abs(oP.csH - oS.csH) * 100).toFixed(2),
-      // Sanity: does the fitted pair reproduce the input probabilities?
-      refitErrorPP: +(Math.max(
-        Math.abs(oP.H - prop.H), Math.abs(oP.D - prop.D), Math.abs(oP.A - prop.A)
-      ) * 100).toFixed(6)
+      primary,
+      xgHome: use.proportional.xgHome, xgAway: use.proportional.xgAway,
+      csHome: use.proportional.csHome, csAway: use.proportional.csAway,
+      over25: use.proportional.over25,
+      devigDivergencePP: use.devigDivergencePP,
+      refitErrorPP: use.refitErrorPP,
+      // Both sets retained so the exchange gain is visible without a
+      // second call, which would cost another credit.
+      consensus: { exchange: exch, allBooks: all }
     });
   }
 
   const scored = fixtures.filter(f => !f.skipped);
+  const mx = (arr, f) => arr.length ? Math.max(...arr.map(f)) : null;
+  const withEx = scored.filter(f => f.consensus.exchange);
+  const withAll = scored.filter(f => f.consensus.allBooks);
+
   return {
     status: 'ok',
     sport: MARKET_SPORT,
@@ -1404,10 +1441,20 @@ async function marketProbe(env, { regions = 'uk' } = {}) {
     fetchedAt: new Date().toISOString(),
     eventCount: events.length,
     usableFixtures: scored.length,
-    distinctBookmakers: [...allBooks].sort(),
-    bookmakerCount: allBooks.size,
-    maxRefitErrorPP: scored.length ? Math.max(...scored.map(f => f.refitErrorPP)) : null,
-    maxDevigDivergencePP: scored.length ? Math.max(...scored.map(f => f.devigDivergencePP)) : null,
+    distinctBookmakers: [...allBooksSeen].sort(),
+    bookmakerCount: allBooksSeen.size,
+    exchangeCoverage: `${withEx.length}/${scored.length}`,
+    // The headline comparison: does preferring exchanges shrink the
+    // de-vig ambiguity that dominates the error budget?
+    devigDivergencePP: {
+      exchange: mx(withEx, f => f.consensus.exchange.devigDivergencePP),
+      allBooks: mx(withAll, f => f.consensus.allBooks.devigDivergencePP)
+    },
+    medianOverroundPct: {
+      exchange: median(withEx.map(f => f.consensus.exchange.overroundPct)),
+      allBooks: median(withAll.map(f => f.consensus.allBooks.overroundPct))
+    },
+    maxRefitErrorPP: mx(scored, f => f.refitErrorPP),
     fixtures
   };
 }
