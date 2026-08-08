@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v1.7 — recency-aware discovery + official breaking-event fast path
+// v2.0 — resilient cross-club discovery + unseen-first freshness + official event fast path
 //
 // Changes vs v1.2 (all additive to the response contract):
 //   1. Browser fallback is gated on ARTICLE CANDIDATES and landing text length,
@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.12.0';
+const SCHEMA_VERSION = '1.20.0';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -26,6 +26,8 @@ const ARTICLE_CACHE_DAYS = 45;
 // Bump when the TEXT FORMAT changes. v1 flattened documents to a single line,
 // which makes line-based boilerplate detection impossible; v2 preserves lines.
 const CACHE_FORMAT = 'v3';     // articles are immutable; render each URL at most once
+const DISCOVERY_LEDGER_MAX = 320;
+const RECENCY_COVERAGE_MIN = 0.25;
 
 /* ---------------------------------------------------------------- storage */
 
@@ -307,22 +309,33 @@ async function parseHtmlResponse(response,baseUrl){
   return {text:cleanLines(c.text.join('\n')).slice(0,65000),links:[...new Set(c.links)]};
 }
 
-/** Extract article timestamps from common listing-card patterns. Best effort only. */
+/** Extract publication dates from multiple publisher signals.
+ *  Structured Article data, HTML time elements and card data attributes are
+ *  combined; no single publisher convention is assumed. */
 function extractLinkTimesFromHtml(markup,baseUrl){
-  const times=new Map();
-  const html=String(markup||'');
-  const timeRe=/<time\b[^>]*(?:datetime|data-time|data-date)=[\"']([^\"']+)[\"'][^>]*>/gi;
-  const anchorRe=/<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>/gi;
-  const timeHits=[]; let m;
-  while((m=timeRe.exec(html))){const t=Date.parse(m[1]);if(Number.isFinite(t))timeHits.push({i:m.index,t})}
-  const anchors=[]; while((m=anchorRe.exec(html))){try{const u=new URL(m[1],baseUrl);if(u.protocol.startsWith('http')){u.hash='';anchors.push({i:m.index,url:u.toString()})}}catch{}}
-  for(const a of anchors){
-    let best=null,dist=Infinity;
-    for(const th of timeHits){const d=Math.abs(th.i-a.i);if(d<dist&&d<=1400){best=th;dist=d}}
-    if(best)times.set(a.url,best.t);
+  const times=new Map(),sources=new Map(),html=String(markup||'');
+  const resolveUrl=raw=>{try{const u=new URL(raw,baseUrl);if(!u.protocol.startsWith('http'))return null;u.hash='';return u.toString()}catch{return null}};
+  const set=(url,raw,source)=>{const u=resolveUrl(url),t=Date.parse(raw||'');if(!u||!Number.isFinite(t))return;const prev=times.get(u);if(!Number.isFinite(prev)||t<prev){times.set(u,t);sources.set(u,source)}};
+  const ldRe=/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while((m=ldRe.exec(html))){
+    let data;try{data=JSON.parse(m[1])}catch{continue}
+    const walk=x=>{if(!x)return;if(Array.isArray(x)){x.forEach(walk);return}if(typeof x!=='object')return;
+      const typ=Array.isArray(x['@type'])?x['@type'].join(' '):String(x['@type']||'');
+      if(/NewsArticle|Article|BlogPosting/i.test(typ)){const url=x.url||x.mainEntityOfPage?.['@id']||x.mainEntityOfPage?.url,date=x.datePublished||x.dateCreated||x.dateModified;if(url&&date)set(url,date,'json-ld')}
+      if(x['@graph'])walk(x['@graph']);for(const v of Object.values(x))if(v&&typeof v==='object')walk(v);
+    };walk(data);
   }
+  const timeRe=/<time\b[^>]*(?:datetime|data-time|data-date)=["']([^"']+)["'][^>]*>/gi;
+  const anchorRe=/<a\b[^>]*href=["']([^"']+)["'][^>]*>/gi;
+  const timeHits=[];while((m=timeRe.exec(html))){const t=Date.parse(m[1]);if(Number.isFinite(t))timeHits.push({i:m.index,t})}
+  const anchors=[];while((m=anchorRe.exec(html))){const u=resolveUrl(m[1]);if(u)anchors.push({i:m.index,url:u})}
+  for(const a of anchors){let best=null,dist=Infinity;for(const th of timeHits){const d=Math.abs(th.i-a.i);if(d<dist&&d<=2200){best=th;dist=d}}if(best&&!times.has(a.url)){times.set(a.url,best.t);sources.set(a.url,'time-near-link')}}
+  const cardDateRe=/(?:data-(?:publish(?:ed)?|date|timestamp)|datePublished)\s*=\s*["']([^"']+)["']/gi;
+  const cardDates=[];while((m=cardDateRe.exec(html))){const t=Date.parse(m[1]);if(Number.isFinite(t))cardDates.push({i:m.index,t})}
+  for(const a of anchors){if(times.has(a.url))continue;let best=null,dist=Infinity;for(const d of cardDates){const dx=Math.abs(d.i-a.i);if(dx<dist&&dx<=2200){best=d;dist=dx}}if(best){times.set(a.url,best.t);sources.set(a.url,'data-attribute')}}
   const uniqueLinks=[...new Set(anchors.map(a=>a.url))];
-  return {times,coverage:uniqueLinks.length?times.size/uniqueLinks.length:0};
+  return {times,sources,coverage:uniqueLinks.length?times.size/uniqueLinks.length:0};
 }
 
 async function fetchPage(url){
@@ -353,7 +366,7 @@ async function fetchPage(url){
   const markup=await r.text();
   const parsed=await parseHtmlResponse(new Response(markup,{headers:{'content-type':ct||'text/html'}}),r.url);
   const recency=extractLinkTimesFromHtml(markup,r.url);
-  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timestampCoverage:recency.coverage,mode:'fetch',status:r.status,redirected:r.url!==url};
+  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,mode:'fetch',status:r.status,redirected:r.url!==url};
 }
 
 /* ------------------------------------------------------------ Browser Run */
@@ -418,7 +431,7 @@ async function browserRender(env,url,budget){
   const response=new Response(markup,{headers:{'content-type':'text/html; charset=utf-8'}});
   const parsed=await parseHtmlResponse(response,url);
   const recency=extractLinkTimesFromHtml(markup,url);
-  return {url,text:parsed.text,links:parsed.links,times:recency.times,timestampCoverage:recency.coverage,mode:'browser-content',status:200,redirected:false};
+  return {url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,mode:'browser-content',status:200,redirected:false};
 }
 
 async function browserMarkdown(env,url,budget){
@@ -512,45 +525,21 @@ function stripBoilerplate(text,boilerplate){
 }
 
 
-/* ------------------------------------------------ official breaking events */
-// Role evidence and breaking club news are deliberately separate. A confirmed
-// signing can be real before FPL has registered the player or before a safe
-// incumbent xMins mapping exists. clubEvents is additive to the response.
-const CLUB_EVENT_VALUES = new Set(['signing','departure']);
-
-function titleCaseSlug(s){return String(s||'').split('-').filter(Boolean).map(w=>w?w[0].toUpperCase()+w.slice(1):w).join(' ')}
-function firstUsefulLines(text,n=12){return splitLines(text).filter(x=>x.length>=4).slice(0,n)}
-function subjectFromJoinUrl(url){try{const slug=decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop()||'');const m=slug.match(/^(.+?)-(?:joins|signs|signed)(?:-|$)/i);return m?cleanText(titleCaseSlug(m[1])).slice(0,100):''}catch{return ''}}
-function subjectFromHeadline(doc,clubName){const club=String(clubName||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');for(const line of firstUsefulLines(doc?.text)){let m=line.match(new RegExp(`^(.{2,90}?)\\s+(?:joins|signs for|signs)\\s+${club}\\b`,'i'));if(m)return cleanText(m[1]).slice(0,100);m=line.match(/^(.{2,90}?)\s+joins\s+([A-Z][A-Za-z .&'-]{2,50})$/i);if(m)return cleanText(m[1]).slice(0,100)}return subjectFromJoinUrl(doc?.url)}
-function fastPathClubEvents(team,clubName,documents){const out=[];for(const d of documents||[]){const text=String(d?.text||''),head=text.slice(0,5000);const path=(()=>{try{return decodeURIComponent(new URL(d.url).pathname).toLowerCase()}catch{return ''}})();const announcementish=/(?:-joins-|-(?:signs|signed)-|has joined us|joined us from|permanent transfer|has left the club)/i.test(path+' '+head);if(!announcementish)continue;let type=null;if(/\bhas joined us\b|\bjoined us from\b|\bjoins us\b/i.test(head))type='signing';if(/\bhas joined [A-Z][^.\n]{1,80}\b(?:in|on) a permanent transfer\b|\bhas left the club\b|\bhas left us\b/i.test(head))type='departure';if(!type){const clubNorm=normal(clubName);for(const line of firstUsefulLines(text)){const m=line.match(/^(.{2,90}?)\s+joins\s+(.{2,60})$/i);if(!m)continue;type=normal(m[2]).includes(clubNorm)?'signing':'departure';break}}if(!type||!CLUB_EVENT_VALUES.has(type))continue;const subject=subjectFromHeadline(d,clubName);if(!subject)continue;const publishedMs=Number(d.publishedAt)||null;out.push({id:`club-${hashString([team,type,subject,d.url].join('|'))}`,team,type,subject,confidence:1,source:d.url,reason:type==='signing'?`Official ${clubName} signing announcement detected. Role/xMins impact is intentionally unresolved until a current FPL player can be mapped safely.`:`Official ${clubName} departure announcement detected. Role/xMins impact is intentionally unresolved until a current FPL player can be mapped safely.`,evidenceDate:publishedMs?new Date(publishedMs).toISOString():'',official:true,fastPath:true})}const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),e.source].join('|');if(seen.has(k))return false;seen.add(k);return true})}
-
-
 
 function scoreLink(url,host,currentYear){
-  let score=0;
-  let u;
-  try{u=new URL(url)}catch{return {score:-99,reason:'unparseable'}}
+  let score=0,u;try{u=new URL(url)}catch{return {score:-99,reason:'unparseable'}}
   if(u.hostname.replace(/^www\./,'')!==host)return {score:-99,reason:'off-host'};
   const p=decodeURIComponent(u.pathname).toLowerCase();
   if(/\/news\//.test(p))score+=7;
-  if(/article|story|press|interview|team-news|transfer|sign|signs|signed|signing|joins|join-|pre-season|preseason|friendly|match-report|line-up|lineup|squad|injury|contract|loan/.test(p))score+=5;
-  if(new RegExp(`/${currentYear}/`).test(p))score+=5;
+  if(/article|story|press|interview|team-news|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pre-season|preseason|friendly|match-report|line-up|lineup|squad|injury|contract|loan/.test(p))score+=6;
+  if(new RegExp(`/${currentYear}/`).test(p))score+=1;
   if(new RegExp(`/${currentYear-1}/`).test(p))score-=2;
-  const depth=p.split('/').filter(Boolean).length;
-  if(depth>=4)score+=2;
-  if(depth>=2)score+=1;
+  const depth=p.split('/').filter(Boolean).length;if(depth>=2)score+=1;
   if(/press-conference|injury-update|starting-xi|confirmed-line-up|team-news|squad-news/.test(p))score+=4;
-  // Listings, TV guides, fixture lists and highlight reels rank highly on the
-  // old keyword rules (/news/ +7, "pre-season" +5) but contain no selection
-  // evidence. A "how to watch" page outranking a match report is why the
-  // extractor was handed goalscoring instead of team news.
-  // Tier 1: pages that structurally cannot contain selection evidence.
-  // Penalty is heavy enough to push them below the acceptance threshold.
-  if(/how-to-watch|watch-live|live-stream|tv-guide|broadcast|listen-live|quiz|competition-|matchday-guide|where-to-watch/.test(p))score-=12;
-  // Tier 2: sometimes carries a lineup mention, so demoted rather than rejected.
+  if(/how-to-watch|watch-live|live-stream|tv-guide|broadcast|listen-live|quiz|competition-|matchday-guide|where-to-watch/.test(p))score-=20;
+  if(/privacy|cookie|terms|ticket|shop|store|account|login|register|video|gallery|women|academy|hospitality|commercial|foundation|sitemap|contact/.test(p))score-=12;
   if(/preview|fixtures|highlights|\/watch-|watch--|match-gallery|photos/.test(p))score-=8;
-  if(/privacy|cookie|terms|ticket|shop|store|account|login|register|video|gallery|women|academy|hospitality|commercial|foundation|sitemap|contact/.test(p))score-=6;
-  if(p==='/'||/\/news\/?$/.test(p))score-=8;
+  if(p==='/'||/\/news\/?$/.test(p))score-=12;
   return {score,reason:score>1?'candidate':'low-score',depth};
 }
 
@@ -559,50 +548,28 @@ function scoreLink(url,host,currentYear){
  * same-host link with real path depth that is not obviously utility chrome.
  * A scan that finds links must never end with zero attempts and no diagnostic.
  */
-function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0){
-  const host=hostOf(base);
-  const currentYear=new Date().getUTCFullYear();
-  const scored=links.map((url,index)=>({url,index,time:Number(times?.get?.(url))||null,...scoreLink(url,host,currentYear)}));
+function discoveryLedgerKey(team){return `discovery:${team}`}
+async function loadDiscoveryLedger(env,team){const row=await env.ROLE_KV.get(discoveryLedgerKey(team),'json');return Array.isArray(row?.urls)?row.urls:[]}
+async function saveDiscoveryLedger(env,team,urls){const dedup=[...new Set((urls||[]).filter(Boolean))].slice(-DISCOVERY_LEDGER_MAX);await env.ROLE_KV.put(discoveryLedgerKey(team),JSON.stringify({updatedAt:new Date().toISOString(),urls:dedup}),{expirationTtl:60*60*24*120})}
 
-  const strict=scored.filter(x=>x.score>1)
-    .sort((a,b)=>b.score-a.score||a.index-b.index);
-
-  let selected=strict;
-  let pass='strict';
-  if(!selected.length){
-    selected=scored.filter(x=>x.score>-99&&(x.depth||0)>=2&&x.score>-6)
-      .sort((a,b)=>b.score-a.score||a.index-b.index);
-    pass='relaxed';
-  }
-
-  // Recency lane is only trusted when timestamp coverage is broad enough.
-  // Hard-junk pages remain excluded before they can consume a recency slot.
-  const coverage=Number(timestampCoverage)||0;
-  const useRecency=coverage>=0.40;
-  const eligible=selected.filter(x=>x.score>-6);
-  const freshLane=useRecency
-    ? eligible.filter(x=>Number.isFinite(x.time)).sort((a,b)=>b.time-a.time||b.score-a.score||a.index-b.index)
-    : [];
-  const keywordLane=eligible.slice().sort((a,b)=>b.score-a.score||a.index-b.index);
-
-  const seen=new Set();
-  const chosen=[];
-  const add=x=>{if(!x||seen.has(x.url)||chosen.length>=limit)return;seen.add(x.url);chosen.push(x.url)};
-  if(useRecency){
-    const reserve=Math.max(1,Math.floor(limit/2));
-    for(const x of freshLane){add(x);if(chosen.length>=reserve)break}
-    for(const x of keywordLane)add(x);
-    pass=`${pass}+recency`;
-  }else{
-    for(const x of keywordLane)add(x);
-    pass=selected.length?`${pass}+keyword-only`:'none';
-  }
-
-  const rejected=scored
-    .filter(x=>!seen.has(x.url))
-    .map(x=>({url:x.url,status:x.reason==='off-host'?'rejected-off-host':'rejected-low-score',score:x.score,time:x.time}));
-
-  return {candidates:chosen,rejected,pass,scoredCount:scored.length,timestampCoverage:Number(coverage.toFixed(2)),recencyUsed:useRecency};
+function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0,{seenUrls=new Set(),force=false}={}){
+  const host=hostOf(base),currentYear=new Date().getUTCFullYear();
+  const scored=links.map((url,index)=>({url,index,time:Number(times?.get?.(url))||null,seen:seenUrls.has(url),...scoreLink(url,host,currentYear)}));
+  let selected=scored.filter(x=>x.score>1),pass='strict';
+  if(!selected.length){selected=scored.filter(x=>x.score>-99&&(x.depth||0)>=2&&x.score>-6);pass='relaxed'}
+  const eligible=selected.filter(x=>x.score>1),coverage=Number(timestampCoverage)||0,useTimestamp=coverage>=RECENCY_COVERAGE_MIN;
+  const unseenFirst=(a,b)=>(a.seen===b.seen?0:(a.seen?1:-1));
+  const freshLane=useTimestamp
+    ? eligible.filter(x=>Number.isFinite(x.time)).sort((a,b)=>unseenFirst(a,b)||b.time-a.time||b.score-a.score||a.index-b.index)
+    : eligible.slice().sort((a,b)=>unseenFirst(a,b)||a.index-b.index||b.score-a.score);
+  const keywordLane=eligible.slice().sort((a,b)=>unseenFirst(a,b)||b.score-a.score||a.index-b.index);
+  const seen=new Set(),chosen=[],add=x=>{if(!x||seen.has(x.url)||chosen.length>=limit)return;seen.add(x.url);chosen.push(x.url)};
+  const reserve=Math.max(1,Math.floor(limit/2));
+  for(const x of freshLane){add(x);if(chosen.length>=reserve)break}
+  for(const x of keywordLane)add(x);
+  const recencySource=useTimestamp?'timestamp':'landing-order';pass=`${pass}+${recencySource}${force?'+unseen-first':''}`;
+  const rejected=scored.filter(x=>!seen.has(x.url)).map(x=>({url:x.url,status:x.reason==='off-host'?'rejected-off-host':'rejected-low-score',score:x.score,time:x.time,seen:x.seen}));
+  return {candidates:chosen,rejected,pass,scoredCount:scored.length,timestampCoverage:Number(coverage.toFixed(2)),recencyUsed:true,recencySource,newCandidates:chosen.filter(u=>!seenUrls.has(u)).length,cachedCandidates:chosen.filter(u=>seenUrls.has(u)).length};
 }
 
 /* --------------------------------------------------------------- discovery */
@@ -644,6 +611,7 @@ async function discoverLanding(env,url,budget){
           url:rendered.url,
           text:rendered.text.length>=(landing?.text.length||0)?rendered.text:landing.text,
           links:[...new Set([...(landing?.links||[]),...rendered.links])],
+          timeSources:new Map([...(landing?.timeSources?.entries?.()||[]),...(rendered.timeSources?.entries?.()||[])]),
           times:new Map([...(landing?.times?.entries?.()||[]),...(rendered.times?.entries?.()||[])]),
           timestampCoverage:Math.max(Number(landing?.timestampCoverage||0),Number(rendered.timestampCoverage||0)),
           mode:rendered.mode,
@@ -780,6 +748,25 @@ async function fplContext(env,team){
   // ROSTER ADDED and biases extraction toward signing events.
   if(!previous)return {current,previous:null,added:[],missing:[],currentRound};
   return {current,previous,currentRound,added:players.filter(p=>!oldNames.has(normal(p.fullName||p.name))),missing:(previous?.players||[]).filter(p=>!newNames.has(normal(p.fullName||p.name)))};
+}
+
+/* ------------------------------------------------ official club events */
+function titleCaseSlug(s){return String(s||'').split('-').filter(Boolean).map(w=>w?w[0].toUpperCase()+w.slice(1):w).join(' ')}
+function subjectFromAnnouncement(doc,clubName){
+  const lines=splitLines(doc?.text).slice(0,16),clubEsc=String(clubName||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  for(const line of lines){const m=line.match(new RegExp(`^(.{2,100}?)\\s+(?:joins|signs for|signs|arrives at)\\s+${clubEsc}\\b`,'i'));if(m)return cleanText(m[1]).slice(0,100)}
+  try{const slug=decodeURIComponent(new URL(doc.url).pathname.split('/').filter(Boolean).pop()||''),m=slug.match(/^(.+?)-(?:joins?|signs?|signed|arrives?|completes?)(?:-|$)/i);return m?cleanText(titleCaseSlug(m[1])).slice(0,100):''}catch{return ''}
+}
+function fastPathClubEvents(team,clubName,documents){
+  const out=[];
+  for(const d of documents||[]){const head=String(d.text||'').slice(0,7000),path=(()=>{try{return decodeURIComponent(new URL(d.url).pathname).toLowerCase()}catch{return ''}})(),hay=path+' '+head;let type=null;
+    if(/\bhas joined us\b|\bjoins us\b|\bjoined us from\b|\bhas signed for us\b|\bwe (?:are pleased|are delighted|can confirm) to (?:announce|confirm).{0,160}\b(?:signing|arrival)\b/i.test(hay))type='signing';
+    if(/\bhas left the club\b|\bhas left us\b|\bdeparts? the club\b|\bjoins [^.\n]{2,80} on a permanent transfer\b/i.test(hay))type='departure';
+    if(!type&&/(?:-joins?-|-signs?-|-signed-|-arrives?-|-completes?-)/i.test(path)){const subj=subjectFromAnnouncement(d,clubName);if(subj)type='signing'}
+    if(!type)continue;const subject=subjectFromAnnouncement(d,clubName);if(!subject)continue;
+    out.push({id:`club-${hashString([team,type,subject,d.url].join('|'))}`,team,type,subject,confidence:1,source:d.url,reason:`Official ${clubName} ${type} announcement detected. Role/xMins impact remains separate until a current FPL player can be mapped safely.`,evidenceDate:Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'',official:true,fastPath:true});
+  }
+  const seen=new Set();return out.filter(e=>{const k=[e.type,normal(e.subject),e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
 }
 
 /* ------------------------------------------------------------- extraction */
@@ -980,6 +967,9 @@ async function scanTeam(env,team,{force=false}={}){
   const errors=[];
   const discovery=[];
   const perUrl=[];
+  const priorDiscovered=await loadDiscoveryLedger(env,team);
+  const seenUrls=new Set(priorDiscovered);
+  const discoveredThisScan=[];
   let linksFound=0,candidateCount=0,attempted=0;
 
   for(const source of club.urls){
@@ -994,7 +984,8 @@ async function scanTeam(env,team,{force=false}={}){
 
       linksFound+=landing.links.length;
 
-      const {candidates,rejected,pass,scoredCount,timestampCoverage,recencyUsed}=selectArticleLinks(landing.url,landing.links,max,landing.times||new Map(),landing.timestampCoverage||0);
+      discoveredThisScan.push(...landing.links);
+      const {candidates,rejected,pass,scoredCount,timestampCoverage,recencyUsed,recencySource,newCandidates,cachedCandidates}=selectArticleLinks(landing.url,landing.links,max,landing.times||new Map(),landing.timestampCoverage||0,{seenUrls,force});
       candidateCount+=candidates.length;
       const candidateTimes=new Map(candidates.map(u=>[u,Number(landing.times?.get?.(u))||null]));
 
@@ -1007,7 +998,10 @@ async function scanTeam(env,team,{force=false}={}){
         selectionPass:candidates.length?pass:'none',
         timestampCoverage,
         recencyUsed,
-        selectedCandidates:candidates.map(u=>({url:u,publishedAt:candidateTimes.get(u)?new Date(candidateTimes.get(u)).toISOString():null})),
+        recencySource,
+        newCandidates,
+        cachedCandidates,
+        selectedCandidates:candidates.map(u=>({url:u,publishedAt:candidateTimes.get(u)?new Date(candidateTimes.get(u)).toISOString():null,dateSource:landing.timeSources?.get?.(u)||null,previouslySeen:seenUrls.has(u)})),
         textChars:landing.text.length,
         browserUsed:record.browserUsed,
         browserError:record.browserError||null,
@@ -1138,6 +1132,8 @@ async function scanTeam(env,team,{force=false}={}){
     }
   }
 
+  try{await saveDiscoveryLedger(env,team,[...priorDiscovered,...discoveredThisScan])}catch{}
+
   const payload={
     status:'ok',
     schemaVersion:SCHEMA_VERSION,
@@ -1183,6 +1179,9 @@ async function scanTeam(env,team,{force=false}={}){
       rawEvents:Array.isArray(raw)?raw.length:0,
       acceptedEvents:events.length,
       confirmedClubEvents:clubEvents.length,
+      newCandidates:discovery.reduce((a,d)=>a+Number(d.newCandidates||0),0),
+      cachedCandidates:discovery.reduce((a,d)=>a+Number(d.cachedCandidates||0),0),
+      recencySource:discovery.some(d=>d.recencySource==='timestamp')?'timestamp':'landing-order',
       perUrl:perUrl.slice(0,60),
       eventsFromThisScan:events.length,
       evidenceAuthoritative,
@@ -1687,6 +1686,12 @@ export default {
       if(u.pathname==='/api/role-latest'){
         if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
         return json({status:'ok',generatedAt:new Date().toISOString(),teams:await allLatest(env)},200,env);
+      }
+      if(u.pathname==='/api/scout/club-events'){
+        const team=String(u.searchParams.get('team')||'').toUpperCase();
+        if(team){const report=await env.ROLE_KV.get(`latest:${team}`,'json');return json({status:'ok',team,generatedAt:report?.generatedAt||null,events:Array.isArray(report?.clubEvents)?report.clubEvents:[]},200,env)}
+        const latest=await allLatest(env),events=[];for(const [code,report] of Object.entries(latest))for(const e of (report?.clubEvents||[]))events.push({...e,team:e.team||code});
+        events.sort((a,b)=>Date.parse(b.evidenceDate||0)-Date.parse(a.evidenceDate||0));return json({status:'ok',generatedAt:new Date().toISOString(),events:events.slice(0,100)},200,env);
       }
       if(u.pathname==='/api/scout/diagnostics'){
         const team=String(u.searchParams.get('team')||'').toUpperCase();if(!team)return json({error:'team is required'},400,env);
