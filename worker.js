@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v1.6 — recency-aware discovery + honest freshness diagnostics
+// v1.7 — recency-aware discovery + official breaking-event fast path
 //
 // Changes vs v1.2 (all additive to the response contract):
 //   1. Browser fallback is gated on ARTICLE CANDIDATES and landing text length,
@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.11.0';
+const SCHEMA_VERSION = '1.12.0';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -512,6 +512,19 @@ function stripBoilerplate(text,boilerplate){
 }
 
 
+/* ------------------------------------------------ official breaking events */
+// Role evidence and breaking club news are deliberately separate. A confirmed
+// signing can be real before FPL has registered the player or before a safe
+// incumbent xMins mapping exists. clubEvents is additive to the response.
+const CLUB_EVENT_VALUES = new Set(['signing','departure']);
+
+function titleCaseSlug(s){return String(s||'').split('-').filter(Boolean).map(w=>w?w[0].toUpperCase()+w.slice(1):w).join(' ')}
+function firstUsefulLines(text,n=12){return splitLines(text).filter(x=>x.length>=4).slice(0,n)}
+function subjectFromJoinUrl(url){try{const slug=decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop()||'');const m=slug.match(/^(.+?)-(?:joins|signs|signed)(?:-|$)/i);return m?cleanText(titleCaseSlug(m[1])).slice(0,100):''}catch{return ''}}
+function subjectFromHeadline(doc,clubName){const club=String(clubName||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');for(const line of firstUsefulLines(doc?.text)){let m=line.match(new RegExp(`^(.{2,90}?)\\s+(?:joins|signs for|signs)\\s+${club}\\b`,'i'));if(m)return cleanText(m[1]).slice(0,100);m=line.match(/^(.{2,90}?)\s+joins\s+([A-Z][A-Za-z .&'-]{2,50})$/i);if(m)return cleanText(m[1]).slice(0,100)}return subjectFromJoinUrl(doc?.url)}
+function fastPathClubEvents(team,clubName,documents){const out=[];for(const d of documents||[]){const text=String(d?.text||''),head=text.slice(0,5000);const path=(()=>{try{return decodeURIComponent(new URL(d.url).pathname).toLowerCase()}catch{return ''}})();const announcementish=/(?:-joins-|-(?:signs|signed)-|has joined us|joined us from|permanent transfer|has left the club)/i.test(path+' '+head);if(!announcementish)continue;let type=null;if(/\bhas joined us\b|\bjoined us from\b|\bjoins us\b/i.test(head))type='signing';if(/\bhas joined [A-Z][^.\n]{1,80}\b(?:in|on) a permanent transfer\b|\bhas left the club\b|\bhas left us\b/i.test(head))type='departure';if(!type){const clubNorm=normal(clubName);for(const line of firstUsefulLines(text)){const m=line.match(/^(.{2,90}?)\s+joins\s+(.{2,60})$/i);if(!m)continue;type=normal(m[2]).includes(clubNorm)?'signing':'departure';break}}if(!type||!CLUB_EVENT_VALUES.has(type))continue;const subject=subjectFromHeadline(d,clubName);if(!subject)continue;const publishedMs=Number(d.publishedAt)||null;out.push({id:`club-${hashString([team,type,subject,d.url].join('|'))}`,team,type,subject,confidence:1,source:d.url,reason:type==='signing'?`Official ${clubName} signing announcement detected. Role/xMins impact is intentionally unresolved until a current FPL player can be mapped safely.`:`Official ${clubName} departure announcement detected. Role/xMins impact is intentionally unresolved until a current FPL player can be mapped safely.`,evidenceDate:publishedMs?new Date(publishedMs).toISOString():'',official:true,fastPath:true})}const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),e.source].join('|');if(seen.has(k))return false;seen.add(k);return true})}
+
+
 
 function scoreLink(url,host,currentYear){
   let score=0;
@@ -983,6 +996,7 @@ async function scanTeam(env,team,{force=false}={}){
 
       const {candidates,rejected,pass,scoredCount,timestampCoverage,recencyUsed}=selectArticleLinks(landing.url,landing.links,max,landing.times||new Map(),landing.timestampCoverage||0);
       candidateCount+=candidates.length;
+      const candidateTimes=new Map(candidates.map(u=>[u,Number(landing.times?.get?.(u))||null]));
 
       discovery.push({
         source:landing.url,
@@ -993,6 +1007,7 @@ async function scanTeam(env,team,{force=false}={}){
         selectionPass:candidates.length?pass:'none',
         timestampCoverage,
         recencyUsed,
+        selectedCandidates:candidates.map(u=>({url:u,publishedAt:candidateTimes.get(u)?new Date(candidateTimes.get(u)).toISOString():null})),
         textChars:landing.text.length,
         browserUsed:record.browserUsed,
         browserError:record.browserError||null,
@@ -1030,7 +1045,7 @@ async function scanTeam(env,team,{force=false}={}){
         attempted++;
         const {doc,entry}=await readArticle(env,url,budget);
         perUrl.push({...entry,kind:'article'});
-        if(doc&&doc.text)documents.push({...doc,kind:'article'});
+        if(doc&&doc.text)documents.push({...doc,kind:'article',publishedAt:candidateTimes.get(url)||null});
         if(entry.error)errors.push(`${url}: ${entry.error}`);
       }
     }catch(e){
@@ -1060,6 +1075,7 @@ async function scanTeam(env,team,{force=false}={}){
   const retrieved=documents.filter(d=>d.text&&d.text.length>0);
   const useful=documents.filter(d=>d.text&&d.text.length>=AI_MIN_DOC_CHARS);
   const articleDocs=useful.filter(d=>d.kind==='article');
+  const clubEvents=fastPathClubEvents(team,club.name,articleDocs);
 
   // Only run the model when at least one real article was read, and send ONLY
   // the articles. The landing page is a headline list whose every line recurs
@@ -1166,6 +1182,7 @@ async function scanTeam(env,team,{force=false}={}){
       budgetExpired:budget.expired(),
       rawEvents:Array.isArray(raw)?raw.length:0,
       acceptedEvents:events.length,
+      confirmedClubEvents:clubEvents.length,
       perUrl:perUrl.slice(0,60),
       eventsFromThisScan:events.length,
       evidenceAuthoritative,
@@ -1180,6 +1197,7 @@ async function scanTeam(env,team,{force=false}={}){
       added:roster.added.map(p=>p.name),
       missingUnresolved:roster.missing.map(p=>p.name)
     },
+    clubEvents,
     events:finalEvents
   };
 
