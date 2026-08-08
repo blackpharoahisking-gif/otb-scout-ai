@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v1.5 — boilerplate stripping + hard browser budget
+// v1.6 — recency-aware discovery + honest freshness diagnostics
 //
 // Changes vs v1.2 (all additive to the response contract):
 //   1. Browser fallback is gated on ARTICLE CANDIDATES and landing text length,
@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.10.0';
+const SCHEMA_VERSION = '1.11.0';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -307,6 +307,24 @@ async function parseHtmlResponse(response,baseUrl){
   return {text:cleanLines(c.text.join('\n')).slice(0,65000),links:[...new Set(c.links)]};
 }
 
+/** Extract article timestamps from common listing-card patterns. Best effort only. */
+function extractLinkTimesFromHtml(markup,baseUrl){
+  const times=new Map();
+  const html=String(markup||'');
+  const timeRe=/<time\b[^>]*(?:datetime|data-time|data-date)=[\"']([^\"']+)[\"'][^>]*>/gi;
+  const anchorRe=/<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>/gi;
+  const timeHits=[]; let m;
+  while((m=timeRe.exec(html))){const t=Date.parse(m[1]);if(Number.isFinite(t))timeHits.push({i:m.index,t})}
+  const anchors=[]; while((m=anchorRe.exec(html))){try{const u=new URL(m[1],baseUrl);if(u.protocol.startsWith('http')){u.hash='';anchors.push({i:m.index,url:u.toString()})}}catch{}}
+  for(const a of anchors){
+    let best=null,dist=Infinity;
+    for(const th of timeHits){const d=Math.abs(th.i-a.i);if(d<dist&&d<=1400){best=th;dist=d}}
+    if(best)times.set(a.url,best.t);
+  }
+  const uniqueLinks=[...new Set(anchors.map(a=>a.url))];
+  return {times,coverage:uniqueLinks.length?times.size/uniqueLinks.length:0};
+}
+
 async function fetchPage(url){
   let r;
   try{
@@ -332,8 +350,10 @@ async function fetchPage(url){
     const err=new Error(`unsupported content-type: ${ct||'unknown'}`);
     err.kind='content-type';err.url=r.url;throw err;
   }
-  const parsed=await parseHtmlResponse(r,r.url);
-  return {url:r.url,text:parsed.text,links:parsed.links,mode:'fetch',status:r.status,redirected:r.url!==url};
+  const markup=await r.text();
+  const parsed=await parseHtmlResponse(new Response(markup,{headers:{'content-type':ct||'text/html'}}),r.url);
+  const recency=extractLinkTimesFromHtml(markup,r.url);
+  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timestampCoverage:recency.coverage,mode:'fetch',status:r.status,redirected:r.url!==url};
 }
 
 /* ------------------------------------------------------------ Browser Run */
@@ -397,7 +417,8 @@ async function browserRender(env,url,budget){
   if(!markup)throw new Error('Browser Run content returned no markup.');
   const response=new Response(markup,{headers:{'content-type':'text/html; charset=utf-8'}});
   const parsed=await parseHtmlResponse(response,url);
-  return {url,text:parsed.text,links:parsed.links,mode:'browser-content',status:200,redirected:false};
+  const recency=extractLinkTimesFromHtml(markup,url);
+  return {url,text:parsed.text,links:parsed.links,times:recency.times,timestampCoverage:recency.coverage,mode:'browser-content',status:200,redirected:false};
 }
 
 async function browserMarkdown(env,url,budget){
@@ -499,7 +520,7 @@ function scoreLink(url,host,currentYear){
   if(u.hostname.replace(/^www\./,'')!==host)return {score:-99,reason:'off-host'};
   const p=decodeURIComponent(u.pathname).toLowerCase();
   if(/\/news\//.test(p))score+=7;
-  if(/article|story|press|interview|team-news|transfer|sign|pre-season|preseason|friendly|match-report|line-up|lineup|squad|injury|contract|loan/.test(p))score+=5;
+  if(/article|story|press|interview|team-news|transfer|sign|signs|signed|signing|joins|join-|pre-season|preseason|friendly|match-report|line-up|lineup|squad|injury|contract|loan/.test(p))score+=5;
   if(new RegExp(`/${currentYear}/`).test(p))score+=5;
   if(new RegExp(`/${currentYear-1}/`).test(p))score-=2;
   const depth=p.split('/').filter(Boolean).length;
@@ -525,10 +546,10 @@ function scoreLink(url,host,currentYear){
  * same-host link with real path depth that is not obviously utility chrome.
  * A scan that finds links must never end with zero attempts and no diagnostic.
  */
-function selectArticleLinks(base,links,limit){
+function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0){
   const host=hostOf(base);
   const currentYear=new Date().getUTCFullYear();
-  const scored=links.map((url,index)=>({url,index,...scoreLink(url,host,currentYear)}));
+  const scored=links.map((url,index)=>({url,index,time:Number(times?.get?.(url))||null,...scoreLink(url,host,currentYear)}));
 
   const strict=scored.filter(x=>x.score>1)
     .sort((a,b)=>b.score-a.score||a.index-b.index);
@@ -541,25 +562,40 @@ function selectArticleLinks(base,links,limit){
     pass='relaxed';
   }
 
+  // Recency lane is only trusted when timestamp coverage is broad enough.
+  // Hard-junk pages remain excluded before they can consume a recency slot.
+  const coverage=Number(timestampCoverage)||0;
+  const useRecency=coverage>=0.40;
+  const eligible=selected.filter(x=>x.score>-6);
+  const freshLane=useRecency
+    ? eligible.filter(x=>Number.isFinite(x.time)).sort((a,b)=>b.time-a.time||b.score-a.score||a.index-b.index)
+    : [];
+  const keywordLane=eligible.slice().sort((a,b)=>b.score-a.score||a.index-b.index);
+
   const seen=new Set();
   const chosen=[];
-  for(const x of selected){
-    if(seen.has(x.url))continue;
-    seen.add(x.url);
-    chosen.push(x.url);
-    if(chosen.length>=limit)break;
+  const add=x=>{if(!x||seen.has(x.url)||chosen.length>=limit)return;seen.add(x.url);chosen.push(x.url)};
+  if(useRecency){
+    const reserve=Math.max(1,Math.floor(limit/2));
+    for(const x of freshLane){add(x);if(chosen.length>=reserve)break}
+    for(const x of keywordLane)add(x);
+    pass=`${pass}+recency`;
+  }else{
+    for(const x of keywordLane)add(x);
+    pass=selected.length?`${pass}+keyword-only`:'none';
   }
+
   const rejected=scored
     .filter(x=>!seen.has(x.url))
-    .map(x=>({url:x.url,status:x.reason==='off-host'?'rejected-off-host':'rejected-low-score',score:x.score}));
+    .map(x=>({url:x.url,status:x.reason==='off-host'?'rejected-off-host':'rejected-low-score',score:x.score,time:x.time}));
 
-  return {candidates:chosen,rejected,pass,scoredCount:scored.length};
+  return {candidates:chosen,rejected,pass,scoredCount:scored.length,timestampCoverage:Number(coverage.toFixed(2)),recencyUsed:useRecency};
 }
 
 /* --------------------------------------------------------------- discovery */
 
 async function discoverLanding(env,url,budget){
-  const record={source:url,mode:'fetch',linksFound:0,textChars:0,browserUsed:false,browserError:null,fetchError:null};
+  const record={source:url,mode:'fetch',linksFound:0,textChars:0,browserUsed:false,browserError:null,fetchError:null,timestampCoverage:0,recencyUsed:false};
   let landing=null;
 
   try{
@@ -568,6 +604,7 @@ async function discoverLanding(env,url,budget){
     record.linksFound=landing.links.length;
     record.textChars=landing.text.length;
     record.source=landing.url;
+    record.timestampCoverage=Number(landing.timestampCoverage||0);
   }catch(e){
     record.fetchError=`${e.kind||'error'}: ${e.message}`;
   }
@@ -594,12 +631,15 @@ async function discoverLanding(env,url,budget){
           url:rendered.url,
           text:rendered.text.length>=(landing?.text.length||0)?rendered.text:landing.text,
           links:[...new Set([...(landing?.links||[]),...rendered.links])],
+          times:new Map([...(landing?.times?.entries?.()||[]),...(rendered.times?.entries?.()||[])]),
+          timestampCoverage:Math.max(Number(landing?.timestampCoverage||0),Number(rendered.timestampCoverage||0)),
           mode:rendered.mode,
           status:200,
           redirected:false
         };
         record.linksFound=landing.links.length;
         record.textChars=landing.text.length;
+        record.timestampCoverage=Number(landing.timestampCoverage||0);
       }catch(e){
         record.browserError=e?.message||String(e);
       }
@@ -941,7 +981,7 @@ async function scanTeam(env,team,{force=false}={}){
 
       linksFound+=landing.links.length;
 
-      const {candidates,rejected,pass,scoredCount}=selectArticleLinks(landing.url,landing.links,max);
+      const {candidates,rejected,pass,scoredCount,timestampCoverage,recencyUsed}=selectArticleLinks(landing.url,landing.links,max,landing.times||new Map(),landing.timestampCoverage||0);
       candidateCount+=candidates.length;
 
       discovery.push({
@@ -951,6 +991,8 @@ async function scanTeam(env,team,{force=false}={}){
         linksScored:scoredCount,
         candidates:candidates.length,
         selectionPass:candidates.length?pass:'none',
+        timestampCoverage,
+        recencyUsed,
         textChars:landing.text.length,
         browserUsed:record.browserUsed,
         browserError:record.browserError||null,
@@ -1127,7 +1169,11 @@ async function scanTeam(env,team,{force=false}={}){
       perUrl:perUrl.slice(0,60),
       eventsFromThisScan:events.length,
       evidenceAuthoritative,
-      evidenceCarriedForward
+      evidenceCarriedForward,
+      timestampCoverage: discovery.length?Number((discovery.reduce((a,d)=>a+Number(d.timestampCoverage||0),0)/discovery.length).toFixed(2)):0,
+      recencyRankingUsed: discovery.some(d=>d.recencyUsed),
+      scanMode: force?'forced-live':'background',
+      cacheState: 'MISS'
     },
     roster:{
       players:roster.current.players.length,
@@ -1672,6 +1718,6 @@ export default {
       // Math.max(1,...Number(x)||1), so 0 became 1 and the documented
       // escape hatch did nothing.
       if(Number.isFinite(configured)&&configured<=0)return;
-      const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.min(4,Math.max(1,Number.isFinite(configured)?configured:1));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeamGuarded(env,team)}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
+      const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.min(4,Math.max(1,Number.isFinite(configured)?configured:4));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeamGuarded(env,team)}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
   }
 };
