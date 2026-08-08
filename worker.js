@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v2.4 — cross-club football terminology taxonomy + semantic event guards
+// v2.8 — RC5.0.8 release hardening: atomic scan lock, execution-aware quota, safe event ageing
 //
 // Changes vs v1.2 (all additive to the response contract):
 //   1. Browser fallback is gated on ARTICLE CANDIDATES and landing text length,
@@ -14,7 +14,11 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.24.0';
+const SCHEMA_VERSION = '1.28.0';   // wire format: UNCHANGED in RC5.0.9 (no field/shape change)
+// Single source of truth. This string was previously duplicated in the report
+// payload and the /api/health response, which is exactly how a deployment
+// smoke test ends up verifying one build while the other reports another.
+const WORKER_BUILD = 'v2.10-rc5.0.10-independent-verified';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -23,9 +27,20 @@ const DEFAULT_BROWSER_BUDGET = 3;  // max Browser Run calls per scan (see notes:
 const DEFAULT_BROWSER_SPACING_MS = 2500; // Browser Run enforces a per-second fill rate, not a burst allowance
 const DEFAULT_SCAN_BUDGET_MS = 45000;
 const ARTICLE_CACHE_DAYS = 45;
+const MUTABLE_CACHE_MINUTES = 90;
+const MUTABLE_ARTICLE_RE = /(?:team-news|fitness-update|injury-update|press-conference|squad-news|starting-xi|confirmed-line-up|line-up|lineup|availability|ruled-out|doubtful|training|matchday-live|live-blog)/i;
+
+function isMutableArticleUrl(url){
+  try{return MUTABLE_ARTICLE_RE.test(decodeURIComponent(new URL(url).pathname))}
+  catch{return MUTABLE_ARTICLE_RE.test(String(url||''))}
+}
+function articleCacheMaxAgeMs(url,force=false){
+  if(force&&isMutableArticleUrl(url))return 0; // manual Fresh Scan revalidates mutable operational news
+  return isMutableArticleUrl(url)?MUTABLE_CACHE_MINUTES*60000:ARTICLE_CACHE_DAYS*86400000;
+}
 // Bump when the TEXT FORMAT changes. v1 flattened documents to a single line,
 // which makes line-based boilerplate detection impossible; v2 preserves lines.
-const CACHE_FORMAT = 'v3';     // articles are immutable; render each URL at most once
+const CACHE_FORMAT = 'v3';     // extracted article cache; mutable operational URLs are revalidated
 const DISCOVERY_LEDGER_MAX = 320;
 const DISCOVERY_LEDGER_VERSION = 'v2';
 const RECENCY_COVERAGE_MIN = 0.25;
@@ -145,7 +160,26 @@ const TEAM_ALIASES = {
 };
 
 const ROLE_VALUES = new Set(['GK','CB','FB','DM','CM','AM','LW','RW','ST']);
-const EVENT_VALUES = new Set(['observed_role','departure','signing','loan_in','loan_out','injury','return','manager_positive','manager_negative']);
+const EVENT_VALUES = new Set(['observed_role','confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','rotation_warning','suspension','departure','signing','loan_in','loan_out','injury','return','manager_positive','manager_negative']);
+
+const EVIDENCE_POLICY = Object.freeze({
+  confirmed_start:{channel:'lineup',tier:1,halfLifeHours:18,ttlHours:30,maxMinuteImpact:35,direct:true},
+  confirmed_bench:{channel:'lineup',tier:1,halfLifeHours:18,ttlHours:30,maxMinuteImpact:35,direct:true},
+  unavailable:{channel:'availability',tier:1,halfLifeHours:72,ttlHours:168,maxMinuteImpact:90,direct:true},
+  suspension:{channel:'availability',tier:1,halfLifeHours:168,ttlHours:336,maxMinuteImpact:90,direct:true},
+  minutes_restricted:{channel:'availability',tier:1,halfLifeHours:48,ttlHours:96,maxMinuteImpact:45,direct:true},
+  fitness_doubt:{channel:'availability',tier:2,halfLifeHours:36,ttlHours:72,maxMinuteImpact:25,direct:true},
+  observed_role:{channel:'selection',tier:2,halfLifeHours:240,ttlHours:720,maxMinuteImpact:12,direct:true},
+  rotation_warning:{channel:'manager',tier:2,halfLifeHours:72,ttlHours:120,maxMinuteImpact:12,direct:true},
+  manager_positive:{channel:'manager',tier:2,halfLifeHours:96,ttlHours:168,maxMinuteImpact:10,direct:true},
+  manager_negative:{channel:'manager',tier:2,halfLifeHours:96,ttlHours:168,maxMinuteImpact:10,direct:true},
+  signing:{channel:'competition',tier:3,halfLifeHours:360,ttlHours:1080,maxMinuteImpact:5,direct:false},
+  departure:{channel:'competition',tier:3,halfLifeHours:360,ttlHours:1080,maxMinuteImpact:5,direct:false},
+  loan_in:{channel:'competition',tier:3,halfLifeHours:240,ttlHours:720,maxMinuteImpact:5,direct:false},
+  loan_out:{channel:'competition',tier:3,halfLifeHours:240,ttlHours:720,maxMinuteImpact:5,direct:false},
+  injury:{channel:'competition',tier:3,halfLifeHours:120,ttlHours:336,maxMinuteImpact:6,direct:false},
+  return:{channel:'competition',tier:3,halfLifeHours:120,ttlHours:336,maxMinuteImpact:6,direct:false}
+});
 
 // Vocabulary observed across official club publishing styles. Discovery uses
 // these families broadly; classification below requires semantic context so
@@ -335,16 +369,31 @@ async function noteForcedScan(env,team){
   await env.ROLE_KV.put(`forcelast:${team}`,String(Date.now()),{expirationTtl:60*60*24});
 }
 
-/** Prevents cron and a user (or two users) scanning the same club at once. */
+/** Prevents cron and users scanning the same club at once.
+ *  Acquisition is one atomic SQLite UPSERT. The token makes release ownership
+ *  safe: an old request cannot clear a newer request's lock after TTL rollover.
+ */
 async function acquireScanLock(env,team){
-  const key=`lock:scan:${team}`;
-  const held=Number(await env.ROLE_KV.get(key))||0;
-  if(held&&Date.now()-held<SCAN_LOCK_TTL_MS)return false;
-  await env.ROLE_KV.put(key,String(Date.now()),{expirationTtl:Math.ceil(SCAN_LOCK_TTL_MS/1000)+30});
-  return true;
+  const key=`lock:scan:${team}`,now=Date.now(),cutoff=now-SCAN_LOCK_TTL_MS;
+  const token=`${now}:${crypto.randomUUID()}`;
+  const expiresAt=now+SCAN_LOCK_TTL_MS+30000;
+  const result=await env.DB.prepare(`
+    INSERT INTO otb_store (key,value,expires_at,updated_at)
+    VALUES (?,?,?,?)
+    ON CONFLICT(key) DO UPDATE SET
+      value=excluded.value,
+      expires_at=excluded.expires_at,
+      updated_at=excluded.updated_at
+    WHERE otb_store.updated_at <= ? OR otb_store.value='0'
+  `).bind(key,token,expiresAt,now,cutoff).run();
+  return Number(result?.meta?.changes||0)>0?token:null;
 }
-async function releaseScanLock(env,team){
-  try{await env.ROLE_KV.put(`lock:scan:${team}`,'0',{expirationTtl:60})}catch{}
+async function releaseScanLock(env,team,token){
+  if(!token)return;
+  try{
+    await env.DB.prepare('DELETE FROM otb_store WHERE key = ? AND value = ?')
+      .bind(`lock:scan:${team}`,String(token)).run();
+  }catch{}
 }
 
 /* ------------------------------------------------------------ page reading */
@@ -400,15 +449,47 @@ function extractLinkTimesFromHtml(markup,baseUrl){
   const uniqueLinks=[...new Set(anchors.map(a=>a.url))];
   return {times,sources,coverage:uniqueLinks.length?times.size/uniqueLinks.length:0};
 }
+function extractPagePublicationFromHtml(markup){
+  const html=String(markup||''),hits=[];
+  const push=(raw,source,priority)=>{const t=Date.parse(raw||'');if(Number.isFinite(t))hits.push({t,source,priority})};
+  let m;
+  const metaRe=/<meta\b[^>]*(?:property|name)=["']([^"']+)["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
+  while((m=metaRe.exec(html))){
+    const k=String(m[1]||'').toLowerCase(),v=m[2];
+    if(['article:published_time','og:published_time','datepublished','publishdate','pubdate'].includes(k))push(v,`meta:${k}`,1);
+    else if(['article:modified_time','datemodified','last-modified'].includes(k))push(v,`meta:${k}`,5);
+  }
+  const ldRe=/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  while((m=ldRe.exec(html))){
+    let data;try{data=JSON.parse(m[1])}catch{continue}
+    const walk=x=>{if(!x)return;if(Array.isArray(x)){x.forEach(walk);return}if(typeof x!=='object')return;
+      const typ=Array.isArray(x['@type'])?x['@type'].join(' '):String(x['@type']||'');
+      if(/NewsArticle|Article|BlogPosting/i.test(typ)){
+        if(x.datePublished)push(x.datePublished,'json-ld:datePublished',0);
+        else if(x.dateCreated)push(x.dateCreated,'json-ld:dateCreated',2);
+        else if(x.dateModified)push(x.dateModified,'json-ld:dateModified',6);
+      }
+      if(x['@graph'])walk(x['@graph']);for(const v of Object.values(x))if(v&&typeof v==='object')walk(v);
+    };walk(data);
+  }
+  const timeRe=/<time\b[^>]*datetime=["']([^"']+)["'][^>]*>/gi;
+  while((m=timeRe.exec(html)))push(m[1],'time:datetime',3);
+  if(!hits.length)return {publishedAt:null,dateSource:null};
+  hits.sort((a,b)=>a.priority-b.priority||a.t-b.t);
+  return {publishedAt:hits[0].t,dateSource:hits[0].source};
+}
 
-async function fetchPage(url){
+
+async function fetchPage(url,{etag=null,lastModified=null}={}){
   let r;
   try{
     r=await fetch(url,{
       headers:{
         'User-Agent':'OTB-Scout-AI/1.3 (+FPL research; contact via otb-role-intelligence.workers.dev)',
         'Accept':'text/html,application/xhtml+xml',
-        'Accept-Language':'en-GB,en;q=0.9'
+        'Accept-Language':'en-GB,en;q=0.9',
+        ...(etag?{'If-None-Match':etag}:{}),
+        ...(lastModified?{'If-Modified-Since':lastModified}:{})
       },
       redirect:'follow'
     });
@@ -416,6 +497,7 @@ async function fetchPage(url){
     const err=new Error(`network error: ${e?.message||String(e)}`);
     err.kind='network';err.url=url;throw err;
   }
+  if(r.status===304)return {url:r.url,notModified:true,status:304,mode:'fetch-304',etag:r.headers.get('etag')||etag||null,lastModified:r.headers.get('last-modified')||lastModified||null};
   if(!r.ok){
     const err=new Error(`HTTP ${r.status}`);
     err.kind=r.status===403||r.status===429?'blocked':'http';
@@ -429,7 +511,8 @@ async function fetchPage(url){
   const markup=await r.text();
   const parsed=await parseHtmlResponse(new Response(markup,{headers:{'content-type':ct||'text/html'}}),r.url);
   const recency=extractLinkTimesFromHtml(markup,r.url);
-  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,mode:'fetch',status:r.status,redirected:r.url!==url};
+  const pageDate=extractPagePublicationFromHtml(markup);
+  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,etag:r.headers.get('etag')||null,lastModified:r.headers.get('last-modified')||null,mode:'fetch',status:r.status,redirected:r.url!==url};
 }
 
 /* ------------------------------------------------------------ Browser Run */
@@ -494,7 +577,8 @@ async function browserRender(env,url,budget){
   const response=new Response(markup,{headers:{'content-type':'text/html; charset=utf-8'}});
   const parsed=await parseHtmlResponse(response,url);
   const recency=extractLinkTimesFromHtml(markup,url);
-  return {url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,mode:'browser-content',status:200,redirected:false};
+  const pageDate=extractPagePublicationFromHtml(markup);
+  return {url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,mode:'browser-content',status:200,redirected:false};
 }
 
 async function browserMarkdown(env,url,budget){
@@ -504,17 +588,20 @@ async function browserMarkdown(env,url,budget){
 }
 
 /* --------------------------------------------------------- article cache */
-// News articles are immutable once published. Rendering the same URL on every
-// scan is what burns the Browser Run allowance: a club's news index shows the
-// same eight stories for days. Caching the extracted text means each article is
-// rendered at most once, ever, and a warm scan spends near-zero browser time.
+// Stable announcement/history URLs use a long extracted-text cache. Mutable
+// operational URLs (team news, fitness, press conferences, lineups, training)
+// use a short cache and are always revalidated during an explicit Fresh Scan.
+// HTTP validators keep revalidation cheap when publishers support them.
 
 function articleKey(url){return `article:${CACHE_FORMAT}:${hashString(url)}`}
 
-async function cachedArticle(env,url){
+async function cachedArticle(env,url,{force=false}={}){
   try{
     const hit=await env.ROLE_KV.get(articleKey(url),'json');
     if(!hit?.text||hit.text.length<AI_MIN_DOC_CHARS)return null;
+    const fetchedAt=Date.parse(hit.fetchedAt||'');
+    const maxAge=articleCacheMaxAgeMs(url,force);
+    if(maxAge===0 || !Number.isFinite(fetchedAt) || Date.now()-fetchedAt>maxAge)return null;
     // Integrity check. The stored payload records the URL it was written for;
     // if it disagrees, the key resolved to another article and the text would
     // be silently wrong. Treat as a miss and re-render rather than serve it.
@@ -531,7 +618,9 @@ async function storeArticle(env,url,doc){
   if(!doc?.text||doc.text.length<AI_MIN_DOC_CHARS)return;
   try{
     await env.ROLE_KV.put(articleKey(url),JSON.stringify({
-      url,text:doc.text,mode:doc.mode,fetchedAt:new Date().toISOString()
+      url,text:doc.text,mode:doc.mode,fetchedAt:new Date().toISOString(),
+      publishedAt:Number(doc.publishedAt)||null,dateSource:doc.dateSource||null,
+      etag:doc.etag||null,lastModified:doc.lastModified||null
     }),{expirationTtl:60*60*24*ARTICLE_CACHE_DAYS});
   }catch{}
 }
@@ -755,77 +844,66 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
 
 /* ---------------------------------------------------------- article reading */
 
-async function readArticle(env,url,budget){
-  const entry={url,status:'pending',mode:null,chars:0,httpStatus:null,error:null,browserUsed:false,cached:false};
+async function readArticle(env,url,budget,{force=false}={}){
+  const entry={url,status:'pending',mode:null,chars:0,httpStatus:null,error:null,browserUsed:false,cached:false,revalidated:false,mutable:isMutableArticleUrl(url)};
+  let hit=null;
+  try{hit=await env.ROLE_KV.get(articleKey(url),'json')}catch{}
 
-  // 1. Cache. Costs nothing and is the reason a warm scan needs no browser.
-  const hit=await cachedArticle(env,url);
-  if(hit){
-    entry.status='cached';entry.mode=hit.mode||'cache';entry.cachedAt=hit.fetchedAt||null;entry.chars=hit.text.length;entry.cached=true;
-    return {doc:{url,text:hit.text,mode:'cache',status:200},entry};
+  // Long-lived immutable articles can be served directly. Mutable operational
+  // news is short-lived and a manual Fresh Scan always revalidates it.
+  const usableCache=await cachedArticle(env,url,{force});
+  if(usableCache){
+    entry.status='cached';entry.mode=usableCache.mode||'cache';entry.cachedAt=usableCache.fetchedAt||null;entry.chars=usableCache.text.length;entry.cached=true;entry.publishedAt=usableCache.publishedAt||null;entry.dateSource=usableCache.dateSource||null;
+    return {doc:{url,text:usableCache.text,mode:'cache',status:200,publishedAt:usableCache.publishedAt||null,dateSource:usableCache.dateSource||null,etag:usableCache.etag||null,lastModified:usableCache.lastModified||null},entry};
   }
 
   let page=null;
-
-  // 2. Plain fetch. No browser time, and some clubs are server-rendered.
   try{
-    page=await fetchPage(url);
-    entry.httpStatus=page.status;
-    entry.mode=page.mode;
-    entry.chars=page.text.length;
+    page=await fetchPage(url,{etag:hit?.etag||null,lastModified:hit?.lastModified||null});
+    if(page.notModified && hit?.text){
+      const refreshed={...hit,fetchedAt:new Date().toISOString(),etag:page.etag||hit.etag||null,lastModified:page.lastModified||hit.lastModified||null};
+      await env.ROLE_KV.put(articleKey(url),JSON.stringify(refreshed),{expirationTtl:60*60*24*ARTICLE_CACHE_DAYS});
+      entry.status='revalidated-not-modified';entry.mode='fetch-304';entry.httpStatus=304;entry.chars=hit.text.length;entry.cached=true;entry.revalidated=true;entry.publishedAt=hit.publishedAt||null;entry.dateSource=hit.dateSource||null;
+      return {doc:{url,text:hit.text,mode:'cache-revalidated',status:200,publishedAt:hit.publishedAt||null,dateSource:hit.dateSource||null,etag:refreshed.etag,lastModified:refreshed.lastModified},entry};
+    }
+    entry.httpStatus=page.status;entry.mode=page.mode;entry.chars=page.text.length;
     if(page.text.length>=ARTICLE_MIN_CHARS){
-      entry.status='accepted';
+      entry.status='accepted';entry.publishedAt=page.publishedAt||null;entry.dateSource=page.dateSource||null;
       await storeArticle(env,url,page);
       return {doc:page,entry};
     }
     entry.status='thin';
   }catch(e){
-    entry.error=`${e.kind||'error'}: ${e.message}`;
-    entry.httpStatus=e.status??null;
-    entry.status=e.kind==='blocked'?'blocked':'fetch-error';
+    entry.error=`${e.kind||'error'}: ${e.message}`;entry.httpStatus=e.status??null;entry.status=e.kind==='blocked'?'blocked':'fetch-error';
   }
 
-  // 3. Browser render, if the allowance permits.
   if(budget.canBrowse(env)){
     try{
-      const rendered=await browserMarkdown(env,url,budget);
-      entry.browserUsed=true;
-      entry.mode=rendered.mode;
-      entry.chars=rendered.text.length;
+      // content gives us rendered HTML so we can recover both text AND article timestamp.
+      const rendered=await browserRender(env,url,budget);
+      entry.browserUsed=true;entry.mode=rendered.mode;entry.chars=rendered.text.length;
       if(rendered.text.length>=AI_MIN_DOC_CHARS){
-        entry.status='accepted-browser';
+        entry.status='accepted-browser';entry.publishedAt=rendered.publishedAt||page?.publishedAt||null;entry.dateSource=rendered.dateSource||page?.dateSource||null;
+        if(!rendered.publishedAt&&page?.publishedAt)rendered.publishedAt=page.publishedAt;
+        if(!rendered.dateSource&&page?.dateSource)rendered.dateSource=page.dateSource;
         await storeArticle(env,url,rendered);
         return {doc:rendered,entry};
       }
       entry.status='too-short';
       return {doc:rendered.text?rendered:null,entry};
     }catch(e){
-      entry.browserUsed=true;
-      entry.status=e.quotaExhausted?'browser-quota-exhausted':(e.rateLimited?'browser-rate-limited':'browser-error');
+      entry.browserUsed=true;entry.status=e.quotaExhausted?'browser-quota-exhausted':(e.rateLimited?'browser-rate-limited':'browser-error');
       entry.error=[entry.error,e?.message||String(e)].filter(Boolean).join(' | ');
       return {doc:page&&page.text?page:null,entry};
     }
   }
 
-  // 4. No browser available. Say WHY — a silent 'too-short' hides a quota wall.
-  if(!env.BROWSER?.quickAction){
-    entry.status='deferred-no-browser';
-    entry.error=entry.error||'Browser Run binding unavailable';
-  }else if(budget.quotaExhausted){
-    entry.status='deferred-browser-quota';
-    entry.error=entry.error||'Browser Run daily allowance exhausted; this URL will be retried on a later scan';
-  }else if(budget.expired()){
-    entry.status='deferred-time-budget';
-    entry.error=entry.error||'scan time budget reached; this URL will be retried on a later scan';
-  }else{
-    entry.status='deferred-browser-budget';
-    entry.error=entry.error||`per-scan browser budget of ${budget.browserMax} reached; this URL will be retried on a later scan`;
-  }
+  if(!env.BROWSER?.quickAction){entry.status='deferred-no-browser';entry.error=entry.error||'Browser Run binding unavailable'}
+  else if(budget.quotaExhausted){entry.status='deferred-browser-quota';entry.error=entry.error||'Browser Run daily allowance exhausted; this URL will be retried on a later scan'}
+  else if(budget.expired()){entry.status='deferred-time-budget';entry.error=entry.error||'scan time budget reached; this URL will be retried on a later scan'}
+  else{entry.status='deferred-browser-budget';entry.error=entry.error||`per-scan browser budget of ${budget.browserMax} reached; this URL will be retried on a later scan`}
 
-  if(page&&page.text&&page.text.length>=AI_MIN_DOC_CHARS){
-    entry.status='accepted-thin';
-    return {doc:page,entry};
-  }
+  if(page&&page.text&&page.text.length>=AI_MIN_DOC_CHARS){entry.status='accepted-thin';return {doc:page,entry}}
   return {doc:null,entry};
 }
 
@@ -897,83 +975,109 @@ function subjectFromHeadlineOrSlug(doc){
 function classifyClubEvent(doc,clubName){
   const lines=headlineLines(doc), headline=firstHeadline(doc);
   let path='';try{path=decodeURIComponent(new URL(doc.url).pathname).toLowerCase()}catch{}
-  const text=String(doc.text||'').slice(0,9000);
-  const hay=`${headline}\n${path}\n${text}`;
+  const body=String(doc.text||'').slice(0,9000),headlineHay=`${headline}\n${path}`,hay=`${headlineHay}\n${body}`;
   const club=normal(clubName);
 
-  // 1) Non-player / academy-office semantics: never classify as a player transaction.
-  if(/\b(?:goalkeeping coach|head coach|assistant coach|academy manager|technical director|sporting director|chief executive)\b/i.test(hay))
-    return {type:'non_player',actionable:false,reason:'staff/non-player announcement'};
+  // 1) Headline/slug movement semantics outrank generic article-body wording.
+  // This preserves true transfer stories even when the body says "head coach"
+  // or "signed a new five-year contract".
+  for(const line of lines.slice(0,4)){
+    let mm=line.match(/^(.{2,100}?)\s+joins\s+(.{2,100}?)\s+on loan\b/i);
+    if(mm)return normal(mm[2]).includes(club)
+      ? {type:'loan_in',actionable:true,reason:'headline loan into current club'}
+      : {type:'loan_out',actionable:true,reason:'headline loan to another club'};
 
-  // 2) Contract renewal / professional terms. This MUST precede "signs".
-  if(termHit('renewal',hay) && !/\b(?:joins?|arrives?|from [A-Z][A-Za-z .&'-]{2,50}|transfer from)\b/i.test(headline)){
-    return {type:'contract_renewal',actionable:false,reason:'contract renewal/internal terms'};
+    mm=line.match(/^(.{2,100}?)\s+joins\s+(.{2,100})$/i);
+    if(mm)return normal(mm[2]).includes(club)
+      ? {type:'signing',actionable:true,reason:'headline joins current club'}
+      : {type:'departure',actionable:true,reason:'headline joins another club'};
+
+    mm=line.match(/^(.{2,100}?)\s+signs\s+for\s+(.{2,100})$/i);
+    if(mm)return normal(mm[2]).includes(club)
+      ? {type:'signing',actionable:true,reason:'headline signs for current club'}
+      : {type:'departure',actionable:true,reason:'headline signs for another club'};
+
+    // "completes a move to X" / "moves to X" name a destination, exactly like
+    // "joins X" and "signs for X" above, so direction must be resolved the
+    // same way: compare the named destination against the club whose site is
+    // being scanned. Treating this as unconditionally outbound was wrong --
+    // a buying club's own announcement routinely opens with wording like
+    // "Player has completed a move to Arsenal from Newcastle United", and
+    // that sentence would have been misclassified as Arsenal's departure.
+    mm=line.match(/\bcompletes?\s+(?:a\s+)?move\s+to\s+(.{2,100}?)(?:\s+from\s+.{2,100})?[.!]?$/i)
+      ||line.match(/\bmoves?\s+to\s+(.{2,100}?)(?:\s+from\s+.{2,100})?[.!]?$/i);
+    if(mm)return normal(mm[1]).includes(club)
+      ? {type:'signing',actionable:true,reason:'headline/opening line: completes move to current club'}
+      : {type:'departure',actionable:true,reason:'headline/opening line: completes move to another club'};
+
+    // "leaves the club" / "departs the club" are genuinely self-referential --
+    // "the club" always means whichever site is being read -- so these stay
+    // unconditional, unlike the destination-naming patterns above.
+    if(/\bleaves? the club\b|\bdeparts? the club\b/i.test(line))
+      return {type:'departure',actionable:true,reason:'explicit outbound headline language'};
+
+    if(/\b(?:new signing|joins us|has joined us|signs for us|arrives at|welcome to)\b/i.test(line))
+      return {type:'signing',actionable:true,reason:'explicit inbound headline language'};
   }
 
-  // 3) Commercial/legal "deal" and "signing" uses.
-  if(/\b(?:partnership|sponsorship|commercial partner|rights deal|broadcast deal|kit deal|brand ambassador)\b/i.test(hay))
-    return {type:'non_player_signing',actionable:false,reason:'commercial/non-player deal'};
+  // 2) Contract renewal suppression is headline/slug-primary, not body-global.
+  // "Player signs for Club" followed by "signed a five-year contract" is a transfer.
+  if(termHit('renewal',headlineHay))
+    return {type:'contract_renewal',actionable:false,reason:'headline/slug contract renewal or internal terms'};
 
-  // 4) Loans need their own direction because their xMins consequence differs
-  // from a permanent signing/departure.
+  // 3) Staff/non-player suppression also requires headline/slug evidence.
+  if(/\b(?:goalkeeping coach|head coach|assistant coach|academy manager|technical director|sporting director|chief executive|manager appointed|coach joins)\b/i.test(headlineHay))
+    return {type:'non_player',actionable:false,reason:'headline/slug is a staff announcement'};
+
+  if(/\b(?:partnership|sponsorship|commercial partner|rights deal|broadcast deal|kit deal|brand ambassador)\b/i.test(headlineHay))
+    return {type:'non_player_signing',actionable:false,reason:'headline/slug commercial or non-player deal'};
+
+  // 4) Body-confirmed loan movement.
   if(termHit('loan',hay)){
     if(/\b(?:returns?|returned|recalled)\s+(?:to\s+[\w .'-]+\s+)?from (?:a |his |her )?loan\b/i.test(hay) ||
        /\b(?:loan spell|loan deal) (?:has )?(?:ended|expired)\b/i.test(hay))
-      return {type:'loan_return',actionable:true,reason:'loan return/recall'};
-
-    for(const line of lines){
-      let mm=line.match(/^(.{2,100}?)\s+joins\s+(.{2,100}?)\s+on loan\b/i);
-      if(mm){
-        return normal(mm[2]).includes(club)
-          ? {type:'loan_in',actionable:true,reason:'headline loan into current club'}
-          : {type:'loan_out',actionable:true,reason:'headline loan to another club'};
-      }
-    }
-    // Article-body phrases used by official sites.
+      return {type:'loan_return',actionable:true,reason:'loan return or recall'};
     if(/\bhas joined us on loan\b|\bjoins us on loan\b|\barrives? on loan\b/i.test(hay))
       return {type:'loan_in',actionable:true,reason:'explicit inbound loan language'};
     if(/\bhas joined [^.\n]{2,80} on (?:a |an )?(?:season-long )?loan\b|\bhas moved to [^.\n]{2,80} on loan\b/i.test(hay))
       return {type:'loan_out',actionable:true,reason:'explicit outbound loan language'};
   }
 
-  // 5) Permanent inbound/outbound transfer.
+  // 5) Body-confirmed permanent transfer.
   if(/\bhas joined us\b|\bjoins us\b|\bjoined us from\b|\bhas signed for us\b|\bnew signing\b|\bwelcome to\b/i.test(hay))
     return {type:'signing',actionable:true,reason:'explicit inbound transfer language'};
+  // Body-level destination language needs the same direction check as headlines.
+  // This covers articles whose headline is generic but whose body says
+  // "Player has completed a move to Arsenal from Newcastle United".
+  let bodyMove=hay.match(/\bhas completed\s+(?:a\s+)?move\s+to\s+([^\.\n]{2,100}?)(?:\s+from\s+[^\.\n]{2,100})?(?:[\.\n]|$)/i)
+    ||hay.match(/\bhas moved\s+to\s+([^\.\n]{2,100}?)(?:\s+from\s+[^\.\n]{2,100})?(?:[\.\n]|$)/i);
+  if(bodyMove)return normal(bodyMove[1]).includes(club)
+    ? {type:'signing',actionable:true,reason:'body confirms move to current club'}
+    : {type:'departure',actionable:true,reason:'body confirms move to another club'};
 
-  if(/\bhas left the club\b|\bhas left us\b|\bleaves? the club\b|\bdeparts? the club\b|\bhas completed (?:a )?move to\b|\bhas joined [^.\n]{2,80} (?:on|in) a permanent transfer\b/i.test(hay))
+  if(/\bhas left the club\b|\bhas left us\b|\bleaves? the club\b|\bdeparts? the club\b|\bhas joined [^.\n]{2,80} (?:on|in) a permanent transfer\b/i.test(hay))
     return {type:'departure',actionable:true,reason:'explicit outbound transfer language'};
 
-  for(const line of lines){
-    let mm=line.match(/^(.{2,100}?)\s+joins\s+(.{2,100})$/i);
-    if(mm){
-      return normal(mm[2]).includes(club)
-        ? {type:'signing',actionable:true,reason:'headline joins current club'}
-        : {type:'departure',actionable:true,reason:'headline joins another club'};
-    }
-    mm=line.match(/^(.{2,100}?)\s+signs\s+for\s+(.{2,100})$/i);
-    if(mm){
-      return normal(mm[2]).includes(club)
-        ? {type:'signing',actionable:true,reason:'headline signs for current club'}
-        : {type:'departure',actionable:true,reason:'headline signs for another club'};
-    }
-  }
-
-  // 6) Injury/availability language. These are official news events; the role
-  // extractor independently decides whether/how they affect xMins.
-  if(termHit('injuryOut',hay))
-    return {type:'injury_status',actionable:false,reason:'official unavailable/injury language'};
-  if(termHit('doubt',hay))
-    return {type:'fitness_doubt',actionable:false,reason:'official doubt/assessment language'};
-  if(termHit('return',hay))
-    return {type:'fitness_return',actionable:false,reason:'official return/availability language'};
-
-  // 7) Selection / tactical language is useful news context but not a transfer.
-  if(termHit('selectionPositive',hay))
-    return {type:'selection_signal',actionable:false,reason:'official selection/role language'};
-  if(termHit('selectionNegative',hay))
-    return {type:'selection_signal',actionable:false,reason:'official bench/rest language'};
-
+  // 6) Operational football news classification stays broad.
+  if(termHit('injuryOut',hay))return {type:'injury_status',actionable:false,reason:'official unavailable/injury language'};
+  if(termHit('doubt',hay))return {type:'fitness_doubt',actionable:false,reason:'official doubt/assessment language'};
+  if(termHit('return',hay))return {type:'fitness_return',actionable:false,reason:'official return/availability language'};
+  if(termHit('selectionPositive',hay))return {type:'selection_signal',actionable:false,reason:'official selection/role language'};
+  if(termHit('selectionNegative',hay))return {type:'selection_signal',actionable:false,reason:'official bench/rest language'};
   return {type:'unknown',actionable:false,reason:'insufficient event semantics'};
+}
+
+function clubEventLedgerKey(team){return `club-events:${team}`}
+async function loadClubEventLedger(env,team){const row=await env.ROLE_KV.get(clubEventLedgerKey(team),'json');return Array.isArray(row?.events)?row.events:[]}
+async function saveClubEventLedger(env,team,events){const seen=new Set(),merged=[];for(const e of (events||[]).sort((a,b)=>Date.parse(b.evidenceDate||0)-Date.parse(a.evidenceDate||0))){const k=e.id||[e.team,e.type,normal(e.subject),e.source].join('|');if(seen.has(k))continue;seen.add(k);merged.push(e);if(merged.length>=120)break}await env.ROLE_KV.put(clubEventLedgerKey(team),JSON.stringify({updatedAt:new Date().toISOString(),events:merged}),{expirationTtl:60*60*24*180})}
+function clubEventCurrentWindowMs(e){
+  const t=String(e?.type||'');
+  return ['signing','departure','loan_in','loan_out','loan_return'].includes(t)?30*86400000:7*86400000;
+}
+function isCurrentClubEvent(e){
+  const t=Date.parse(e?.evidenceDate||e?.detectedAt||e?.createdAt||'');
+  // Unknown-age events stay in history but never remain "current" indefinitely.
+  return Number.isFinite(t) ? (Date.now()-t)<=clubEventCurrentWindowMs(e) : false;
 }
 
 function fastPathClubEvents(team,clubName,documents){
@@ -993,6 +1097,7 @@ function fastPathClubEvents(team,clubName,documents){
       team,type:tx.type,subject,confidence:1,source:d.url,
       reason:`Official ${clubName} ${tx.type.replaceAll('_',' ')} announcement detected. Role/xMins impact remains separate until a current FPL player can be mapped safely.`,
       evidenceDate:Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'',
+      detectedAt:new Date().toISOString(),
       official:true,fastPath:true,classificationReason:tx.reason
     });
   }
@@ -1004,10 +1109,15 @@ function fastPathClubEvents(team,clubName,documents){
 
 function extractionSchema(){return {
   type:'object',additionalProperties:false,required:['events'],properties:{events:{type:'array',maxItems:30,items:{type:'object',additionalProperties:false,
-    required:['type','subject','affected','role','overlap','hierarchy','confidence','source','reason'],properties:{
+    required:['type','subject','affected','overlap','hierarchy','confidence','source','reason'],properties:{
       type:{type:'string',enum:[...EVENT_VALUES]},subject:{type:'string'},affected:{type:'string'},role:{type:'string',enum:[...ROLE_VALUES]},
       overlap:{type:'number',minimum:0,maximum:1},hierarchy:{type:'number',minimum:0,maximum:1},confidence:{type:'number',minimum:0,maximum:1},
-      source:{type:'string'},reason:{type:'string'},evidenceDate:{type:'string'}
+      source:{type:'string'},reason:{type:'string'},evidenceDate:{type:'string'},
+      minutesCap:{type:'number',minimum:0,maximum:90},
+      directAvailability:{type:'number',minimum:0,maximum:1},
+      selectionCertainty:{type:'number',minimum:0,maximum:1},
+      productionImpact:{type:'number',minimum:-0.25,maximum:0.25},
+      fixtureId:{type:'string'},competition:{type:'string'},kickoff:{type:'string'},gameweek:{type:'number',minimum:1,maximum:60}
     }}}}
 }}
 
@@ -1026,6 +1136,12 @@ RULES:
 - GOALS, ASSISTS, AND PERFORMANCE QUALITY ARE NOT ROLE EVIDENCE. A player scoring, assisting, playing well, or being praised for a performance tells you nothing about expected minutes on its own. A substitute who scores must NOT produce an observed_role event. Only create an event from a goal or performance mention if the SAME text also states that the player started, or states the position he played in.
 - Fixture lists, TV and "how to watch" guides, ticket news, kit launches, competition or quiz pages, and community or commercial stories contain no role evidence. Return no event from them even if current FPL players are named.
 - Use departure/signing/injury/return for a competitor event and name the FPL player(s) whose minutes are likely affected.
+- CONFIRMED LINEUPS: use confirmed_start when an official team sheet explicitly names a CURRENT FPL player in the starting XI; use confirmed_bench when it explicitly names that player among substitutes.
+- MATCH SCOPE: when identifiable from the official text, include fixtureId, competition, kickoff and gameweek for match-specific evidence. Never invent these fields.
+- DIRECT AVAILABILITY: use unavailable when the club/manager explicitly says a CURRENT FPL player is ruled out, unavailable, will miss the match, will not travel, or is ineligible. Use suspension for an explicit domestic suspension. These direct events affect the named player himself.
+- FITNESS UNCERTAINTY: use fitness_doubt for doubtful, late fitness test, assessed tomorrow, touch-and-go, or similar uncertainty that clearly refers to a CURRENT FPL player.
+- MINUTES RESTRICTION: use minutes_restricted only when the source explicitly limits a CURRENT FPL player's workload (for example 45 minutes, 60 minutes maximum, or not ready for 90). Set minutesCap only when supported.
+- ROTATION: use rotation_warning only for direct manager/club language that materially warns of rotation/rest. Do not infer rotation merely from fixture congestion.
 - TRANSFER SEMANTICS: signing means a player ARRIVING FROM ANOTHER CLUB. departure means a player LEAVING FOR ANOTHER CLUB. A player who "signs a new deal", "signs a new contract", "extends his contract", "renews", "agrees professional terms", or signs sponsorship/commercial terms is NOT a signing event and must produce NO signing/departure role event.
 - LOAN SEMANTICS: loan_in means a player temporarily ARRIVING at the current club; loan_out means a current player temporarily LEAVING; a loan return/recall is not a permanent signing/departure. Never collapse loan movement into a permanent transfer.
 - OFFICIAL FITNESS LANGUAGE: phrases such as ruled out, unavailable, sidelined, set to miss, back in training, resumed training, available for, doubtful, or chance of making the game are valid injury/return/minutes evidence when they clearly refer to a CURRENT FPL player.
@@ -1041,6 +1157,9 @@ RULES:
 - For departure/injury events, affected is the beneficiary. For signing/return events, affected is the threatened incumbent. Do not apply an injury event to the injured player himself.
 - Confirmed official statements: confidence 0.9-1.0. Repeated official preseason lineup evidence: 0.70-0.90. One ambiguous mention: <=0.55.
 - overlap measures direct role competition. hierarchy measures expected selection strength of subject/role evidence.
+- directAvailability is optional and only for direct availability evidence. Use 0 for definitely unavailable/suspended; use a supported intermediate probability only for explicit uncertainty; use 1 for explicitly available.
+- selectionCertainty is optional and only for confirmed lineup or explicit start/bench language.
+- productionImpact is optional and should normally be 0. Use a small non-zero value only when the source explicitly establishes a sustained tactical role that plausibly changes per-minute production.
 - Include a concise reason citing the concrete evidence (for example: started two consecutive friendlies at RW, manager named him first choice, competitor signed). Include the exact source URL and an ISO evidenceDate when available.
 - The source field MUST be one of the SOURCE URLs supplied above, copied exactly.
 - Return no event when evidence is insufficient.
@@ -1058,8 +1177,13 @@ OFFICIAL MATERIAL:\n${docs}`;
 
 function validateEvents(team,players,events,allowedSources){
   const byName=new Map;for(const p of players){byName.set(normal(p.name),p);byName.set(normal(p.fullName),p)}const out=[];
+  const canonicalUrl=u=>{try{const x=new URL(String(u||''));x.hash='';return x.toString()}catch{return String(u||'')}};
+  const allowedExact=new Set([...allowedSources].map(canonicalUrl));
   const allowedHosts=new Set([...allowedSources].map(hostOf).filter(Boolean));
-  for(const e of events||[]){const p=byName.get(normal(e.affected));if(!p||!EVENT_VALUES.has(e.type)||!ROLE_VALUES.has(e.role))continue;
+  for(const e of events||[]){const p=byName.get(normal(e.affected));if(!p||!EVENT_VALUES.has(e.type))continue;
+    const roleOptional=['confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension'].includes(e.type);
+    if(!roleOptional&&!ROLE_VALUES.has(e.role))continue;
+    const eventRole=ROLE_VALUES.has(e.role)?e.role:null;
     // observed_role describes the subject's OWN selection, so subject and
     // affected must be the same player. When they differ the model has
     // described a competitor being selected, which is a threat to `affected`,
@@ -1069,13 +1193,18 @@ function validateEvents(team,players,events,allowedSources){
     // Guard against a hallucinated URL: the citation must point at a document
     // that was actually supplied to the model.
     if(allowedHosts.size&&!allowedHosts.has(hostOf(source)))continue;
+    if(allowedExact.size&&!allowedExact.has(canonicalUrl(source)))continue;
     if(e.type==='injury'&&normal(e.subject)===normal(p.name))continue;
     if(e.type==='loan_in'&&normal(e.subject)===normal(p.name))continue; // arrival threatens incumbent; affected is incumbent
     if(e.type==='loan_out'&&normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName))continue; // outbound loan should name departing current player
+    if(['confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension'].includes(e.type)
+       && normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName))continue;
 
     const evidenceTime=Date.parse(e.evidenceDate||'');if(Number.isFinite(evidenceTime)&&Date.now()-evidenceTime>120*86400000&&!['departure','signing'].includes(e.type))continue;
     const normalizedType=e.type==='loan_in'?'signing':(e.type==='loan_out'?'departure':e.type);
-    out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,subject:cleanText(e.subject).slice(0,120),role:e.role,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate:cleanText(e.evidenceDate).slice(0,40),auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
+    const policy=EVIDENCE_POLICY[e.type]||EVIDENCE_POLICY[normalizedType]||{channel:'other',tier:4,halfLifeHours:168,ttlHours:336,maxMinuteImpact:8,direct:false};
+    const evidenceDate=cleanText(e.evidenceDate).slice(0,40),evidenceMs=Date.parse(evidenceDate||''),effectiveMs=Number.isFinite(evidenceMs)?evidenceMs:Date.now();
+    out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,rawType:e.type,subject:cleanText(e.subject).slice(0,120),role:eventRole,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate,evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.98,effectiveFrom:new Date(effectiveMs).toISOString(),expiresAt:new Date(effectiveMs+policy.ttlHours*3600000).toISOString(),halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,directImpact:!!policy.direct,verificationStatus:'official-source',minutesCap:Number.isFinite(Number(e.minutesCap))?clamp(Number(e.minutesCap),0,90):null,directAvailability:Number.isFinite(Number(e.directAvailability))?clamp(Number(e.directAvailability),0,1):null,selectionCertainty:Number.isFinite(Number(e.selectionCertainty))?clamp(Number(e.selectionCertainty),0,1):null,productionImpact:Number.isFinite(Number(e.productionImpact))?clamp(Number(e.productionImpact),-.25,.25):0,fixtureId:cleanText(e.fixtureId).slice(0,80)||null,competition:cleanText(e.competition).slice(0,80)||null,kickoff:cleanText(e.kickoff).slice(0,40)||null,gameweek:Number.isFinite(Number(e.gameweek))?Number(e.gameweek):null,auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
   }
   const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),normal(e.affected),e.role,e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
 }
@@ -1275,7 +1404,7 @@ async function scanTeam(env,team,{force=false}={}){
       }
 
       // Cached articles cost nothing, so read them before spending any budget.
-      const cacheHits=await Promise.all(candidates.map(u=>cachedArticle(env,u)));
+      const cacheHits=await Promise.all(candidates.map(u=>cachedArticle(env,u,{force})));
       const ordered=[
         ...candidates.filter((u,i)=>cacheHits[i]),
         ...candidates.filter((u,i)=>!cacheHits[i])
@@ -1283,10 +1412,11 @@ async function scanTeam(env,team,{force=false}={}){
 
       for(const url of ordered){
         attempted++;
-        processedThisScan.push(url);
-        const {doc,entry}=await readArticle(env,url,budget);
-        perUrl.push({...entry,kind:'article'});
-        if(doc&&doc.text)documents.push({...doc,kind:'article',publishedAt:candidateTimes.get(url)||null});
+        const {doc,entry}=await readArticle(env,url,budget,{force});
+        const processedOk=!!(doc&&doc.text)&&['cached','revalidated-not-modified','accepted','accepted-browser','accepted-thin'].includes(entry.status);
+        if(processedOk)processedThisScan.push(url);
+        perUrl.push({...entry,kind:'article',processedOk});
+        if(doc&&doc.text){const landingPublishedAt=candidateTimes.get(url)||null,articlePublishedAt=Number(doc.publishedAt)||null,publishedAt=articlePublishedAt||landingPublishedAt||null,dateSource=articlePublishedAt?(doc.dateSource||'article-page'):(landingPublishedAt?(landing.timeSources?.get?.(url)||'landing-page'):null);documents.push({...doc,kind:'article',publishedAt,dateSource,landingPublishedAt,articlePublishedAt});}
         if(entry.error)errors.push(`${url}: ${entry.error}`);
       }
     }catch(e){
@@ -1316,7 +1446,9 @@ async function scanTeam(env,team,{force=false}={}){
   const retrieved=documents.filter(d=>d.text&&d.text.length>0);
   const useful=documents.filter(d=>d.text&&d.text.length>=AI_MIN_DOC_CHARS);
   const articleDocs=useful.filter(d=>d.kind==='article');
-  const clubEvents=fastPathClubEvents(team,club.name,articleDocs);
+  const currentClubEvents=fastPathClubEvents(team,club.name,articleDocs),priorClubEvents=await loadClubEventLedger(env,team);
+  const clubEvents=[...currentClubEvents,...priorClubEvents].sort((a,b)=>Date.parse(b.evidenceDate||0)-Date.parse(a.evidenceDate||0)).filter((e,i,arr)=>arr.findIndex(x=>(x.id||[x.team,x.type,normal(x.subject),x.source].join('|'))===(e.id||[e.team,e.type,normal(e.subject),e.source].join('|')))===i).slice(0,120);
+  try{await saveClubEventLedger(env,team,clubEvents)}catch{}
   const transactionDiagnostics=articleDocs.map(d=>{
     const tx=classifyClubEvent(d,club.name);
     return {url:d.url,type:tx.type,actionable:tx.actionable,reason:tx.reason};
@@ -1388,7 +1520,7 @@ async function scanTeam(env,team,{force=false}={}){
   const payload={
     status:'ok',
     schemaVersion:SCHEMA_VERSION,
-    workerBuild:'v2.4-cross-club-terminology-taxonomy',
+    workerBuild:WORKER_BUILD,
     season:env.SEASON||'2026/27',
     team,
     club:club.name,
@@ -1444,6 +1576,12 @@ async function scanTeam(env,team,{force=false}={}){
       newCandidates:discovery.reduce((a,d)=>a+Number(d.newCandidates||0),0),
       cachedCandidates:discovery.reduce((a,d)=>a+Number(d.cachedCandidates||0),0),
       recencySource:discovery.some(d=>d.recencySource==='timestamp')?'timestamp':'landing-order',
+      articleDatesRecovered:articleDocs.filter(d=>Number(d.articlePublishedAt)).length,
+      landingDatesUsed:articleDocs.filter(d=>!Number(d.articlePublishedAt)&&Number(d.landingPublishedAt)).length,
+      undatedArticleDocs:articleDocs.filter(d=>!Number(d.publishedAt)).length,
+      failedCandidatesRetainedForRetry:perUrl.filter(x=>x.kind==='article'&&x.processedOk===false).length,
+      mutableArticlesRevalidated:perUrl.filter(x=>x.revalidated).length,
+
       dynamicDiscoveryEscalated:discovery.some(d=>d.dynamicEscalated),
       dynamicEscalationReasons:[...new Set(discovery.map(d=>d.dynamicEscalationReason).filter(Boolean))],
       staticUnprocessedCandidates:discovery.reduce((a,d)=>a+Number(d.staticUnprocessedCandidates||0),0),
@@ -1486,13 +1624,18 @@ function reportAgeMs(report){
 /** Wraps scanTeam so two callers cannot burn the browser allowance twice on the
  *  same club. A blocked caller gets the cached report rather than an error. */
 async function scanTeamGuarded(env,team){
-  if(!(await acquireScanLock(env,team))){
+  const lockToken=await acquireScanLock(env,team);
+  if(!lockToken){
     const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
-    if(cached)return {status:'ok',scanLocked:true,lockNote:'a scan for this club was already in progress',...cached,cache:'HIT',refreshing:true};
+    if(cached)return {...cached,status:'ok',scanLocked:true,scanExecuted:false,lockNote:'a scan for this club was already in progress',cache:'HIT',refreshing:true};
     throw new Error(`A scan for ${team} is already in progress. Try again shortly.`);
   }
-  try{return await scanTeam(env,team,{force:true})}
-  finally{await releaseScanLock(env,team)}
+  try{
+    const report=await scanTeam(env,team,{force:true});
+    return {...report,scanExecuted:true};
+  }finally{
+    await releaseScanLock(env,team,lockToken);
+  }
 }
 
 async function cacheFirstTeamReport(env,team,ctx,{force=false}={}){
@@ -1915,7 +2058,7 @@ export default {
     env = await withD1(env);
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
-      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:'v2.4-cross-club-terminology-taxonomy',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
+      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:WORKER_BUILD,schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
       // Derived team numbers for the projection engine. Public and
       // read-only: it never triggers a fetch, so it cannot burn credits.
       if(u.pathname==='/api/market/teams'){
@@ -1940,9 +2083,10 @@ export default {
             if(cached)return json({status:'ok',forceThrottled:true,forceThrottleReason:gate.reason,retryAfterSec:gate.retryAfterSec,...cached,cache:'HIT'},200,env);
             return json({status:'error',error:gate.reason,retryAfterSec:gate.retryAfterSec},429,env);
           }
-          await noteForcedScan(env,team);
         }
-        return json(await cacheFirstTeamReport(env,team,ctx,{force}),200,env);
+        const result=await cacheFirstTeamReport(env,team,ctx,{force});
+        if(force&&!adminAuthorised(request,env)&&result?.status==='ok'&&result?.scanExecuted===true&&!result?.forceThrottled)await noteForcedScan(env,team);
+        return json(result,200,env);
       }
       if(u.pathname==='/api/role-sync'&&request.method==='POST'){
         if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
@@ -1955,9 +2099,15 @@ export default {
       }
       if(u.pathname==='/api/scout/club-events'){
         const team=String(u.searchParams.get('team')||'').toUpperCase();
-        if(team){const report=await env.ROLE_KV.get(`latest:${team}`,'json');return json({status:'ok',team,generatedAt:report?.generatedAt||null,events:Array.isArray(report?.clubEvents)?report.clubEvents:[]},200,env)}
-        const latest=await allLatest(env),events=[];for(const [code,report] of Object.entries(latest))for(const e of (report?.clubEvents||[]))events.push({...e,team:e.team||code});
-        events.sort((a,b)=>Date.parse(b.evidenceDate||0)-Date.parse(a.evidenceDate||0));return json({status:'ok',generatedAt:new Date().toISOString(),events:events.slice(0,100)},200,env);
+        const mode=String(u.searchParams.get('mode')||'current').toLowerCase();
+        if(team){
+          const report=await env.ROLE_KV.get(`latest:${team}`,'json'),history=Array.isArray(report?.clubEvents)?report.clubEvents:[],current=history.filter(isCurrentClubEvent);
+          return json({status:'ok',team,generatedAt:report?.generatedAt||null,events:mode==='history'?history:current,current,historyCount:history.length},200,env)
+        }
+        const latest=await allLatest(env),history=[];for(const [code,report] of Object.entries(latest))for(const e of (report?.clubEvents||[]))history.push({...e,team:e.team||code});
+        history.sort((a,b)=>Date.parse(b.evidenceDate||0)-Date.parse(a.evidenceDate||0));
+        const current=history.filter(isCurrentClubEvent);
+        return json({status:'ok',generatedAt:new Date().toISOString(),events:(mode==='history'?history:current).slice(0,100),current:current.slice(0,100),historyCount:history.length},200,env);
       }
       if(u.pathname==='/api/scout/interrogate'){
         const team=String(u.searchParams.get('team')||'').toUpperCase();
@@ -1982,7 +2132,9 @@ export default {
             staticUnprocessedCandidates:d.staticUnprocessedCandidates||0,
             renderedUnprocessedCandidates:d.renderedUnprocessedCandidates||0,
             confirmedClubEvents:d.confirmedClubEvents||0,
-            acceptedEvents:d.acceptedEvents||0
+            acceptedEvents:d.acceptedEvents||0,
+            scanExecuted:report.scanExecuted===true,
+            scanLocked:report.scanLocked===true
           },
           discovery:(d.discovery||[]).map(x=>({
             source:x.source,mode:x.mode,linksFound:x.linksFound,
