@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v2.0 — resilient cross-club discovery + unseen-first freshness + official event fast path
+// v2.1 — article-level publication recovery + relaxed-pass repair + richer freshness diagnostics
 //
 // Changes vs v1.2 (all additive to the response contract):
 //   1. Browser fallback is gated on ARTICLE CANDIDATES and landing text length,
@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.20.0';
+const SCHEMA_VERSION = '1.21.0';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -338,6 +338,53 @@ function extractLinkTimesFromHtml(markup,baseUrl){
   return {times,sources,coverage:uniqueLinks.length?times.size/uniqueLinks.length:0};
 }
 
+function extractPagePublicationFromHtml(markup,baseUrl){
+  const html=String(markup||'');
+  const hits=[];
+  const push=(raw,source,priority)=>{
+    const t=Date.parse(raw||'');
+    if(Number.isFinite(t))hits.push({t,source,priority});
+  };
+
+  // OpenGraph / article meta.
+  let m;
+  const metaRe=/<meta\b[^>]*(?:property|name)=["']([^"']+)["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
+  while((m=metaRe.exec(html))){
+    const k=String(m[1]||'').toLowerCase(),v=m[2];
+    if(k==='article:published_time'||k==='og:published_time'||k==='datepublished'||k==='publishdate'||k==='pubdate')push(v,`meta:${k}`,1);
+    else if(k==='article:modified_time'||k==='datemodified'||k==='last-modified')push(v,`meta:${k}`,4);
+  }
+
+  // JSON-LD on the article page.
+  const ldRe=/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  while((m=ldRe.exec(html))){
+    let data;try{data=JSON.parse(m[1])}catch{continue}
+    const walk=x=>{
+      if(!x)return;
+      if(Array.isArray(x)){x.forEach(walk);return}
+      if(typeof x!=='object')return;
+      const typ=Array.isArray(x['@type'])?x['@type'].join(' '):String(x['@type']||'');
+      if(/NewsArticle|Article|BlogPosting/i.test(typ)){
+        if(x.datePublished)push(x.datePublished,'json-ld:datePublished',0);
+        else if(x.dateCreated)push(x.dateCreated,'json-ld:dateCreated',2);
+        else if(x.dateModified)push(x.dateModified,'json-ld:dateModified',5);
+      }
+      if(x['@graph'])walk(x['@graph']);
+      for(const v of Object.values(x))if(v&&typeof v==='object')walk(v);
+    };
+    walk(data);
+  }
+
+  // Plain <time datetime> on article body.
+  const timeRe=/<time\b[^>]*datetime=["']([^"']+)["'][^>]*>/gi;
+  while((m=timeRe.exec(html)))push(m[1],'time:datetime',3);
+
+  if(!hits.length)return {publishedAt:null,dateSource:null};
+  hits.sort((a,b)=>a.priority-b.priority||a.t-b.t);
+  return {publishedAt:hits[0].t,dateSource:hits[0].source};
+}
+
+
 async function fetchPage(url){
   let r;
   try{
@@ -366,7 +413,8 @@ async function fetchPage(url){
   const markup=await r.text();
   const parsed=await parseHtmlResponse(new Response(markup,{headers:{'content-type':ct||'text/html'}}),r.url);
   const recency=extractLinkTimesFromHtml(markup,r.url);
-  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,mode:'fetch',status:r.status,redirected:r.url!==url};
+  const pageDate=extractPagePublicationFromHtml(markup,r.url);
+  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,mode:'fetch',status:r.status,redirected:r.url!==url};
 }
 
 /* ------------------------------------------------------------ Browser Run */
@@ -431,7 +479,8 @@ async function browserRender(env,url,budget){
   const response=new Response(markup,{headers:{'content-type':'text/html; charset=utf-8'}});
   const parsed=await parseHtmlResponse(response,url);
   const recency=extractLinkTimesFromHtml(markup,url);
-  return {url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,mode:'browser-content',status:200,redirected:false};
+  const pageDate=extractPagePublicationFromHtml(markup,url);
+  return {url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,mode:'browser-content',status:200,redirected:false};
 }
 
 async function browserMarkdown(env,url,budget){
@@ -468,7 +517,9 @@ async function storeArticle(env,url,doc){
   if(!doc?.text||doc.text.length<AI_MIN_DOC_CHARS)return;
   try{
     await env.ROLE_KV.put(articleKey(url),JSON.stringify({
-      url,text:doc.text,mode:doc.mode,fetchedAt:new Date().toISOString()
+      url,text:doc.text,mode:doc.mode,fetchedAt:new Date().toISOString(),
+      publishedAt:Number(doc.publishedAt)||null,
+      dateSource:doc.dateSource||null
     }),{expirationTtl:60*60*24*ARTICLE_CACHE_DAYS});
   }catch{}
 }
@@ -557,7 +608,8 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
   const scored=links.map((url,index)=>({url,index,time:Number(times?.get?.(url))||null,seen:seenUrls.has(url),...scoreLink(url,host,currentYear)}));
   let selected=scored.filter(x=>x.score>1),pass='strict';
   if(!selected.length){selected=scored.filter(x=>x.score>-99&&(x.depth||0)>=2&&x.score>-6);pass='relaxed'}
-  const eligible=selected.filter(x=>x.score>1),coverage=Number(timestampCoverage)||0,useTimestamp=coverage>=RECENCY_COVERAGE_MIN;
+  const eligible=pass==='relaxed'?selected:selected.filter(x=>x.score>1);
+  const coverage=Number(timestampCoverage)||0,useTimestamp=coverage>=RECENCY_COVERAGE_MIN;
   const unseenFirst=(a,b)=>(a.seen===b.seen?0:(a.seen?1:-1));
   const freshLane=useTimestamp
     ? eligible.filter(x=>Number.isFinite(x.time)).sort((a,b)=>unseenFirst(a,b)||b.time-a.time||b.score-a.score||a.index-b.index)
@@ -645,8 +697,8 @@ async function readArticle(env,url,budget){
   // 1. Cache. Costs nothing and is the reason a warm scan needs no browser.
   const hit=await cachedArticle(env,url);
   if(hit){
-    entry.status='cached';entry.mode=hit.mode||'cache';entry.cachedAt=hit.fetchedAt||null;entry.chars=hit.text.length;entry.cached=true;
-    return {doc:{url,text:hit.text,mode:'cache',status:200},entry};
+    entry.status='cached';entry.mode=hit.mode||'cache';entry.cachedAt=hit.fetchedAt||null;entry.chars=hit.text.length;entry.cached=true;entry.publishedAt=hit.publishedAt||null;entry.dateSource=hit.dateSource||null;
+    return {doc:{url,text:hit.text,mode:'cache',status:200,publishedAt:hit.publishedAt||null,dateSource:hit.dateSource||null},entry};
   }
 
   let page=null;
@@ -659,6 +711,8 @@ async function readArticle(env,url,budget){
     entry.chars=page.text.length;
     if(page.text.length>=ARTICLE_MIN_CHARS){
       entry.status='accepted';
+      entry.publishedAt=page.publishedAt||null;
+      entry.dateSource=page.dateSource||null;
       await storeArticle(env,url,page);
       return {doc:page,entry};
     }
@@ -678,6 +732,10 @@ async function readArticle(env,url,budget){
       entry.chars=rendered.text.length;
       if(rendered.text.length>=AI_MIN_DOC_CHARS){
         entry.status='accepted-browser';
+        if(page?.publishedAt&&!rendered.publishedAt)rendered.publishedAt=page.publishedAt;
+        if(page?.dateSource&&!rendered.dateSource)rendered.dateSource=page.dateSource;
+        entry.publishedAt=rendered.publishedAt||null;
+        entry.dateSource=rendered.dateSource||null;
         await storeArticle(env,url,rendered);
         return {doc:rendered,entry};
       }
@@ -1038,8 +1096,14 @@ async function scanTeam(env,team,{force=false}={}){
       for(const url of ordered){
         attempted++;
         const {doc,entry}=await readArticle(env,url,budget);
-        perUrl.push({...entry,kind:'article'});
-        if(doc&&doc.text)documents.push({...doc,kind:'article',publishedAt:candidateTimes.get(url)||null});
+        perUrl.push({...entry,kind:'article',landingPublishedAt:candidateTimes.get(url)||null});
+        if(doc&&doc.text){
+          const landingPublishedAt=candidateTimes.get(url)||null;
+          const articlePublishedAt=Number(doc.publishedAt)||null;
+          const publishedAt=articlePublishedAt||landingPublishedAt||null;
+          const dateSource=articlePublishedAt?(doc.dateSource||'article-page'):(landingPublishedAt?(landing.timeSources?.get?.(url)||'landing-page'):null);
+          documents.push({...doc,kind:'article',publishedAt,dateSource,landingPublishedAt,articlePublishedAt});
+        }
         if(entry.error)errors.push(`${url}: ${entry.error}`);
       }
     }catch(e){
@@ -1069,6 +1133,17 @@ async function scanTeam(env,team,{force=false}={}){
   const retrieved=documents.filter(d=>d.text&&d.text.length>0);
   const useful=documents.filter(d=>d.text&&d.text.length>=AI_MIN_DOC_CHARS);
   const articleDocs=useful.filter(d=>d.kind==='article');
+  const articleByUrl=new Map(articleDocs.map(d=>[d.url,d]));
+  for(const d of discovery){
+    if(Array.isArray(d.selectedCandidates))d.selectedCandidates=d.selectedCandidates.map(x=>{
+      const a=articleByUrl.get(x.url);
+      return a?{...x,
+        publishedAt:Number(a.publishedAt)?new Date(Number(a.publishedAt)).toISOString():x.publishedAt,
+        dateSource:a.dateSource||x.dateSource,
+        articleDateRecovered:!!Number(a.articlePublishedAt)
+      }:x;
+    });
+  }
   const clubEvents=fastPathClubEvents(team,club.name,articleDocs);
 
   // Only run the model when at least one real article was read, and send ONLY
@@ -1137,6 +1212,7 @@ async function scanTeam(env,team,{force=false}={}){
   const payload={
     status:'ok',
     schemaVersion:SCHEMA_VERSION,
+    workerBuild:'v2.1-article-date-recovery',
     season:env.SEASON||'2026/27',
     team,
     club:club.name,
@@ -1182,6 +1258,9 @@ async function scanTeam(env,team,{force=false}={}){
       newCandidates:discovery.reduce((a,d)=>a+Number(d.newCandidates||0),0),
       cachedCandidates:discovery.reduce((a,d)=>a+Number(d.cachedCandidates||0),0),
       recencySource:discovery.some(d=>d.recencySource==='timestamp')?'timestamp':'landing-order',
+      articleDatesRecovered:articleDocs.filter(d=>Number(d.articlePublishedAt)).length,
+      landingDatesUsed:articleDocs.filter(d=>!Number(d.articlePublishedAt)&&Number(d.landingPublishedAt)).length,
+      undatedArticleDocs:articleDocs.filter(d=>!Number(d.publishedAt)).length,
       perUrl:perUrl.slice(0,60),
       eventsFromThisScan:events.length,
       evidenceAuthoritative,
@@ -1649,7 +1728,7 @@ export default {
     env = await withD1(env);
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
-      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
+      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:'v2.1-article-date-recovery',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
       // Derived team numbers for the projection engine. Public and
       // read-only: it never triggers a fetch, so it cannot burn credits.
       if(u.pathname==='/api/market/teams'){
