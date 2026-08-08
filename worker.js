@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v2.1 — article-level publication recovery + relaxed-pass repair + richer freshness diagnostics
+// v2.2 — forced dynamic discovery + processed-URL ledger + full rank diagnostics
 //
 // Changes vs v1.2 (all additive to the response contract):
 //   1. Browser fallback is gated on ARTICLE CANDIDATES and landing text length,
@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.21.0';
+const SCHEMA_VERSION = '1.22.0';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -27,6 +27,7 @@ const ARTICLE_CACHE_DAYS = 45;
 // which makes line-based boilerplate detection impossible; v2 preserves lines.
 const CACHE_FORMAT = 'v3';     // articles are immutable; render each URL at most once
 const DISCOVERY_LEDGER_MAX = 320;
+const DISCOVERY_LEDGER_VERSION = 'v2';
 const RECENCY_COVERAGE_MIN = 0.25;
 
 /* ---------------------------------------------------------------- storage */
@@ -338,53 +339,6 @@ function extractLinkTimesFromHtml(markup,baseUrl){
   return {times,sources,coverage:uniqueLinks.length?times.size/uniqueLinks.length:0};
 }
 
-function extractPagePublicationFromHtml(markup,baseUrl){
-  const html=String(markup||'');
-  const hits=[];
-  const push=(raw,source,priority)=>{
-    const t=Date.parse(raw||'');
-    if(Number.isFinite(t))hits.push({t,source,priority});
-  };
-
-  // OpenGraph / article meta.
-  let m;
-  const metaRe=/<meta\b[^>]*(?:property|name)=["']([^"']+)["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
-  while((m=metaRe.exec(html))){
-    const k=String(m[1]||'').toLowerCase(),v=m[2];
-    if(k==='article:published_time'||k==='og:published_time'||k==='datepublished'||k==='publishdate'||k==='pubdate')push(v,`meta:${k}`,1);
-    else if(k==='article:modified_time'||k==='datemodified'||k==='last-modified')push(v,`meta:${k}`,4);
-  }
-
-  // JSON-LD on the article page.
-  const ldRe=/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  while((m=ldRe.exec(html))){
-    let data;try{data=JSON.parse(m[1])}catch{continue}
-    const walk=x=>{
-      if(!x)return;
-      if(Array.isArray(x)){x.forEach(walk);return}
-      if(typeof x!=='object')return;
-      const typ=Array.isArray(x['@type'])?x['@type'].join(' '):String(x['@type']||'');
-      if(/NewsArticle|Article|BlogPosting/i.test(typ)){
-        if(x.datePublished)push(x.datePublished,'json-ld:datePublished',0);
-        else if(x.dateCreated)push(x.dateCreated,'json-ld:dateCreated',2);
-        else if(x.dateModified)push(x.dateModified,'json-ld:dateModified',5);
-      }
-      if(x['@graph'])walk(x['@graph']);
-      for(const v of Object.values(x))if(v&&typeof v==='object')walk(v);
-    };
-    walk(data);
-  }
-
-  // Plain <time datetime> on article body.
-  const timeRe=/<time\b[^>]*datetime=["']([^"']+)["'][^>]*>/gi;
-  while((m=timeRe.exec(html)))push(m[1],'time:datetime',3);
-
-  if(!hits.length)return {publishedAt:null,dateSource:null};
-  hits.sort((a,b)=>a.priority-b.priority||a.t-b.t);
-  return {publishedAt:hits[0].t,dateSource:hits[0].source};
-}
-
-
 async function fetchPage(url){
   let r;
   try{
@@ -413,8 +367,7 @@ async function fetchPage(url){
   const markup=await r.text();
   const parsed=await parseHtmlResponse(new Response(markup,{headers:{'content-type':ct||'text/html'}}),r.url);
   const recency=extractLinkTimesFromHtml(markup,r.url);
-  const pageDate=extractPagePublicationFromHtml(markup,r.url);
-  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,mode:'fetch',status:r.status,redirected:r.url!==url};
+  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,mode:'fetch',status:r.status,redirected:r.url!==url};
 }
 
 /* ------------------------------------------------------------ Browser Run */
@@ -479,8 +432,7 @@ async function browserRender(env,url,budget){
   const response=new Response(markup,{headers:{'content-type':'text/html; charset=utf-8'}});
   const parsed=await parseHtmlResponse(response,url);
   const recency=extractLinkTimesFromHtml(markup,url);
-  const pageDate=extractPagePublicationFromHtml(markup,url);
-  return {url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,mode:'browser-content',status:200,redirected:false};
+  return {url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,mode:'browser-content',status:200,redirected:false};
 }
 
 async function browserMarkdown(env,url,budget){
@@ -517,9 +469,7 @@ async function storeArticle(env,url,doc){
   if(!doc?.text||doc.text.length<AI_MIN_DOC_CHARS)return;
   try{
     await env.ROLE_KV.put(articleKey(url),JSON.stringify({
-      url,text:doc.text,mode:doc.mode,fetchedAt:new Date().toISOString(),
-      publishedAt:Number(doc.publishedAt)||null,
-      dateSource:doc.dateSource||null
+      url,text:doc.text,mode:doc.mode,fetchedAt:new Date().toISOString()
     }),{expirationTtl:60*60*24*ARTICLE_CACHE_DAYS});
   }catch{}
 }
@@ -599,35 +549,70 @@ function scoreLink(url,host,currentYear){
  * same-host link with real path depth that is not obviously utility chrome.
  * A scan that finds links must never end with zero attempts and no diagnostic.
  */
-function discoveryLedgerKey(team){return `discovery:${team}`}
+function discoveryLedgerKey(team){return `discovery:${DISCOVERY_LEDGER_VERSION}:${team}`}
 async function loadDiscoveryLedger(env,team){const row=await env.ROLE_KV.get(discoveryLedgerKey(team),'json');return Array.isArray(row?.urls)?row.urls:[]}
 async function saveDiscoveryLedger(env,team,urls){const dedup=[...new Set((urls||[]).filter(Boolean))].slice(-DISCOVERY_LEDGER_MAX);await env.ROLE_KV.put(discoveryLedgerKey(team),JSON.stringify({updatedAt:new Date().toISOString(),urls:dedup}),{expirationTtl:60*60*24*120})}
 
 function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0,{seenUrls=new Set(),force=false}={}){
   const host=hostOf(base),currentYear=new Date().getUTCFullYear();
   const scored=links.map((url,index)=>({url,index,time:Number(times?.get?.(url))||null,seen:seenUrls.has(url),...scoreLink(url,host,currentYear)}));
+
   let selected=scored.filter(x=>x.score>1),pass='strict';
   if(!selected.length){selected=scored.filter(x=>x.score>-99&&(x.depth||0)>=2&&x.score>-6);pass='relaxed'}
+
+  // IMPORTANT: the relaxed pass must stay relaxed. v2.0 accidentally reapplied
+  // score>1 here, which made "relaxed" effectively strict again.
   const eligible=pass==='relaxed'?selected:selected.filter(x=>x.score>1);
   const coverage=Number(timestampCoverage)||0,useTimestamp=coverage>=RECENCY_COVERAGE_MIN;
   const unseenFirst=(a,b)=>(a.seen===b.seen?0:(a.seen?1:-1));
+
+  // Freshness lane:
+  //   1) timestamps, when enough are actually available;
+  //   2) otherwise the publisher's rendered DOM order;
+  // with never-processed URLs ahead of URLs already analysed.
   const freshLane=useTimestamp
     ? eligible.filter(x=>Number.isFinite(x.time)).sort((a,b)=>unseenFirst(a,b)||b.time-a.time||b.score-a.score||a.index-b.index)
     : eligible.slice().sort((a,b)=>unseenFirst(a,b)||a.index-b.index||b.score-a.score);
   const keywordLane=eligible.slice().sort((a,b)=>unseenFirst(a,b)||b.score-a.score||a.index-b.index);
+
   const seen=new Set(),chosen=[],add=x=>{if(!x||seen.has(x.url)||chosen.length>=limit)return;seen.add(x.url);chosen.push(x.url)};
   const reserve=Math.max(1,Math.floor(limit/2));
   for(const x of freshLane){add(x);if(chosen.length>=reserve)break}
   for(const x of keywordLane)add(x);
-  const recencySource=useTimestamp?'timestamp':'landing-order';pass=`${pass}+${recencySource}${force?'+unseen-first':''}`;
-  const rejected=scored.filter(x=>!seen.has(x.url)).map(x=>({url:x.url,status:x.reason==='off-host'?'rejected-off-host':'rejected-low-score',score:x.score,time:x.time,seen:x.seen}));
-  return {candidates:chosen,rejected,pass,scoredCount:scored.length,timestampCoverage:Number(coverage.toFixed(2)),recencyUsed:true,recencySource,newCandidates:chosen.filter(u=>!seenUrls.has(u)).length,cachedCandidates:chosen.filter(u=>seenUrls.has(u)).length};
+
+  const recencySource=useTimestamp?'timestamp':'landing-order';
+  pass=`${pass}+${recencySource}${force?'+unprocessed-first':''}`;
+
+  const rejected=scored.filter(x=>!seen.has(x.url)).map(x=>({
+    url:x.url,status:x.reason==='off-host'?'rejected-off-host':'rejected-low-score',
+    score:x.score,time:x.time,seen:x.seen,index:x.index
+  }));
+
+  // Full rank trace for interrogation. No article text is exposed, only URLs
+  // and selection metadata, so this is cheap and safe to retain in diagnostics.
+  const ranked=scored
+    .filter(x=>x.score>-99)
+    .sort((a,b)=>unseenFirst(a,b)||b.score-a.score||a.index-b.index)
+    .slice(0,80)
+    .map(x=>({url:x.url,index:x.index,score:x.score,seen:x.seen,time:x.time,selected:seen.has(x.url),reason:x.reason}));
+
+  return {
+    candidates:chosen,rejected,ranked,pass,scoredCount:scored.length,
+    timestampCoverage:Number(coverage.toFixed(2)),recencyUsed:true,recencySource,
+    newCandidates:chosen.filter(u=>!seenUrls.has(u)).length,
+    cachedCandidates:chosen.filter(u=>seenUrls.has(u)).length
+  };
 }
 
 /* --------------------------------------------------------------- discovery */
 
-async function discoverLanding(env,url,budget){
-  const record={source:url,mode:'fetch',linksFound:0,textChars:0,browserUsed:false,browserError:null,fetchError:null,timestampCoverage:0,recencyUsed:false};
+async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set()}={}){
+  const record={
+    source:url,mode:'fetch',linksFound:0,textChars:0,browserUsed:false,
+    browserError:null,fetchError:null,timestampCoverage:0,recencyUsed:false,
+    staticCandidates:0,staticUnprocessedCandidates:0,
+    dynamicEscalated:false,dynamicEscalationReason:null
+  };
   let landing=null;
 
   try{
@@ -643,45 +628,62 @@ async function discoverLanding(env,url,budget){
 
   const host=hostOf(landing?.url||url);
   const year=new Date().getUTCFullYear();
-  const candidateCount=(landing?.links||[]).filter(l=>scoreLink(l,host,year).score>1).length;
+  const staticEligible=(landing?.links||[]).filter(l=>scoreLink(l,host,year).score>1);
+  const candidateCount=staticEligible.length;
+  const staticUnprocessed=staticEligible.filter(l=>!processedUrls.has(l)).length;
   record.candidatesFromFetch=candidateCount;
+  record.staticCandidates=candidateCount;
+  record.staticUnprocessedCandidates=staticUnprocessed;
 
-  // THE v1.2 DEFECT: this gate was `links.length < 4`. Six nav links cleared it
-  // on a JS-rendered shell, so the browser was never tried and no article
-  // candidates ever existed.
-  const needsBrowser = !landing
-    || candidateCount===0
-    || landing.text.length<LANDING_MIN_CHARS;
+  // A manual Fresh Live Scan has a stronger contract than a background fetch.
+  // If static HTML yields no new processable URLs OR no usable publication
+  // coverage, render the landing page with JavaScript before declaring it fresh.
+  // Cloudflare recommends Browser Run /content + networkidle for JS-heavy pages.
+  let escalationReason=null;
+  if(!landing)escalationReason='static-fetch-failed';
+  else if(candidateCount===0)escalationReason='no-static-candidates';
+  else if(landing.text.length<LANDING_MIN_CHARS)escalationReason='static-shell';
+  else if(force&&staticUnprocessed===0)escalationReason='forced-scan-no-unprocessed-links';
+  else if(force&&Number(landing.timestampCoverage||0)<RECENCY_COVERAGE_MIN)escalationReason='forced-scan-low-date-coverage';
+
+  const needsBrowser=!!escalationReason;
+  record.dynamicEscalationReason=escalationReason;
 
   if(needsBrowser){
     if(budget.canBrowse(env)){
       try{
         const rendered=await browserRender(env,landing?.url||url,budget);
         record.browserUsed=true;
+        record.dynamicEscalated=true;
         record.mode=rendered.mode;
+
+        // Prefer rendered DOM order while preserving any useful static links.
+        // Rendered links come FIRST because their order reflects the page the
+        // user actually sees after JavaScript executes.
+        const mergedLinks=[...new Set([...(rendered.links||[]),...(landing?.links||[])])];
         landing={
           url:rendered.url,
-          text:rendered.text.length>=(landing?.text.length||0)?rendered.text:landing.text,
-          links:[...new Set([...(landing?.links||[]),...rendered.links])],
+          text:rendered.text.length>=(landing?.text.length||0)?rendered.text:(landing?.text||''),
+          links:mergedLinks,
           timeSources:new Map([...(landing?.timeSources?.entries?.()||[]),...(rendered.timeSources?.entries?.()||[])]),
           times:new Map([...(landing?.times?.entries?.()||[]),...(rendered.times?.entries?.()||[])]),
           timestampCoverage:Math.max(Number(landing?.timestampCoverage||0),Number(rendered.timestampCoverage||0)),
-          mode:rendered.mode,
-          status:200,
-          redirected:false
+          mode:rendered.mode,status:200,redirected:false
         };
         record.linksFound=landing.links.length;
         record.textChars=landing.text.length;
         record.timestampCoverage=Number(landing.timestampCoverage||0);
+
+        const renderedEligible=landing.links.filter(l=>scoreLink(l,hostOf(landing.url),year).score>1);
+        record.renderedCandidates=renderedEligible.length;
+        record.renderedUnprocessedCandidates=renderedEligible.filter(l=>!processedUrls.has(l)).length;
       }catch(e){
         record.browserError=e?.message||String(e);
       }
     }else{
       record.browserError=!env.BROWSER?.quickAction
         ? 'Browser Run binding unavailable'
-        : (budget.quotaExhausted
-            ? 'Browser Run daily allowance exhausted'
-            : 'per-scan browser budget reached');
+        : (budget.quotaExhausted?'Browser Run daily allowance exhausted':'per-scan browser budget reached');
     }
   }
 
@@ -697,8 +699,8 @@ async function readArticle(env,url,budget){
   // 1. Cache. Costs nothing and is the reason a warm scan needs no browser.
   const hit=await cachedArticle(env,url);
   if(hit){
-    entry.status='cached';entry.mode=hit.mode||'cache';entry.cachedAt=hit.fetchedAt||null;entry.chars=hit.text.length;entry.cached=true;entry.publishedAt=hit.publishedAt||null;entry.dateSource=hit.dateSource||null;
-    return {doc:{url,text:hit.text,mode:'cache',status:200,publishedAt:hit.publishedAt||null,dateSource:hit.dateSource||null},entry};
+    entry.status='cached';entry.mode=hit.mode||'cache';entry.cachedAt=hit.fetchedAt||null;entry.chars=hit.text.length;entry.cached=true;
+    return {doc:{url,text:hit.text,mode:'cache',status:200},entry};
   }
 
   let page=null;
@@ -711,8 +713,6 @@ async function readArticle(env,url,budget){
     entry.chars=page.text.length;
     if(page.text.length>=ARTICLE_MIN_CHARS){
       entry.status='accepted';
-      entry.publishedAt=page.publishedAt||null;
-      entry.dateSource=page.dateSource||null;
       await storeArticle(env,url,page);
       return {doc:page,entry};
     }
@@ -732,10 +732,6 @@ async function readArticle(env,url,budget){
       entry.chars=rendered.text.length;
       if(rendered.text.length>=AI_MIN_DOC_CHARS){
         entry.status='accepted-browser';
-        if(page?.publishedAt&&!rendered.publishedAt)rendered.publishedAt=page.publishedAt;
-        if(page?.dateSource&&!rendered.dateSource)rendered.dateSource=page.dateSource;
-        entry.publishedAt=rendered.publishedAt||null;
-        entry.dateSource=rendered.dateSource||null;
         await storeArticle(env,url,rendered);
         return {doc:rendered,entry};
       }
@@ -1025,14 +1021,14 @@ async function scanTeam(env,team,{force=false}={}){
   const errors=[];
   const discovery=[];
   const perUrl=[];
-  const priorDiscovered=await loadDiscoveryLedger(env,team);
-  const seenUrls=new Set(priorDiscovered);
-  const discoveredThisScan=[];
+  const priorProcessed=await loadDiscoveryLedger(env,team);
+  const seenUrls=new Set(priorProcessed);
+  const processedThisScan=[];
   let linksFound=0,candidateCount=0,attempted=0;
 
   for(const source of club.urls){
     try{
-      const {landing,record}=await discoverLanding(env,source,budget);
+      const {landing,record}=await discoverLanding(env,source,budget,{force,processedUrls:seenUrls});
       if(!landing){
         discovery.push({...record,linksFound:0,candidates:0,selectionPass:null});
         if(record.fetchError)errors.push(`${source}: ${record.fetchError}`);
@@ -1042,8 +1038,7 @@ async function scanTeam(env,team,{force=false}={}){
 
       linksFound+=landing.links.length;
 
-      discoveredThisScan.push(...landing.links);
-      const {candidates,rejected,pass,scoredCount,timestampCoverage,recencyUsed,recencySource,newCandidates,cachedCandidates}=selectArticleLinks(landing.url,landing.links,max,landing.times||new Map(),landing.timestampCoverage||0,{seenUrls,force});
+      const {candidates,rejected,ranked,pass,scoredCount,timestampCoverage,recencyUsed,recencySource,newCandidates,cachedCandidates}=selectArticleLinks(landing.url,landing.links,max,landing.times||new Map(),landing.timestampCoverage||0,{seenUrls,force});
       candidateCount+=candidates.length;
       const candidateTimes=new Map(candidates.map(u=>[u,Number(landing.times?.get?.(u))||null]));
 
@@ -1059,7 +1054,14 @@ async function scanTeam(env,team,{force=false}={}){
         recencySource,
         newCandidates,
         cachedCandidates,
-        selectedCandidates:candidates.map(u=>({url:u,publishedAt:candidateTimes.get(u)?new Date(candidateTimes.get(u)).toISOString():null,dateSource:landing.timeSources?.get?.(u)||null,previouslySeen:seenUrls.has(u)})),
+        selectedCandidates:candidates.map(u=>({url:u,publishedAt:candidateTimes.get(u)?new Date(candidateTimes.get(u)).toISOString():null,dateSource:landing.timeSources?.get?.(u)||null,previouslyProcessed:seenUrls.has(u)})),
+        rankedCandidates:ranked,
+        staticCandidates:record.staticCandidates,
+        staticUnprocessedCandidates:record.staticUnprocessedCandidates,
+        renderedCandidates:record.renderedCandidates??null,
+        renderedUnprocessedCandidates:record.renderedUnprocessedCandidates??null,
+        dynamicEscalated:record.dynamicEscalated,
+        dynamicEscalationReason:record.dynamicEscalationReason,
         textChars:landing.text.length,
         browserUsed:record.browserUsed,
         browserError:record.browserError||null,
@@ -1095,15 +1097,10 @@ async function scanTeam(env,team,{force=false}={}){
 
       for(const url of ordered){
         attempted++;
+        processedThisScan.push(url);
         const {doc,entry}=await readArticle(env,url,budget);
-        perUrl.push({...entry,kind:'article',landingPublishedAt:candidateTimes.get(url)||null});
-        if(doc&&doc.text){
-          const landingPublishedAt=candidateTimes.get(url)||null;
-          const articlePublishedAt=Number(doc.publishedAt)||null;
-          const publishedAt=articlePublishedAt||landingPublishedAt||null;
-          const dateSource=articlePublishedAt?(doc.dateSource||'article-page'):(landingPublishedAt?(landing.timeSources?.get?.(url)||'landing-page'):null);
-          documents.push({...doc,kind:'article',publishedAt,dateSource,landingPublishedAt,articlePublishedAt});
-        }
+        perUrl.push({...entry,kind:'article'});
+        if(doc&&doc.text)documents.push({...doc,kind:'article',publishedAt:candidateTimes.get(url)||null});
         if(entry.error)errors.push(`${url}: ${entry.error}`);
       }
     }catch(e){
@@ -1133,17 +1130,6 @@ async function scanTeam(env,team,{force=false}={}){
   const retrieved=documents.filter(d=>d.text&&d.text.length>0);
   const useful=documents.filter(d=>d.text&&d.text.length>=AI_MIN_DOC_CHARS);
   const articleDocs=useful.filter(d=>d.kind==='article');
-  const articleByUrl=new Map(articleDocs.map(d=>[d.url,d]));
-  for(const d of discovery){
-    if(Array.isArray(d.selectedCandidates))d.selectedCandidates=d.selectedCandidates.map(x=>{
-      const a=articleByUrl.get(x.url);
-      return a?{...x,
-        publishedAt:Number(a.publishedAt)?new Date(Number(a.publishedAt)).toISOString():x.publishedAt,
-        dateSource:a.dateSource||x.dateSource,
-        articleDateRecovered:!!Number(a.articlePublishedAt)
-      }:x;
-    });
-  }
   const clubEvents=fastPathClubEvents(team,club.name,articleDocs);
 
   // Only run the model when at least one real article was read, and send ONLY
@@ -1207,12 +1193,12 @@ async function scanTeam(env,team,{force=false}={}){
     }
   }
 
-  try{await saveDiscoveryLedger(env,team,[...priorDiscovered,...discoveredThisScan])}catch{}
+  try{await saveDiscoveryLedger(env,team,[...priorProcessed,...processedThisScan])}catch{}
 
   const payload={
     status:'ok',
     schemaVersion:SCHEMA_VERSION,
-    workerBuild:'v2.1-article-date-recovery',
+    workerBuild:'v2.2-dynamic-discovery-interrogation',
     season:env.SEASON||'2026/27',
     team,
     club:club.name,
@@ -1258,9 +1244,10 @@ async function scanTeam(env,team,{force=false}={}){
       newCandidates:discovery.reduce((a,d)=>a+Number(d.newCandidates||0),0),
       cachedCandidates:discovery.reduce((a,d)=>a+Number(d.cachedCandidates||0),0),
       recencySource:discovery.some(d=>d.recencySource==='timestamp')?'timestamp':'landing-order',
-      articleDatesRecovered:articleDocs.filter(d=>Number(d.articlePublishedAt)).length,
-      landingDatesUsed:articleDocs.filter(d=>!Number(d.articlePublishedAt)&&Number(d.landingPublishedAt)).length,
-      undatedArticleDocs:articleDocs.filter(d=>!Number(d.publishedAt)).length,
+      dynamicDiscoveryEscalated:discovery.some(d=>d.dynamicEscalated),
+      dynamicEscalationReasons:[...new Set(discovery.map(d=>d.dynamicEscalationReason).filter(Boolean))],
+      staticUnprocessedCandidates:discovery.reduce((a,d)=>a+Number(d.staticUnprocessedCandidates||0),0),
+      renderedUnprocessedCandidates:discovery.reduce((a,d)=>a+Number(d.renderedUnprocessedCandidates||0),0),
       perUrl:perUrl.slice(0,60),
       eventsFromThisScan:events.length,
       evidenceAuthoritative,
@@ -1728,7 +1715,7 @@ export default {
     env = await withD1(env);
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
-      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:'v2.1-article-date-recovery',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
+      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:'v2.2-dynamic-discovery-interrogation',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
       // Derived team numbers for the projection engine. Public and
       // read-only: it never triggers a fetch, so it cannot burn credits.
       if(u.pathname==='/api/market/teams'){
@@ -1771,6 +1758,46 @@ export default {
         if(team){const report=await env.ROLE_KV.get(`latest:${team}`,'json');return json({status:'ok',team,generatedAt:report?.generatedAt||null,events:Array.isArray(report?.clubEvents)?report.clubEvents:[]},200,env)}
         const latest=await allLatest(env),events=[];for(const [code,report] of Object.entries(latest))for(const e of (report?.clubEvents||[]))events.push({...e,team:e.team||code});
         events.sort((a,b)=>Date.parse(b.evidenceDate||0)-Date.parse(a.evidenceDate||0));return json({status:'ok',generatedAt:new Date().toISOString(),events:events.slice(0,100)},200,env);
+      }
+      if(u.pathname==='/api/scout/interrogate'){
+        const team=String(u.searchParams.get('team')||'').toUpperCase();
+        if(!team)return json({error:'team is required'},400,env);
+        const report=await env.ROLE_KV.get(`latest:${team}`,'json');
+        if(!report)return json({status:'ok',team,report:null},200,env);
+        const d=report.diagnostics||{};
+        return json({
+          status:'ok',team,
+          schemaVersion:report.schemaVersion||SCHEMA_VERSION,
+          workerBuild:report.workerBuild||null,
+          generatedAt:report.generatedAt||null,
+          cache:report.cache||null,
+          summary:{
+            candidates:d.candidates||0,articleDocuments:d.articleDocuments||0,
+            cacheHits:d.cacheHits||0,newCandidates:d.newCandidates||0,
+            cachedCandidates:d.cachedCandidates||0,
+            recencySource:d.recencySource||null,
+            timestampCoverage:d.timestampCoverage||0,
+            dynamicDiscoveryEscalated:!!d.dynamicDiscoveryEscalated,
+            dynamicEscalationReasons:d.dynamicEscalationReasons||[],
+            staticUnprocessedCandidates:d.staticUnprocessedCandidates||0,
+            renderedUnprocessedCandidates:d.renderedUnprocessedCandidates||0,
+            confirmedClubEvents:d.confirmedClubEvents||0,
+            acceptedEvents:d.acceptedEvents||0
+          },
+          discovery:(d.discovery||[]).map(x=>({
+            source:x.source,mode:x.mode,linksFound:x.linksFound,
+            selectionPass:x.selectionPass,timestampCoverage:x.timestampCoverage,
+            recencySource:x.recencySource,newCandidates:x.newCandidates,
+            cachedCandidates:x.cachedCandidates,dynamicEscalated:x.dynamicEscalated,
+            dynamicEscalationReason:x.dynamicEscalationReason,
+            staticCandidates:x.staticCandidates,
+            staticUnprocessedCandidates:x.staticUnprocessedCandidates,
+            renderedCandidates:x.renderedCandidates,
+            renderedUnprocessedCandidates:x.renderedUnprocessedCandidates,
+            selectedCandidates:x.selectedCandidates,
+            rankedCandidates:x.rankedCandidates
+          }))
+        },200,env);
       }
       if(u.pathname==='/api/scout/diagnostics'){
         const team=String(u.searchParams.get('team')||'').toUpperCase();if(!team)return json({error:'team is required'},400,env);
