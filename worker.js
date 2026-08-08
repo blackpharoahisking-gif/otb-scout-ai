@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v2.2 — forced dynamic discovery + processed-URL ledger + full rank diagnostics
+// v2.4 — cross-club football terminology taxonomy + semantic event guards
 //
 // Changes vs v1.2 (all additive to the response contract):
 //   1. Browser fallback is gated on ARTICLE CANDIDATES and landing text length,
@@ -14,7 +14,7 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.22.0';
+const SCHEMA_VERSION = '1.24.0';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -145,7 +145,69 @@ const TEAM_ALIASES = {
 };
 
 const ROLE_VALUES = new Set(['GK','CB','FB','DM','CM','AM','LW','RW','ST']);
-const EVENT_VALUES = new Set(['observed_role','departure','signing','injury','return','manager_positive','manager_negative']);
+const EVENT_VALUES = new Set(['observed_role','departure','signing','loan_in','loan_out','injury','return','manager_positive','manager_negative']);
+
+// Vocabulary observed across official club publishing styles. Discovery uses
+// these families broadly; classification below requires semantic context so
+// ambiguous words such as "signs", "deal", "returns" and "leaves" cannot
+// create a player event on their own.
+const CLUB_TERMS = Object.freeze({
+  transferIn:[
+    /\bjoins?\b/i, /\bnew signing\b/i, /\bsigns? for\b/i,
+    /\bcomplete(?:s|d)? (?:the )?(?:signing|move)\b/i,
+    /\bhas signed\b/i, /\barrives?\b/i, /\bwelcome\b/i,
+    /\bagree(?:s|d)? (?:a )?deal to sign\b/i, /\bseals? (?:a )?move\b/i
+  ],
+  transferOut:[
+    /\bleaves?\b/i, /\bdeparts?\b/i, /\bhas left\b/i,
+    /\bjoins? .+ from\b/i, /\bcomplete(?:s|d)? (?:a )?move to\b/i,
+    /\btransfer(?:red)? to\b/i, /\bsold to\b/i, /\bfarewell\b/i
+  ],
+  loan:[
+    /\bon loan\b/i, /\bseason-long loan\b/i, /\bloan deal\b/i,
+    /\bloan move\b/i, /\btemporary move\b/i, /\breturns? from loan\b/i,
+    /\brecalled from loan\b/i
+  ],
+  renewal:[
+    /\bnew deal\b/i, /\bnew contract\b/i, /\bcontract extension\b/i,
+    /\bextends? (?:his|her|their|the) (?:stay|deal|contract)\b/i,
+    /\bcommits? .+ future\b/i, /\bcommits? to\b/i, /\bpens? (?:a )?new deal\b/i,
+    /\bputs? pen to paper\b/i, /\bre-?signs?\b/i, /\brenews?\b/i,
+    /\bprofessional terms\b/i, /\bfirst pro(?:fessional)? deal\b/i
+  ],
+  injuryOut:[
+    /\bruled out\b/i, /\bunavailable\b/i, /\bsidelined\b/i,
+    /\bwill miss\b/i, /\bset to miss\b/i, /\bout for\b/i,
+    /\bsuffer(?:s|ed)? (?:an? )?(?:injury|knock|setback)\b/i,
+    /\bunderwent surgery\b/i, /\boperation\b/i
+  ],
+  doubt:[
+    /\bdoubtful\b/i, /\ba doubt\b/i, /\bfitness test\b/i,
+    /\bassessment closer to the game\b/i, /\bwe will see\b/i,
+    /\bchance of making\b/i, /\bmay be in contention\b/i
+  ],
+  return:[
+    /\bback in training\b/i, /\breturns? to training\b/i,
+    /\breturned to training\b/i, /\bresumed training\b/i,
+    /\bback with the squad\b/i, /\breturned to the squad\b/i,
+    /\bavailable for\b/i, /\bfit to face\b/i, /\bready to return\b/i
+  ],
+  selectionPositive:[
+    /\bstarts?\b/i, /\bstarting xi\b/i, /\bnamed in the starting xi\b/i,
+    /\bfirst choice\b/i, /\bkept his place\b/i, /\bkept her place\b/i,
+    /\bplayed (?:the full )?90\b/i, /\bdeployed at\b/i, /\blined up at\b/i
+  ],
+  selectionNegative:[
+    /\bbenched\b/i, /\brested\b/i, /\bdropped\b/i,
+    /\bnot in the squad\b/i, /\bomitted from the squad\b/i,
+    /\bsubstitute\b/i
+  ],
+  nonPlayer:[
+    /\bmanager\b/i, /\bcoach\b/i, /\bacademy manager\b/i,
+    /\bstaff\b/i, /\bpartnership\b/i, /\bsponsorship\b/i,
+    /\bcommercial\b/i, /\bambassador\b/i
+  ]
+});
 
 /* --------------------------------------------------------------- helpers */
 
@@ -532,7 +594,7 @@ function scoreLink(url,host,currentYear){
   if(u.hostname.replace(/^www\./,'')!==host)return {score:-99,reason:'off-host'};
   const p=decodeURIComponent(u.pathname).toLowerCase();
   if(/\/news\//.test(p))score+=7;
-  if(/article|story|press|interview|team-news|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pre-season|preseason|friendly|match-report|line-up|lineup|squad|injury|contract|loan/.test(p))score+=6;
+  if(/article|story|press|interview|team-news|fitness-update|injury-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|squad|pre-season|preseason|friendly|match-report|injury|contract/.test(p))score+=6;
   if(new RegExp(`/${currentYear}/`).test(p))score+=1;
   if(new RegExp(`/${currentYear-1}/`).test(p))score-=2;
   const depth=p.split('/').filter(Boolean).length;if(depth>=2)score+=1;
@@ -805,22 +867,137 @@ async function fplContext(env,team){
 }
 
 /* ------------------------------------------------ official club events */
-function titleCaseSlug(s){return String(s||'').split('-').filter(Boolean).map(w=>w?w[0].toUpperCase()+w.slice(1):w).join(' ')}
-function subjectFromAnnouncement(doc,clubName){
-  const lines=splitLines(doc?.text).slice(0,16),clubEsc=String(clubName||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-  for(const line of lines){const m=line.match(new RegExp(`^(.{2,100}?)\\s+(?:joins|signs for|signs|arrives at)\\s+${clubEsc}\\b`,'i'));if(m)return cleanText(m[1]).slice(0,100)}
-  try{const slug=decodeURIComponent(new URL(doc.url).pathname.split('/').filter(Boolean).pop()||''),m=slug.match(/^(.+?)-(?:joins?|signs?|signed|arrives?|completes?)(?:-|$)/i);return m?cleanText(titleCaseSlug(m[1])).slice(0,100):''}catch{return ''}
+// Official-club event classifier. The role model remains conservative; these
+// events are a news/intelligence layer and only map into xMins when a current
+// FPL player can be identified safely.
+
+function titleCaseSlug(s){
+  return String(s||'').split('-').filter(Boolean)
+    .map(w=>w?w[0].toUpperCase()+w.slice(1):w).join(' ')
 }
+function headlineLines(doc){return splitLines(doc?.text).slice(0,20)}
+function firstHeadline(doc){return headlineLines(doc)[0]||''}
+function termHit(group,text){return (CLUB_TERMS[group]||[]).some(r=>r.test(text))}
+
+function subjectFromHeadlineOrSlug(doc){
+  for(const line of headlineLines(doc)){
+    let m=line.match(/^(.{2,100}?)\s+(?:joins|signs for|completes (?:a )?move to|moves to|leaves|departs|pens new deal|signs new deal|signs new contract|extends contract)\b/i);
+    if(m)return cleanText(m[1]).slice(0,100);
+    m=line.match(/^(?:injury update|fitness update|team news):?\s*(.{2,100})$/i);
+    if(m)return cleanText(m[1]).slice(0,100);
+  }
+  try{
+    const slug=decodeURIComponent(new URL(doc.url).pathname.split('/').filter(Boolean).pop()||'');
+    // Do not use "signs" alone to classify, but it is still useful for subject extraction.
+    const m=slug.match(/^(.+?)-(?:joins?|signs?|signed|leaves?|departs?|completes?|moves?|pens?|extends?|returns?)(?:-|$)/i);
+    return m?cleanText(titleCaseSlug(m[1])).slice(0,100):'';
+  }catch{return ''}
+}
+
+function classifyClubEvent(doc,clubName){
+  const lines=headlineLines(doc), headline=firstHeadline(doc);
+  let path='';try{path=decodeURIComponent(new URL(doc.url).pathname).toLowerCase()}catch{}
+  const text=String(doc.text||'').slice(0,9000);
+  const hay=`${headline}\n${path}\n${text}`;
+  const club=normal(clubName);
+
+  // 1) Non-player / academy-office semantics: never classify as a player transaction.
+  if(/\b(?:goalkeeping coach|head coach|assistant coach|academy manager|technical director|sporting director|chief executive)\b/i.test(hay))
+    return {type:'non_player',actionable:false,reason:'staff/non-player announcement'};
+
+  // 2) Contract renewal / professional terms. This MUST precede "signs".
+  if(termHit('renewal',hay) && !/\b(?:joins?|arrives?|from [A-Z][A-Za-z .&'-]{2,50}|transfer from)\b/i.test(headline)){
+    return {type:'contract_renewal',actionable:false,reason:'contract renewal/internal terms'};
+  }
+
+  // 3) Commercial/legal "deal" and "signing" uses.
+  if(/\b(?:partnership|sponsorship|commercial partner|rights deal|broadcast deal|kit deal|brand ambassador)\b/i.test(hay))
+    return {type:'non_player_signing',actionable:false,reason:'commercial/non-player deal'};
+
+  // 4) Loans need their own direction because their xMins consequence differs
+  // from a permanent signing/departure.
+  if(termHit('loan',hay)){
+    if(/\b(?:returns?|returned|recalled)\s+(?:to\s+[\w .'-]+\s+)?from (?:a |his |her )?loan\b/i.test(hay) ||
+       /\b(?:loan spell|loan deal) (?:has )?(?:ended|expired)\b/i.test(hay))
+      return {type:'loan_return',actionable:true,reason:'loan return/recall'};
+
+    for(const line of lines){
+      let mm=line.match(/^(.{2,100}?)\s+joins\s+(.{2,100}?)\s+on loan\b/i);
+      if(mm){
+        return normal(mm[2]).includes(club)
+          ? {type:'loan_in',actionable:true,reason:'headline loan into current club'}
+          : {type:'loan_out',actionable:true,reason:'headline loan to another club'};
+      }
+    }
+    // Article-body phrases used by official sites.
+    if(/\bhas joined us on loan\b|\bjoins us on loan\b|\barrives? on loan\b/i.test(hay))
+      return {type:'loan_in',actionable:true,reason:'explicit inbound loan language'};
+    if(/\bhas joined [^.\n]{2,80} on (?:a |an )?(?:season-long )?loan\b|\bhas moved to [^.\n]{2,80} on loan\b/i.test(hay))
+      return {type:'loan_out',actionable:true,reason:'explicit outbound loan language'};
+  }
+
+  // 5) Permanent inbound/outbound transfer.
+  if(/\bhas joined us\b|\bjoins us\b|\bjoined us from\b|\bhas signed for us\b|\bnew signing\b|\bwelcome to\b/i.test(hay))
+    return {type:'signing',actionable:true,reason:'explicit inbound transfer language'};
+
+  if(/\bhas left the club\b|\bhas left us\b|\bleaves? the club\b|\bdeparts? the club\b|\bhas completed (?:a )?move to\b|\bhas joined [^.\n]{2,80} (?:on|in) a permanent transfer\b/i.test(hay))
+    return {type:'departure',actionable:true,reason:'explicit outbound transfer language'};
+
+  for(const line of lines){
+    let mm=line.match(/^(.{2,100}?)\s+joins\s+(.{2,100})$/i);
+    if(mm){
+      return normal(mm[2]).includes(club)
+        ? {type:'signing',actionable:true,reason:'headline joins current club'}
+        : {type:'departure',actionable:true,reason:'headline joins another club'};
+    }
+    mm=line.match(/^(.{2,100}?)\s+signs\s+for\s+(.{2,100})$/i);
+    if(mm){
+      return normal(mm[2]).includes(club)
+        ? {type:'signing',actionable:true,reason:'headline signs for current club'}
+        : {type:'departure',actionable:true,reason:'headline signs for another club'};
+    }
+  }
+
+  // 6) Injury/availability language. These are official news events; the role
+  // extractor independently decides whether/how they affect xMins.
+  if(termHit('injuryOut',hay))
+    return {type:'injury_status',actionable:false,reason:'official unavailable/injury language'};
+  if(termHit('doubt',hay))
+    return {type:'fitness_doubt',actionable:false,reason:'official doubt/assessment language'};
+  if(termHit('return',hay))
+    return {type:'fitness_return',actionable:false,reason:'official return/availability language'};
+
+  // 7) Selection / tactical language is useful news context but not a transfer.
+  if(termHit('selectionPositive',hay))
+    return {type:'selection_signal',actionable:false,reason:'official selection/role language'};
+  if(termHit('selectionNegative',hay))
+    return {type:'selection_signal',actionable:false,reason:'official bench/rest language'};
+
+  return {type:'unknown',actionable:false,reason:'insufficient event semantics'};
+}
+
 function fastPathClubEvents(team,clubName,documents){
   const out=[];
-  for(const d of documents||[]){const head=String(d.text||'').slice(0,7000),path=(()=>{try{return decodeURIComponent(new URL(d.url).pathname).toLowerCase()}catch{return ''}})(),hay=path+' '+head;let type=null;
-    if(/\bhas joined us\b|\bjoins us\b|\bjoined us from\b|\bhas signed for us\b|\bwe (?:are pleased|are delighted|can confirm) to (?:announce|confirm).{0,160}\b(?:signing|arrival)\b/i.test(hay))type='signing';
-    if(/\bhas left the club\b|\bhas left us\b|\bdeparts? the club\b|\bjoins [^.\n]{2,80} on a permanent transfer\b/i.test(hay))type='departure';
-    if(!type&&/(?:-joins?-|-signs?-|-signed-|-arrives?-|-completes?-)/i.test(path)){const subj=subjectFromAnnouncement(d,clubName);if(subj)type='signing'}
-    if(!type)continue;const subject=subjectFromAnnouncement(d,clubName);if(!subject)continue;
-    out.push({id:`club-${hashString([team,type,subject,d.url].join('|'))}`,team,type,subject,confidence:1,source:d.url,reason:`Official ${clubName} ${type} announcement detected. Role/xMins impact remains separate until a current FPL player can be mapped safely.`,evidenceDate:Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'',official:true,fastPath:true});
+  for(const d of documents||[]){
+    const tx=classifyClubEvent(d,clubName);
+    // Only transaction types create fast-path clubEvents today. Injury/return/
+    // selection signals continue through the AI/FPL pipelines to avoid duplicate
+    // alerts in News, but are retained in diagnostics for taxonomy auditing.
+    if(!['signing','departure','loan_in','loan_out','loan_return'].includes(tx.type))continue;
+
+    const subject=subjectFromHeadlineOrSlug(d);
+    if(!subject)continue;
+
+    out.push({
+      id:`club-${hashString([team,tx.type,subject,d.url].join('|'))}`,
+      team,type:tx.type,subject,confidence:1,source:d.url,
+      reason:`Official ${clubName} ${tx.type.replaceAll('_',' ')} announcement detected. Role/xMins impact remains separate until a current FPL player can be mapped safely.`,
+      evidenceDate:Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'',
+      official:true,fastPath:true,classificationReason:tx.reason
+    });
   }
-  const seen=new Set();return out.filter(e=>{const k=[e.type,normal(e.subject),e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
+  const seen=new Set();
+  return out.filter(e=>{const k=[e.type,normal(e.subject),e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
 }
 
 /* ------------------------------------------------------------- extraction */
@@ -849,6 +1026,11 @@ RULES:
 - GOALS, ASSISTS, AND PERFORMANCE QUALITY ARE NOT ROLE EVIDENCE. A player scoring, assisting, playing well, or being praised for a performance tells you nothing about expected minutes on its own. A substitute who scores must NOT produce an observed_role event. Only create an event from a goal or performance mention if the SAME text also states that the player started, or states the position he played in.
 - Fixture lists, TV and "how to watch" guides, ticket news, kit launches, competition or quiz pages, and community or commercial stories contain no role evidence. Return no event from them even if current FPL players are named.
 - Use departure/signing/injury/return for a competitor event and name the FPL player(s) whose minutes are likely affected.
+- TRANSFER SEMANTICS: signing means a player ARRIVING FROM ANOTHER CLUB. departure means a player LEAVING FOR ANOTHER CLUB. A player who "signs a new deal", "signs a new contract", "extends his contract", "renews", "agrees professional terms", or signs sponsorship/commercial terms is NOT a signing event and must produce NO signing/departure role event.
+- LOAN SEMANTICS: loan_in means a player temporarily ARRIVING at the current club; loan_out means a current player temporarily LEAVING; a loan return/recall is not a permanent signing/departure. Never collapse loan movement into a permanent transfer.
+- OFFICIAL FITNESS LANGUAGE: phrases such as ruled out, unavailable, sidelined, set to miss, back in training, resumed training, available for, doubtful, or chance of making the game are valid injury/return/minutes evidence when they clearly refer to a CURRENT FPL player.
+- SELECTION LANGUAGE varies by club: starting XI, named in the XI, starts, kept his place, first choice, benched, rested, omitted, deployed at, lined up at, and played 90 are role/minutes evidence. Treat them semantically, not as raw keyword triggers.
+- Do not infer a competitive xMins effect merely from a contract renewal. A renewal can be reported as news elsewhere, but it does not by itself change another player's expected minutes.
 - Use manager_positive/manager_negative only for direct role/minutes language.
 - affected MUST exactly match one CURRENT FPL player name from the list.
 - For observed_role, subject and affected MUST be the SAME player: it records that THAT player was selected. If the text says a DIFFERENT player started in a position, that is a threat to the incumbent — use manager_negative or signing with the incumbent as affected, never observed_role.
@@ -888,8 +1070,12 @@ function validateEvents(team,players,events,allowedSources){
     // that was actually supplied to the model.
     if(allowedHosts.size&&!allowedHosts.has(hostOf(source)))continue;
     if(e.type==='injury'&&normal(e.subject)===normal(p.name))continue;
+    if(e.type==='loan_in'&&normal(e.subject)===normal(p.name))continue; // arrival threatens incumbent; affected is incumbent
+    if(e.type==='loan_out'&&normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName))continue; // outbound loan should name departing current player
+
     const evidenceTime=Date.parse(e.evidenceDate||'');if(Number.isFinite(evidenceTime)&&Date.now()-evidenceTime>120*86400000&&!['departure','signing'].includes(e.type))continue;
-    out.push({id:`auto-${hashString([team,e.type,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:e.type,subject:cleanText(e.subject).slice(0,120),role:e.role,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate:cleanText(e.evidenceDate).slice(0,40),auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
+    const normalizedType=e.type==='loan_in'?'signing':(e.type==='loan_out'?'departure':e.type);
+    out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,subject:cleanText(e.subject).slice(0,120),role:e.role,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate:cleanText(e.evidenceDate).slice(0,40),auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
   }
   const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),normal(e.affected),e.role,e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
 }
@@ -1131,6 +1317,10 @@ async function scanTeam(env,team,{force=false}={}){
   const useful=documents.filter(d=>d.text&&d.text.length>=AI_MIN_DOC_CHARS);
   const articleDocs=useful.filter(d=>d.kind==='article');
   const clubEvents=fastPathClubEvents(team,club.name,articleDocs);
+  const transactionDiagnostics=articleDocs.map(d=>{
+    const tx=classifyClubEvent(d,club.name);
+    return {url:d.url,type:tx.type,actionable:tx.actionable,reason:tx.reason};
+  }).filter(x=>x.type!=='unknown');
 
   // Only run the model when at least one real article was read, and send ONLY
   // the articles. The landing page is a headline list whose every line recurs
@@ -1198,7 +1388,7 @@ async function scanTeam(env,team,{force=false}={}){
   const payload={
     status:'ok',
     schemaVersion:SCHEMA_VERSION,
-    workerBuild:'v2.2-dynamic-discovery-interrogation',
+    workerBuild:'v2.4-cross-club-terminology-taxonomy',
     season:env.SEASON||'2026/27',
     team,
     club:club.name,
@@ -1241,6 +1431,16 @@ async function scanTeam(env,team,{force=false}={}){
       rawEvents:Array.isArray(raw)?raw.length:0,
       acceptedEvents:events.length,
       confirmedClubEvents:clubEvents.length,
+      transactionDiagnostics:transactionDiagnostics.slice(0,30),
+      suppressedContractRenewals:transactionDiagnostics.filter(x=>x.type==='contract_renewal').length,
+      taxonomySignals:{
+        loans:transactionDiagnostics.filter(x=>['loan_in','loan_out','loan_return'].includes(x.type)).length,
+        injuryStatus:transactionDiagnostics.filter(x=>x.type==='injury_status').length,
+        fitnessReturns:transactionDiagnostics.filter(x=>x.type==='fitness_return').length,
+        fitnessDoubts:transactionDiagnostics.filter(x=>x.type==='fitness_doubt').length,
+        selectionSignals:transactionDiagnostics.filter(x=>x.type==='selection_signal').length,
+        nonPlayerSuppressed:transactionDiagnostics.filter(x=>['non_player','non_player_signing'].includes(x.type)).length
+      },
       newCandidates:discovery.reduce((a,d)=>a+Number(d.newCandidates||0),0),
       cachedCandidates:discovery.reduce((a,d)=>a+Number(d.cachedCandidates||0),0),
       recencySource:discovery.some(d=>d.recencySource==='timestamp')?'timestamp':'landing-order',
@@ -1715,7 +1915,7 @@ export default {
     env = await withD1(env);
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
-      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:'v2.2-dynamic-discovery-interrogation',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
+      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:'v2.4-cross-club-terminology-taxonomy',schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,generatedAt:new Date().toISOString()},200,env);
       // Derived team numbers for the projection engine. Public and
       // read-only: it never triggers a fetch, so it cannot burn credits.
       if(u.pathname==='/api/market/teams'){
