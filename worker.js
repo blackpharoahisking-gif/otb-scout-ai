@@ -15,16 +15,19 @@
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
 const TRANSACTION_REGRESSION_CASES = Object.freeze({
-  NEW_BRUNO_DEPARTURE: 'previously-seen official Newcastle departure remains recoverable',
+  NEW_BRUNO_DEPARTURE: 'Arsenal official signing can mirror a Newcastle departure and persist independently of Newcastle article novelty',
   ARS_BRUNO_SIGNING: 'official Arsenal signing remains visible',
-  NON_MENS_SUPPRESSED: 'women/academy transactions do not enter men FPL Scout'
+  NON_MENS_SUPPRESSED: 'women/academy/U23/U21/U18 transactions never enter men FPL Scout',
+  INDEX_PAGES_SUPPRESSED: 'listing/index pages cannot establish official transactions',
+  DUPLICATES_COLLAPSED: 'multiple articles for one player/team/type collapse into one canonical transaction fact',
+  FRIENDLY_CALIBRATED: 'pre-season XI and precautionary absences cannot create competitive-strength xMins swings'
 });
 
 const SCHEMA_VERSION = '1.28.0';   // wire format: UNCHANGED in RC5.0.9 (no field/shape change)
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.14-rc5.0.14-transaction-retention';
+const WORKER_BUILD = 'v2.15-rc5.0.15-transaction-ledger-final';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -267,9 +270,36 @@ function normal(s){return cleanText(s).toLowerCase().normalize('NFD').replace(/[
 function isMensFirstTeamSource(url,text=''){
   const u=String(url||'').toLowerCase();
   const t=normal(text||'');
-  if(/\/women(?:\/|$)|\/womens(?:\/|$)|\/academy(?:\/|$)|\/u21(?:\/|$)|\/u18(?:\/|$)|\/under-21|\/under-18|girls|women-s/.test(u))return false;
-  if(/\bwomen'?s team\b|\bwomen'?s first team\b|\bgirls'? academy\b|\bacademy side\b|\bunder-21s?\b|\bunder-18s?\b|\bu21s?\b|\bu18s?\b/.test(t))return false;
+  if(/\/women(?:\/|$)|\/womens(?:\/|$)|women-|womens-|women_|\/academy(?:\/|$)|academy-|\/u21(?:\/|$)|\/u18(?:\/|$)|\/under-21|\/under-18|girls|ladies/.test(u))return false;
+  if(/\bwomen'?s team\b|\bwomen'?s first team\b|\bwomen'?s side\b|\bgirls'? academy\b|\bacademy side\b|\bunder-23s?\b|\bunder-21s?\b|\bunder-18s?\b|\bu23s?\b|\bu21s?\b|\bu18s?\b|\bladies\b/.test(t))return false;
   return true;
+}
+function isAggregatorTransactionSource(url){
+  let p='';try{p=decodeURIComponent(new URL(String(url||'')).pathname).toLowerCase()}catch{p=String(url||'').toLowerCase()}
+  return /\/listing\/|\/news\/all(?:\/|$)|\/news\/?$|\/news\/men\/?$|\/mens-news\/?$|\/latest-news\/?$/.test(p);
+}
+function validTransactionSubject(subject){
+  const s=cleanText(subject).trim();
+  if(!s||s.length<2||s.length>80)return false;
+  if(/^the\b/i.test(s)||/\bcapped by\b|\byears? old\b|\bunder-\d+\b|\bu-?\d+\b|\bteam\b|\bsquad\b|\bclub\b|\bplayer\b$/i.test(s))return false;
+  const words=s.split(/\s+/).filter(Boolean);
+  if(words.length>6)return false;
+  return words.some(w=>/[A-Za-zÀ-ÖØ-öø-ÿĀ-ž]/.test(w));
+}
+function sourceHasSubjectTransaction(doc,subject){
+  const ns=normal(subject), text=String(doc?.text||'');
+  if(!ns||!text)return false;
+  const lines=splitLines(text);
+  const tx=/\bjoins?\b|\bsigns?(?: for)?\b|\bsigned\b|\bnew signing\b|\bnew recruit\b|\bnew arrival\b|\bcompletes? (?:a )?move\b|\bmoves? to\b|\bleaves?\b|\bdeparts?\b|\bhas left\b|\bon loan\b|\bloan move\b|\breturns? from loan\b/i;
+  for(const line of lines){
+    const nl=normal(line);
+    if(nl.includes(ns)&&tx.test(line))return true;
+  }
+  try{
+    const slug=normal(decodeURIComponent(new URL(doc.url).pathname.split('/').filter(Boolean).pop()||''));
+    if(slug.includes(ns)&&tx.test(slug))return true;
+  }catch{}
+  return false;
 }
 
 function hashString(s){
@@ -1014,6 +1044,7 @@ function subjectFromHeadlineOrSlug(doc){
 
 function classifyClubEvent(doc,clubName){
   if(!isMensFirstTeamSource(doc?.url,doc?.text))return {type:'non_mens',actionable:false,reason:'non-men first-team source suppressed'};
+  if(isAggregatorTransactionSource(doc?.url))return {type:'index_page',actionable:false,reason:'listing/index page cannot establish a transaction'};
   const lines=headlineLines(doc), headline=firstHeadline(doc);
   let path='';try{path=decodeURIComponent(new URL(doc.url).pathname).toLowerCase()}catch{}
   const body=String(doc.text||'').slice(0,9000),headlineHay=`${headline}\n${path}`,hay=`${headlineHay}\n${body}`;
@@ -1120,17 +1151,39 @@ function classifyClubEvent(doc,clubName){
 }
 
 function clubEventLedgerKey(team){return `club-events:${team}`}
-async function loadClubEventLedger(env,team){const row=await env.ROLE_KV.get(clubEventLedgerKey(team),'json');return Array.isArray(row?.events)?row.events:[]}
-async function saveClubEventLedger(env,team,events){
-  const prior=await loadClubEventLedger(env,team),priorByKey=new Map(prior.map(e=>[e.id||[e.team,e.type,normal(e.subject),e.source].join('|'),e]));
-  const seen=new Set(),merged=[];
-  for(const e0 of (events||[]).sort((a,b)=>Date.parse(b.evidenceDate||b.detectedAt||0)-Date.parse(a.evidenceDate||a.detectedAt||0))){
-    const k=e0.id||[e0.team,e0.type,normal(e0.subject),e0.source].join('|');
-    if(seen.has(k))continue;seen.add(k);
-    const old=priorByKey.get(k),firstSeenAt=old?.firstSeenAt||old?.detectedAt||e0.firstSeenAt||e0.detectedAt||new Date().toISOString();
-    merged.push({...e0,firstSeenAt});
-    if(merged.length>=120)break;
+function canonicalClubEventKey(e){
+  return [String(e?.team||''),String(e?.type||''),normal(e?.subject),String(e?.counterpartTeam||'')].join('|');
+}
+function validStoredClubEvent(e){
+  if(!e||!['signing','departure','loan_in','loan_out','loan_return'].includes(String(e.type||'')))return false;
+  if(!validTransactionSubject(e.subject))return false;
+  if(!isMensFirstTeamSource(e.source,''))return false;
+  if(isAggregatorTransactionSource(e.source))return false;
+  // Old information-recovery events from team-news/friendly pages are retained only
+  // when they were backed by explicit same-line subject+transaction evidence.
+  if(e.recovered&&/team-news|friendly|match-report/i.test(String(e.source||''))&&!e.subjectTransactionVerified)return false;
+  return true;
+}
+function mergeClubEventRows(rows){
+  const byKey=new Map();
+  for(const e0 of rows||[]){
+    if(!validStoredClubEvent(e0))continue;
+    const k=canonicalClubEventKey(e0),old=byKey.get(k);
+    const evidence=[...(old?.evidence||[]),...(e0.evidence||[]),e0.source].filter(Boolean);
+    const firstSeenAt=old?.firstSeenAt||old?.detectedAt||e0.firstSeenAt||e0.detectedAt||new Date().toISOString();
+    const newer=!old||Date.parse(e0.evidenceDate||e0.detectedAt||0)>=Date.parse(old.evidenceDate||old.detectedAt||0);
+    const base=newer?e0:old;
+    byKey.set(k,{...base,firstSeenAt,evidence:[...new Set(evidence)].slice(0,8)});
   }
+  return [...byKey.values()].sort((a,b)=>Date.parse(b.evidenceDate||b.detectedAt||0)-Date.parse(a.evidenceDate||a.detectedAt||0)).slice(0,120);
+}
+async function loadClubEventLedger(env,team){
+  const row=await env.ROLE_KV.get(clubEventLedgerKey(team),'json');
+  return mergeClubEventRows(Array.isArray(row?.events)?row.events:[]);
+}
+async function saveClubEventLedger(env,team,events){
+  const prior=await loadClubEventLedger(env,team);
+  const merged=mergeClubEventRows([...prior,...(events||[])]);
   await env.ROLE_KV.put(clubEventLedgerKey(team),JSON.stringify({updatedAt:new Date().toISOString(),events:merged}),{expirationTtl:60*60*24*180});
 }
 function clubEventCurrentWindowMs(e){
@@ -1143,30 +1196,76 @@ function isCurrentClubEvent(e){
   return Number.isFinite(t) ? (Date.now()-t)<=clubEventCurrentWindowMs(e) : false;
 }
 
+function teamCodeFromNameText(text,currentTeam=''){
+  const n=normal(text);
+  const aliases=Object.entries(TEAM_ALIASES).sort((a,b)=>b[0].length-a[0].length);
+  for(const [alias,code] of aliases){
+    if(code===currentTeam)continue;
+    if(n.includes(alias))return code;
+  }
+  return '';
+}
+function transactionCounterpart(doc,currentTeam,type){
+  const text=String(doc?.text||'');
+  const lines=splitLines(text).slice(0,80);
+  const subject=subjectFromHeadlineOrSlug(doc);
+  const candidateLines=subject?lines.filter(l=>normal(l).includes(normal(subject))):lines;
+  const search=candidateLines.length?candidateLines:lines;
+  for(const line of search){
+    let m=null;
+    if(['signing','loan_in'].includes(type)){
+      m=line.match(/\bfrom\s+([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿĀ-ž .'&-]{2,80})/i);
+    }else if(['departure','loan_out'].includes(type)){
+      m=line.match(/\b(?:to|joins?|signed for)\s+([A-ZÀ-ÖØ-Ý][A-Za-zÀ-ÖØ-öø-ÿĀ-ž .'&-]{2,80})/i);
+    }
+    if(m){
+      const code=teamCodeFromNameText(m[1],currentTeam);
+      if(code)return code;
+    }
+  }
+  return '';
+}
+function mirrorType(type){
+  return ({signing:'departure',departure:'signing',loan_in:'loan_out',loan_out:'loan_in'})[type]||'';
+}
+async function mirrorClubTransactions(env,events){
+  const writes=[];
+  for(const e of events||[]){
+    if(!e.counterpartTeam)continue;
+    const mt=mirrorType(e.type);if(!mt)continue;
+    const mirrored={
+      ...e,
+      id:`club-${hashString([e.counterpartTeam,mt,normal(e.subject),e.team].join('|'))}`,
+      team:e.counterpartTeam,type:mt,counterpartTeam:e.team,
+      reason:`Mirrored from an official ${TEAMS[e.team]?.name||e.team} transaction announcement. ${e.subject} ${mt==='departure'?'left':'joined'} ${TEAMS[e.counterpartTeam]?.name||e.counterpartTeam}.`,
+      mirrored:true,mirrorSourceTeam:e.team
+    };
+    writes.push(saveClubEventLedger(env,e.counterpartTeam,[mirrored]));
+  }
+  if(writes.length)await Promise.allSettled(writes);
+}
+
 function fastPathClubEvents(team,clubName,documents){
   const out=[];
   for(const d of documents||[]){
     const tx=classifyClubEvent(d,clubName);
-    // Only transaction types create fast-path clubEvents today. Injury/return/
-    // selection signals continue through the AI/FPL pipelines to avoid duplicate
-    // alerts in News, but are retained in diagnostics for taxonomy auditing.
     if(!['signing','departure','loan_in','loan_out','loan_return'].includes(tx.type))continue;
-
     const subject=subjectFromHeadlineOrSlug(d);
-    if(!subject)continue;
-    if(subject.length>80||/^the\s+\d|^the\s+\w+[- ]year[- ]old|capped by|under-\d|years? old/i.test(subject))continue;
-
+    if(!validTransactionSubject(subject))continue;
+    const subjectTransactionVerified=sourceHasSubjectTransaction(d,subject);
+    // Follow-up recovery must tie the player and transaction language together.
+    if(/follow-up confirms/i.test(tx.reason)&&!subjectTransactionVerified)continue;
+    const counterpartTeam=transactionCounterpart(d,team,tx.type);
     out.push({
-      id:`club-${hashString([team,tx.type,subject,d.url].join('|'))}`,
-      team,type:tx.type,subject,confidence:1,source:d.url,
+      id:`club-${hashString([team,tx.type,normal(subject),counterpartTeam].join('|'))}`,
+      team,type:tx.type,subject,confidence:1,source:d.url,counterpartTeam:counterpartTeam||'',
       reason:`Official ${clubName} ${tx.type.replaceAll('_',' ')} announcement detected. Role/xMins impact remains separate until a current FPL player can be mapped safely.`,
       evidenceDate:Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'',
       detectedAt:new Date().toISOString(),
-      official:true,fastPath:true,classificationReason:tx.reason
+      official:true,fastPath:true,subjectTransactionVerified,classificationReason:tx.reason
     });
   }
-  const seen=new Set();
-  return out.filter(e=>{const k=[e.type,normal(e.subject),e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
+  return mergeClubEventRows(out);
 }
 
 /* ------------------------------------------------------------- extraction */
@@ -1239,6 +1338,14 @@ OFFICIAL MATERIAL:\n${docs}`;
   return Array.isArray(out?.events)?out.events:[];
 }
 
+function isPreseasonOrFriendlySource(url,text=''){
+  const s=`${String(url||'')} ${String(text||'')}`.toLowerCase();
+  return /pre-season|preseason|friendly|tour match|emirates cup|summer series/.test(s);
+}
+function hasCompetitiveAbsenceLanguage(text=''){
+  return /\bwill miss\b|\bset to miss\b|\bruled out of (?:the )?(?:premier league|league|opening|opener|gameweek|gw)\b|\bunavailable for (?:the )?(?:premier league|league|opening|opener|gameweek|gw)\b|\bsuspended for\b/i.test(String(text||''));
+}
+
 function validateEvents(team,players,events,sourceDocuments){
   const byName=new Map;for(const p of players){byName.set(normal(p.name),p);byName.set(normal(p.fullName),p)}const out=[];
   const canonicalUrl=u=>{try{const x=new URL(String(u||''));x.hash='';return x.toString()}catch{return String(u||'')}};
@@ -1276,10 +1383,22 @@ function validateEvents(team,players,events,sourceDocuments){
       if(!affectedNamed)continue;
     }
     if(Number.isFinite(evidenceTime)&&Date.now()-evidenceTime>120*86400000&&!['departure','signing'].includes(e.type))continue;
-    const normalizedType=e.type==='loan_in'?'signing':(e.type==='loan_out'?'departure':e.type);
-    const policy=EVIDENCE_POLICY[e.type]||EVIDENCE_POLICY[normalizedType]||{channel:'other',tier:4,halfLifeHours:168,ttlHours:336,maxMinuteImpact:8,direct:false};
+    let normalizedType=e.type==='loan_in'?'signing':(e.type==='loan_out'?'departure':e.type);
+    let policy=EVIDENCE_POLICY[e.type]||EVIDENCE_POLICY[normalizedType]||{channel:'other',tier:4,halfLifeHours:168,ttlHours:336,maxMinuteImpact:8,direct:false};
+
+    // Pre-season/friendly evidence updates the prior; it must not masquerade as
+    // a confirmed Premier League lineup or a confirmed competitive absence.
+    const preseason=isPreseasonOrFriendlySource(source,meta.text);
+    if(preseason&&['confirmed_start','confirmed_bench'].includes(e.type)){
+      policy={...EVIDENCE_POLICY.observed_role,channel:'selection',tier:3,halfLifeHours:96,ttlHours:240,maxMinuteImpact:8,direct:false};
+    }
+    if(preseason&&['unavailable','minutes_restricted','fitness_doubt'].includes(e.type)&&!hasCompetitiveAbsenceLanguage(meta.text)){
+      normalizedType='fitness_doubt';
+      policy={...EVIDENCE_POLICY.fitness_doubt,tier:3,halfLifeHours:24,ttlHours:72,maxMinuteImpact:15,direct:false};
+    }
+
     const effectiveMs=authoritativeMs||Date.now();
-    out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,rawType:e.type,subject:cleanText(e.subject).slice(0,120),role:eventRole,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate,evidenceDateSource:meta.dateSource||null,evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.98,effectiveFrom:new Date(effectiveMs).toISOString(),expiresAt:new Date(effectiveMs+policy.ttlHours*3600000).toISOString(),halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,directImpact:!!policy.direct,verificationStatus:'official-source',minutesCap:Number.isFinite(Number(e.minutesCap))?clamp(Number(e.minutesCap),0,90):null,directAvailability:Number.isFinite(Number(e.directAvailability))?clamp(Number(e.directAvailability),0,1):null,selectionCertainty:Number.isFinite(Number(e.selectionCertainty))?clamp(Number(e.selectionCertainty),0,1):null,productionImpact:Number.isFinite(Number(e.productionImpact))?clamp(Number(e.productionImpact),-.25,.25):0,fixtureId:cleanText(e.fixtureId).slice(0,80)||null,competition:cleanText(e.competition).slice(0,80)||null,kickoff:cleanText(e.kickoff).slice(0,40)||null,gameweek:Number.isFinite(Number(e.gameweek))?Number(e.gameweek):null,auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
+    out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,rawType:e.type,subject:cleanText(e.subject).slice(0,120),role:eventRole,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate,evidenceDateSource:meta.dateSource||null,evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.98,effectiveFrom:new Date(effectiveMs).toISOString(),expiresAt:new Date(effectiveMs+policy.ttlHours*3600000).toISOString(),halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,directImpact:!!policy.direct,preseasonCalibrated:preseason,verificationStatus:'official-source',minutesCap:Number.isFinite(Number(e.minutesCap))?clamp(Number(e.minutesCap),0,90):null,directAvailability:Number.isFinite(Number(e.directAvailability))?clamp(Number(e.directAvailability),0,1):null,selectionCertainty:Number.isFinite(Number(e.selectionCertainty))?clamp(Number(e.selectionCertainty),0,1):null,productionImpact:Number.isFinite(Number(e.productionImpact))?clamp(Number(e.productionImpact),-.25,.25):0,fixtureId:cleanText(e.fixtureId).slice(0,80)||null,competition:cleanText(e.competition).slice(0,80)||null,kickoff:cleanText(e.kickoff).slice(0,40)||null,gameweek:Number.isFinite(Number(e.gameweek))?Number(e.gameweek):null,auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
   }
   const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),normal(e.affected),e.role,e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
 }
@@ -1548,11 +1667,9 @@ async function scanTeam(env,team,{force=false}={}){
   const priorClubEvents=await loadClubEventLedger(env,team);
   const priorLatest=await env.ROLE_KV.get(cacheKey,'json');
   const priorLatestClubEvents=Array.isArray(priorLatest?.clubEvents)?priorLatest.clubEvents:[];
-  const clubEvents=[...currentClubEvents,...priorClubEvents,...priorLatestClubEvents]
-    .sort((a,b)=>Date.parse(b.evidenceDate||b.detectedAt||0)-Date.parse(a.evidenceDate||a.detectedAt||0))
-    .filter((e,i,arr)=>arr.findIndex(x=>(x.id||[x.team,x.type,normal(x.subject),x.source].join('|'))===(e.id||[e.team,e.type,normal(e.subject),e.source].join('|')))===i)
-    .slice(0,120);
+  const clubEvents=mergeClubEventRows([...currentClubEvents,...priorClubEvents,...priorLatestClubEvents]);
   try{await saveClubEventLedger(env,team,clubEvents)}catch{}
+  try{await mirrorClubTransactions(env,currentClubEvents)}catch{}
   const transactionDiagnostics=articleDocs.map(d=>{
     const tx=classifyClubEvent(d,club.name);
     return {url:d.url,type:tx.type,actionable:tx.actionable,reason:tx.reason};
@@ -1583,28 +1700,28 @@ async function scanTeam(env,team,{force=false}={}){
     if(subject.length>80||/^the\s+\d|^the\s+\w+[- ]year[- ]old|capped by|under-\d|years? old/i.test(subject))continue;
     const nt=normal(d.text||''),ns=normal(subject);
     if(!nt.includes(ns))continue;
+    if(!sourceHasSubjectTransaction(d,subject))continue;
     const tx=classifyClubEvent(d,club.name);
     if(!['signing','departure','loan_in','loan_out','loan_return'].includes(tx.type))continue;
+    const counterpartTeam=transactionCounterpart(d,team,tx.type);
     aiRecoveredClubEvents.push({
-      id:`club-${hashString([team,tx.type,subject,d.url].join('|'))}`,
-      team,type:tx.type,subject,confidence:0.95,source:d.url,
+      id:`club-${hashString([team,tx.type,normal(subject),counterpartTeam].join('|'))}`,
+      team,type:tx.type,subject,confidence:0.95,source:d.url,counterpartTeam:counterpartTeam||'',
       reason:`Official ${club.name} ${tx.type.replaceAll('_',' ')} information recovered from a current club article. Role/xMins impact remains separate until player-specific evidence justifies it.`,
       evidenceDate:Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'',
       detectedAt:new Date().toISOString(),
       firstSeenAt:new Date().toISOString(),
-      official:true,fastPath:false,recovered:true,classificationReason:tx.reason
+      official:true,fastPath:false,recovered:true,subjectTransactionVerified:true,classificationReason:tx.reason
     });
   }
 
   // Merge any recovered transaction FACTS into the persistent News ledger before
   // validating player-specific xMins events.
   if(aiRecoveredClubEvents.length){
-    const mergedRecovered=[...clubEvents,...aiRecoveredClubEvents]
-      .sort((a,b)=>Date.parse(b.evidenceDate||b.detectedAt||0)-Date.parse(a.evidenceDate||a.detectedAt||0))
-      .filter((e,i,arr)=>arr.findIndex(x=>(x.id||[x.team,x.type,normal(x.subject),x.source].join('|'))===(e.id||[e.team,e.type,normal(e.subject),e.source].join('|')))===i)
-      .slice(0,120);
+    const mergedRecovered=mergeClubEventRows([...clubEvents,...aiRecoveredClubEvents]);
     clubEvents.splice(0,clubEvents.length,...mergedRecovered);
     try{await saveClubEventLedger(env,team,clubEvents)}catch{}
+    try{await mirrorClubTransactions(env,aiRecoveredClubEvents)}catch{}
   }
 
   const events=validateEvents(team,roster.current.players,raw,modelInput);
@@ -1714,6 +1831,9 @@ async function scanTeam(env,team,{force=false}={}){
       workerOwnedEvidenceDates:events.filter(e=>!!e.evidenceDate).length,
       confirmedClubEvents:clubEvents.length,
       recoveredClubEvents:clubEvents.filter(e=>e.recovered).length,
+      mirroredClubEvents:clubEvents.filter(e=>e.mirrored).length,
+      canonicalTransactionCount:mergeClubEventRows(clubEvents).length,
+      preseasonCalibratedEvents:events.filter(e=>e.preseasonCalibrated).length,
       nonMensClubEventsSuppressed:transactionDiagnostics.filter(x=>x.type==='non_mens').length,
       transactionDiagnostics:transactionDiagnostics.slice(0,30),
       suppressedContractRenewals:transactionDiagnostics.filter(x=>x.type==='contract_renewal').length,
