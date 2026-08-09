@@ -27,7 +27,7 @@ const SCHEMA_VERSION = '1.28.0';   // wire format: UNCHANGED in RC5.0.9 (no fiel
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.16-rc5.0.16-transaction-truth-layer';
+const WORKER_BUILD = 'v2.17-rc5.0.17-counterpart-identity-fix';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -1160,7 +1160,18 @@ function classifyClubEvent(doc,clubName){
 
 function clubEventLedgerKey(team){return `club-events:${team}`}
 function canonicalClubEventKey(e){
-  return [String(e?.team||''),String(e?.type||''),normal(e?.subject),String(e?.counterpartTeam||'')].join('|');
+  // RC5.0.17 D-06: counterpartTeam is EVIDENCE about a transaction, not part
+  // of the transaction's identity. It was previously in this key, which
+  // meant the same real-world signing produced two different canonical keys
+  // whenever the fast-path regex extractor and the AI-recovery pass resolved
+  // the counterpart club with different success on the same article -- one
+  // path finds "from Newcastle United" in the text, the other doesn't. Both
+  // records are the SAME transaction fact; only their confidence about the
+  // counterpart differs. A player+type+club can only be involved in one
+  // open transaction of a given type at a time, so identity is exactly that
+  // triple. counterpartTeam is still carried on the record and merged
+  // forward in mergeClubEventRows below -- it is enrichment, not a key.
+  return [String(e?.team||''),String(e?.type||''),normal(e?.subject)].join('|');
 }
 function validStoredClubEvent(e){
   if(!e||!['signing','departure','loan_in','loan_out','loan_return'].includes(String(e.type||'')))return false;
@@ -1181,7 +1192,18 @@ function mergeClubEventRows(rows){
     const firstSeenAt=old?.firstSeenAt||old?.detectedAt||e0.firstSeenAt||e0.detectedAt||new Date().toISOString();
     const newer=!old||Date.parse(e0.evidenceDate||e0.detectedAt||0)>=Date.parse(old.evidenceDate||old.detectedAt||0);
     const base=newer?e0:old;
-    byKey.set(k,{...base,firstSeenAt,evidence:[...new Set(evidence)].slice(0,8)});
+    // RC5.0.17: counterpartTeam is no longer part of the key (see
+    // canonicalClubEventKey above), so a group can now contain rows that
+    // disagree on it -- typically one resolved, one empty, from the two
+    // extraction paths. Whichever side actually resolved a counterpart must
+    // not be discarded just because it lost the recency tiebreak, or
+    // cross-club mirroring silently stops firing depending on which
+    // extraction pass happened to run last. Non-empty wins; on a genuine
+    // conflict between two DIFFERENT non-empty values, prefer the newer row
+    // (base), since that is a real disagreement worth surfacing via evidence
+    // rather than a resolved/unresolved split.
+    const counterpartTeam=base.counterpartTeam||old?.counterpartTeam||e0.counterpartTeam||'';
+    byKey.set(k,{...base,counterpartTeam,firstSeenAt,evidence:[...new Set(evidence)].slice(0,8)});
   }
   return [...byKey.values()].sort((a,b)=>Date.parse(b.evidenceDate||b.detectedAt||0)-Date.parse(a.evidenceDate||a.detectedAt||0)).slice(0,120);
 }
