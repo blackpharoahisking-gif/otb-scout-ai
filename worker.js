@@ -18,7 +18,7 @@ const SCHEMA_VERSION = '1.28.0';   // wire format: UNCHANGED in RC5.0.9 (no fiel
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.12-rc5.0.12-information-first';
+const WORKER_BUILD = 'v2.13-rc5.0.13-publisher-recency';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -1365,6 +1365,28 @@ async function calibrationExport(env,{team=null,resolvedOnly=false}={}){
 
 
 
+function buildRecencySummary(discovery,articleDocs){
+  const landingCoverage=discovery.length
+    ? discovery.reduce((a,d)=>a+Number(d.timestampCoverage||0),0)/discovery.length
+    : 0;
+  const dated=articleDocs.filter(d=>Number(d.publishedAt)>0);
+  const articleCoverage=articleDocs.length?dated.length/articleDocs.length:0;
+  const landingUsable=landingCoverage>=RECENCY_COVERAGE_MIN;
+  return {
+    mode: landingUsable ? 'landing-timestamps' : (dated.length ? 'article-confirmed' : 'landing-order'),
+    landingCoverage:Number(landingCoverage.toFixed(2)),
+    landingCoveragePct:Math.round(landingCoverage*100),
+    articleCoverage:Number(articleCoverage.toFixed(2)),
+    articleCoveragePct:Math.round(articleCoverage*100),
+    articlesDated:dated.length,
+    articleDocuments:articleDocs.length,
+    label: landingUsable
+      ? `landing ${Math.round(landingCoverage*100)}% · ${dated.length}/${articleDocs.length} articles dated`
+      : `${dated.length?'article-confirmed':'landing-order'} · ${dated.length}/${articleDocs.length} articles dated`,
+    publisherStructureLimited:!landingUsable
+  };
+}
+
 async function scanTeam(env,team,{force=false}={}){
   team=String(team||'').toUpperCase();
   const club=CLUB_SOURCES[team];
@@ -1494,6 +1516,7 @@ async function scanTeam(env,team,{force=false}={}){
   const retrieved=documents.filter(d=>d.text&&d.text.length>0);
   const useful=documents.filter(d=>d.text&&d.text.length>=AI_MIN_DOC_CHARS);
   const articleDocs=useful.filter(d=>d.kind==='article');
+  const recencySummary=buildRecencySummary(discovery,articleDocs);
   const currentClubEvents=fastPathClubEvents(team,club.name,articleDocs);
   const priorClubEvents=await loadClubEventLedger(env,team);
   const priorLatest=await env.ROLE_KV.get(cacheKey,'json');
@@ -1675,6 +1698,10 @@ async function scanTeam(env,team,{force=false}={}){
       newCandidates:discovery.reduce((a,d)=>a+Number(d.newCandidates||0),0),
       cachedCandidates:discovery.reduce((a,d)=>a+Number(d.cachedCandidates||0),0),
       recencySource:discovery.some(d=>d.recencySource==='timestamp')?'timestamp':'landing-order',
+      recencySummary,
+      publisherStructureNote:recencySummary.publisherStructureLimited
+        ? 'Landing page exposes insufficient per-link timestamps; final freshness is confirmed from article publication metadata when available.'
+        : 'Landing page exposes sufficient per-link timestamps for timestamp-based discovery ranking.',
       articleDatesRecovered:articleDocs.filter(d=>Number(d.articlePublishedAt)).length,
       landingDatesUsed:articleDocs.filter(d=>!Number(d.articlePublishedAt)&&Number(d.landingPublishedAt)).length,
       undatedArticleDocs:articleDocs.filter(d=>!Number(d.publishedAt)).length,
@@ -1689,7 +1716,7 @@ async function scanTeam(env,team,{force=false}={}){
       eventsFromThisScan:events.length,
       evidenceAuthoritative,
       evidenceCarriedForward,
-      timestampCoverage: discovery.length?Number((discovery.reduce((a,d)=>a+Number(d.timestampCoverage||0),0)/discovery.length).toFixed(2)):0,
+      timestampCoverage:recencySummary.landingCoverage,
       recencyRankingUsed: discovery.some(d=>d.recencyUsed),
       scanMode: force?'forced-live':'background',
       cacheState: 'MISS'
