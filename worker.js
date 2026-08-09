@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v2.8 — RC5.0.8 release hardening: atomic scan lock, execution-aware quota, safe event ageing
+// v2.11 — RC5.0.11 evidence-integrity hardening: source-owned dates, durable transactions, conservative competition mapping
 //
 // Changes vs v1.2 (all additive to the response contract):
 //   1. Browser fallback is gated on ARTICLE CANDIDATES and landing text length,
@@ -18,7 +18,7 @@ const SCHEMA_VERSION = '1.28.0';   // wire format: UNCHANGED in RC5.0.9 (no fiel
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.10-rc5.0.10-independent-verified';
+const WORKER_BUILD = 'v2.11-rc5.0.11-evidence-integrity';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -1069,7 +1069,18 @@ function classifyClubEvent(doc,clubName){
 
 function clubEventLedgerKey(team){return `club-events:${team}`}
 async function loadClubEventLedger(env,team){const row=await env.ROLE_KV.get(clubEventLedgerKey(team),'json');return Array.isArray(row?.events)?row.events:[]}
-async function saveClubEventLedger(env,team,events){const seen=new Set(),merged=[];for(const e of (events||[]).sort((a,b)=>Date.parse(b.evidenceDate||0)-Date.parse(a.evidenceDate||0))){const k=e.id||[e.team,e.type,normal(e.subject),e.source].join('|');if(seen.has(k))continue;seen.add(k);merged.push(e);if(merged.length>=120)break}await env.ROLE_KV.put(clubEventLedgerKey(team),JSON.stringify({updatedAt:new Date().toISOString(),events:merged}),{expirationTtl:60*60*24*180})}
+async function saveClubEventLedger(env,team,events){
+  const prior=await loadClubEventLedger(env,team),priorByKey=new Map(prior.map(e=>[e.id||[e.team,e.type,normal(e.subject),e.source].join('|'),e]));
+  const seen=new Set(),merged=[];
+  for(const e0 of (events||[]).sort((a,b)=>Date.parse(b.evidenceDate||b.detectedAt||0)-Date.parse(a.evidenceDate||a.detectedAt||0))){
+    const k=e0.id||[e0.team,e0.type,normal(e0.subject),e0.source].join('|');
+    if(seen.has(k))continue;seen.add(k);
+    const old=priorByKey.get(k),firstSeenAt=old?.firstSeenAt||old?.detectedAt||e0.firstSeenAt||e0.detectedAt||new Date().toISOString();
+    merged.push({...e0,firstSeenAt});
+    if(merged.length>=120)break;
+  }
+  await env.ROLE_KV.put(clubEventLedgerKey(team),JSON.stringify({updatedAt:new Date().toISOString(),events:merged}),{expirationTtl:60*60*24*180});
+}
 function clubEventCurrentWindowMs(e){
   const t=String(e?.type||'');
   return ['signing','departure','loan_in','loan_out','loan_return'].includes(t)?30*86400000:7*86400000;
@@ -1123,7 +1134,7 @@ function extractionSchema(){return {
 
 async function aiExtract(env,team,clubName,players,documents,rosterDelta){
   const playerList=players.map(p=>`${p.name} [${p.fplPosition}]`).join(', ');
-  const docs=documents.map((d,i)=>`SOURCE ${i+1}: ${d.url}\n${d.text.slice(0,12000)}`).join('\n\n');
+  const docs=documents.map((d,i)=>`SOURCE ${i+1}: ${d.url}\nSOURCE_PUBLISHED_AT: ${Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'unknown'}\nSOURCE_DATE_ORIGIN: ${d.dateSource||'unknown'}\n${d.text.slice(0,12000)}`).join('\n\n');
   const prompt=`You are the OTB football role-intelligence extractor. Analyse only the supplied official-club text and FPL roster evidence for ${clubName} (${team}).
 Return only current, source-grounded structured events that can materially change EXPECTED MINUTES for players registered in FPL.
 
@@ -1154,7 +1165,7 @@ RULES:
 - Do not infer a transfer from roster absence alone. Roster absence is unresolved unless official text confirms it.
 - Ignore vague rumours, fan opinion, historical stories, academy-only evidence, unrelated teams, and material older than 120 days unless it confirms a still-current transfer or injury status.
 - A player's FPL position is not his football role. A DEF may legitimately be observed at RW, LW, AM or ST.
-- For departure/injury events, affected is the beneficiary. For signing/return events, affected is the threatened incumbent. Do not apply an injury event to the injured player himself.
+- For departure/injury events, affected is the beneficiary. For signing/return events, affected is the threatened incumbent. Do not apply an injury event to the injured player himself.\n- PLAYER-SPECIFIC COMPETITION EFFECTS MUST BE EXPLICIT. For signing, departure, loan_in, loan_out, injury or return, only name an affected CURRENT FPL player when that affected player's name is present in the cited official source. Do not nominate a threatened/beneficiary player from squad knowledge alone.
 - Confirmed official statements: confidence 0.9-1.0. Repeated official preseason lineup evidence: 0.70-0.90. One ambiguous mention: <=0.55.
 - overlap measures direct role competition. hierarchy measures expected selection strength of subject/role evidence.
 - directAvailability is optional and only for direct availability evidence. Use 0 for definitely unavailable/suspended; use a supported intermediate probability only for explicit uncertainty; use 1 for explicitly available.
@@ -1175,11 +1186,13 @@ OFFICIAL MATERIAL:\n${docs}`;
   return Array.isArray(out?.events)?out.events:[];
 }
 
-function validateEvents(team,players,events,allowedSources){
+function validateEvents(team,players,events,sourceDocuments){
   const byName=new Map;for(const p of players){byName.set(normal(p.name),p);byName.set(normal(p.fullName),p)}const out=[];
   const canonicalUrl=u=>{try{const x=new URL(String(u||''));x.hash='';return x.toString()}catch{return String(u||'')}};
-  const allowedExact=new Set([...allowedSources].map(canonicalUrl));
-  const allowedHosts=new Set([...allowedSources].map(hostOf).filter(Boolean));
+  const docs=Array.isArray(sourceDocuments)?sourceDocuments:[];
+  const sourceMeta=new Map(docs.map(d=>[canonicalUrl(d.url),{publishedAt:Number(d.publishedAt)||null,dateSource:d.dateSource||null,text:String(d.text||'')}]));
+  const allowedExact=new Set(sourceMeta.keys());
+  const allowedHosts=new Set(docs.map(d=>hostOf(d.url)).filter(Boolean));
   for(const e of events||[]){const p=byName.get(normal(e.affected));if(!p||!EVENT_VALUES.has(e.type))continue;
     const roleOptional=['confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension'].includes(e.type);
     if(!roleOptional&&!ROLE_VALUES.has(e.role))continue;
@@ -1200,11 +1213,20 @@ function validateEvents(team,players,events,allowedSources){
     if(['confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension'].includes(e.type)
        && normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName))continue;
 
-    const evidenceTime=Date.parse(e.evidenceDate||'');if(Number.isFinite(evidenceTime)&&Date.now()-evidenceTime>120*86400000&&!['departure','signing'].includes(e.type))continue;
+    const meta=sourceMeta.get(canonicalUrl(source))||{};
+    const authoritativeMs=Number(meta.publishedAt)||null;
+    const evidenceDate=authoritativeMs?new Date(authoritativeMs).toISOString():'';
+    const evidenceTime=authoritativeMs||Date.now();
+    if(['signing','departure','loan_in','loan_out','injury','return'].includes(e.type)){
+      const sourceNorm=normal(meta.text||'');
+      const affectedNamed=sourceNorm.includes(normal(p.name)) || (p.fullName&&sourceNorm.includes(normal(p.fullName)));
+      if(!affectedNamed)continue;
+    }
+    if(Number.isFinite(evidenceTime)&&Date.now()-evidenceTime>120*86400000&&!['departure','signing'].includes(e.type))continue;
     const normalizedType=e.type==='loan_in'?'signing':(e.type==='loan_out'?'departure':e.type);
     const policy=EVIDENCE_POLICY[e.type]||EVIDENCE_POLICY[normalizedType]||{channel:'other',tier:4,halfLifeHours:168,ttlHours:336,maxMinuteImpact:8,direct:false};
-    const evidenceDate=cleanText(e.evidenceDate).slice(0,40),evidenceMs=Date.parse(evidenceDate||''),effectiveMs=Number.isFinite(evidenceMs)?evidenceMs:Date.now();
-    out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,rawType:e.type,subject:cleanText(e.subject).slice(0,120),role:eventRole,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate,evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.98,effectiveFrom:new Date(effectiveMs).toISOString(),expiresAt:new Date(effectiveMs+policy.ttlHours*3600000).toISOString(),halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,directImpact:!!policy.direct,verificationStatus:'official-source',minutesCap:Number.isFinite(Number(e.minutesCap))?clamp(Number(e.minutesCap),0,90):null,directAvailability:Number.isFinite(Number(e.directAvailability))?clamp(Number(e.directAvailability),0,1):null,selectionCertainty:Number.isFinite(Number(e.selectionCertainty))?clamp(Number(e.selectionCertainty),0,1):null,productionImpact:Number.isFinite(Number(e.productionImpact))?clamp(Number(e.productionImpact),-.25,.25):0,fixtureId:cleanText(e.fixtureId).slice(0,80)||null,competition:cleanText(e.competition).slice(0,80)||null,kickoff:cleanText(e.kickoff).slice(0,40)||null,gameweek:Number.isFinite(Number(e.gameweek))?Number(e.gameweek):null,auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
+    const effectiveMs=authoritativeMs||Date.now();
+    out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,rawType:e.type,subject:cleanText(e.subject).slice(0,120),role:eventRole,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate,evidenceDateSource:meta.dateSource||null,evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.98,effectiveFrom:new Date(effectiveMs).toISOString(),expiresAt:new Date(effectiveMs+policy.ttlHours*3600000).toISOString(),halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,directImpact:!!policy.direct,verificationStatus:'official-source',minutesCap:Number.isFinite(Number(e.minutesCap))?clamp(Number(e.minutesCap),0,90):null,directAvailability:Number.isFinite(Number(e.directAvailability))?clamp(Number(e.directAvailability),0,1):null,selectionCertainty:Number.isFinite(Number(e.selectionCertainty))?clamp(Number(e.selectionCertainty),0,1):null,productionImpact:Number.isFinite(Number(e.productionImpact))?clamp(Number(e.productionImpact),-.25,.25):0,fixtureId:cleanText(e.fixtureId).slice(0,80)||null,competition:cleanText(e.competition).slice(0,80)||null,kickoff:cleanText(e.kickoff).slice(0,40)||null,gameweek:Number.isFinite(Number(e.gameweek))?Number(e.gameweek):null,auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
   }
   const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),normal(e.affected),e.role,e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
 }
@@ -1446,8 +1468,14 @@ async function scanTeam(env,team,{force=false}={}){
   const retrieved=documents.filter(d=>d.text&&d.text.length>0);
   const useful=documents.filter(d=>d.text&&d.text.length>=AI_MIN_DOC_CHARS);
   const articleDocs=useful.filter(d=>d.kind==='article');
-  const currentClubEvents=fastPathClubEvents(team,club.name,articleDocs),priorClubEvents=await loadClubEventLedger(env,team);
-  const clubEvents=[...currentClubEvents,...priorClubEvents].sort((a,b)=>Date.parse(b.evidenceDate||0)-Date.parse(a.evidenceDate||0)).filter((e,i,arr)=>arr.findIndex(x=>(x.id||[x.team,x.type,normal(x.subject),x.source].join('|'))===(e.id||[e.team,e.type,normal(e.subject),e.source].join('|')))===i).slice(0,120);
+  const currentClubEvents=fastPathClubEvents(team,club.name,articleDocs);
+  const priorClubEvents=await loadClubEventLedger(env,team);
+  const priorLatest=await env.ROLE_KV.get(cacheKey,'json');
+  const priorLatestClubEvents=Array.isArray(priorLatest?.clubEvents)?priorLatest.clubEvents:[];
+  const clubEvents=[...currentClubEvents,...priorClubEvents,...priorLatestClubEvents]
+    .sort((a,b)=>Date.parse(b.evidenceDate||b.detectedAt||0)-Date.parse(a.evidenceDate||a.detectedAt||0))
+    .filter((e,i,arr)=>arr.findIndex(x=>(x.id||[x.team,x.type,normal(x.subject),x.source].join('|'))===(e.id||[e.team,e.type,normal(e.subject),e.source].join('|')))===i)
+    .slice(0,120);
   try{await saveClubEventLedger(env,team,clubEvents)}catch{}
   const transactionDiagnostics=articleDocs.map(d=>{
     const tx=classifyClubEvent(d,club.name);
@@ -1460,7 +1488,7 @@ async function scanTeam(env,team,{force=false}={}){
   // otherwise dominate the model input with ~26k chars of teasers.
   const modelInput=articleDocs;
   const raw=modelInput.length?await aiExtract(env,team,club.name,roster.current.players,modelInput,roster):[];
-  const events=validateEvents(team,roster.current.players,raw,new Set(modelInput.map(d=>d.url)));
+  const events=validateEvents(team,roster.current.players,raw,modelInput);
 
   const browserFallbackUsed=perUrl.some(x=>x.browserUsed)||discovery.some(d=>d.browserUsed);
 
@@ -1562,6 +1590,9 @@ async function scanTeam(env,team,{force=false}={}){
       budgetExpired:budget.expired(),
       rawEvents:Array.isArray(raw)?raw.length:0,
       acceptedEvents:events.length,
+      rawCompetitionEvents:Array.isArray(raw)?raw.filter(e=>['signing','departure','loan_in','loan_out','injury','return'].includes(e?.type)).length:0,
+      acceptedCompetitionEvents:events.filter(e=>['signing','departure','injury','return'].includes(e?.type)).length,
+      workerOwnedEvidenceDates:events.filter(e=>!!e.evidenceDate).length,
       confirmedClubEvents:clubEvents.length,
       transactionDiagnostics:transactionDiagnostics.slice(0,30),
       suppressedContractRenewals:transactionDiagnostics.filter(x=>x.type==='contract_renewal').length,
