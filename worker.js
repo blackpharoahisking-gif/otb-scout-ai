@@ -27,7 +27,7 @@ const SCHEMA_VERSION = '1.28.0';   // wire format: UNCHANGED in RC5.0.9 (no fiel
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.15-rc5.0.15-transaction-ledger-final';
+const WORKER_BUILD = 'v2.16-rc5.0.16-transaction-truth-layer';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -282,6 +282,14 @@ function validTransactionSubject(subject){
   const s=cleanText(subject).trim();
   if(!s||s.length<2||s.length>80)return false;
   if(/^the\b/i.test(s)||/\bcapped by\b|\byears? old\b|\bunder-\d+\b|\bu-?\d+\b|\bteam\b|\bsquad\b|\bclub\b|\bplayer\b$/i.test(s))return false;
+  // RC5.0.16 D-04: a JSON/metadata-leak fragment like 'title: "Caleb Yirenkyi'
+  // was passing every check above -- short, letters present, no banned phrase
+  // -- and produced a duplicate transaction fact under a different canonical
+  // key from the clean 'Caleb Yirenkyi' extraction of the same signing.
+  // Reject field-label prefixes, stray quote/brace/bracket characters, and
+  // colons, none of which appear in a real player name.
+  if(/^[a-z_]{2,20}\s*:/i.test(s))return false;
+  if(/["'{}\[\]<>]|https?:\/\//i.test(s))return false;
   const words=s.split(/\s+/).filter(Boolean);
   if(words.length>6)return false;
   return words.some(w=>/[A-Za-zÀ-ÖØ-öø-ÿĀ-ž]/.test(w));
@@ -1237,7 +1245,13 @@ async function mirrorClubTransactions(env,events){
       ...e,
       id:`club-${hashString([e.counterpartTeam,mt,normal(e.subject),e.team].join('|'))}`,
       team:e.counterpartTeam,type:mt,counterpartTeam:e.team,
-      reason:`Mirrored from an official ${TEAMS[e.team]?.name||e.team} transaction announcement. ${e.subject} ${mt==='departure'?'left':'joined'} ${TEAMS[e.counterpartTeam]?.name||e.counterpartTeam}.`,
+      // RC5.0.16 D-05: this referenced an undeclared `TEAMS` global. Every
+      // call threw a ReferenceError before it ever reached env.ROLE_KV.put,
+      // and both call sites wrap this function in a bare try{}catch{} with
+      // no logging -- so cross-club mirroring has been silently failing on
+      // every single invocation since it was introduced, not intermittently.
+      // CLUB_SOURCES is the table that actually exists and carries `.name`.
+      reason:`Mirrored from an official ${CLUB_SOURCES[e.team]?.name||e.team} transaction announcement. ${e.subject} ${mt==='departure'?'left':'joined'} ${CLUB_SOURCES[e.counterpartTeam]?.name||e.counterpartTeam}.`,
       mirrored:true,mirrorSourceTeam:e.team
     };
     writes.push(saveClubEventLedger(env,e.counterpartTeam,[mirrored]));
@@ -1669,7 +1683,12 @@ async function scanTeam(env,team,{force=false}={}){
   const priorLatestClubEvents=Array.isArray(priorLatest?.clubEvents)?priorLatest.clubEvents:[];
   const clubEvents=mergeClubEventRows([...currentClubEvents,...priorClubEvents,...priorLatestClubEvents]);
   try{await saveClubEventLedger(env,team,clubEvents)}catch{}
-  try{await mirrorClubTransactions(env,currentClubEvents)}catch{}
+  // RC5.0.16: a bare catch{} here is exactly what let the TEAMS bug above
+  // fail silently on every call for the life of RC5.0.15. Record failures
+  // where they can actually be found (mirror-error:<team>), without letting
+  // a mirroring problem take down the scan that discovered the transaction.
+  try{await mirrorClubTransactions(env,currentClubEvents)}
+  catch(e){await env.ROLE_KV.put(`mirror-error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e?.message||String(e)}),{expirationTtl:86400}).catch(()=>{})}
   const transactionDiagnostics=articleDocs.map(d=>{
     const tx=classifyClubEvent(d,club.name);
     return {url:d.url,type:tx.type,actionable:tx.actionable,reason:tx.reason};
@@ -1721,7 +1740,8 @@ async function scanTeam(env,team,{force=false}={}){
     const mergedRecovered=mergeClubEventRows([...clubEvents,...aiRecoveredClubEvents]);
     clubEvents.splice(0,clubEvents.length,...mergedRecovered);
     try{await saveClubEventLedger(env,team,clubEvents)}catch{}
-    try{await mirrorClubTransactions(env,aiRecoveredClubEvents)}catch{}
+    try{await mirrorClubTransactions(env,aiRecoveredClubEvents)}
+    catch(e){await env.ROLE_KV.put(`mirror-error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e?.message||String(e)}),{expirationTtl:86400}).catch(()=>{})}
   }
 
   const events=validateEvents(team,roster.current.players,raw,modelInput);
@@ -1890,7 +1910,56 @@ async function scanTeam(env,team,{force=false}={}){
 
 /* -------------------------------------------------------------- surfaces */
 
-async function allLatest(env){const out={};for(const team of Object.keys(CLUB_SOURCES)){const x=await env.ROLE_KV.get(`latest:${team}`,'json');if(x)out[team]=x}return out}
+/* RC5.0.16 -- ONE TRANSACTION TRUTH LAYER.
+ *
+ * Root cause of the RC5.0.15 defects (Bruno/Newcastle mirror missing,
+ * Jessie Gale contamination, Horniceck/Yirenkyi duplicates, historical bad
+ * records surviving the new validator): every client-facing route returned
+ * `report.clubEvents` -- a snapshot frozen into `latest:${team}` at the
+ * moment of the LAST SCAN of that specific club -- while the canonical
+ * ledger at `club-events:${team}` (which loadClubEventLedger/
+ * mergeClubEventRows re-validates and re-deduplicates on every single read)
+ * was written correctly by both scanTeam and mirrorClubTransactions but was
+ * never read back by any client-facing endpoint. It was write-only.
+ *
+ * That explains all four defects as one bug:
+ *  - a cross-club mirror lands correctly in the counterpart club's ledger,
+ *    but only that club's OWN next scan would ever merge it into that
+ *    club's served snapshot -- which may not happen for days.
+ *  - a malformed subject rejected by today's validator during a scan stays
+ *    visible forever if it was ever written into a snapshot, because the
+ *    snapshot is served verbatim and never re-validated.
+ *  - two spellings/extractions of one signing can each get merged into
+ *    *different* club snapshots at *different* times and never collapse,
+ *    because collapsing only happens inside a scan's merge step, which the
+ *    read path skips entirely.
+ *
+ * The fix is not another special case: every place that hands clubEvents to
+ * a client now overlays a fresh ledger read (loadClubEventLedger) on top of
+ * whatever the frozen snapshot says. This is one extra KV read -- no
+ * Browser Run cost, no change to scan cadence or budget -- and it makes it
+ * structurally impossible for a served response to diverge from the
+ * validated canonical ledger, regardless of how stale the snapshot is or
+ * which club's scan last touched it.
+ */
+async function withCurrentClubEvents(env,team,report){
+  if(!report)return report;
+  try{
+    const events=await loadClubEventLedger(env,team);
+    return {...report,clubEvents:events};
+  }catch{
+    return report; // ledger read failure must never take down report serving
+  }
+}
+
+async function allLatest(env){
+  const out={};
+  for(const team of Object.keys(CLUB_SOURCES)){
+    const x=await env.ROLE_KV.get(`latest:${team}`,'json');
+    if(x)out[team]=await withCurrentClubEvents(env,team,x);
+  }
+  return out;
+}
 
 function reportAgeMs(report){
   const t=Date.parse(report?.generatedAt||'');
@@ -1903,12 +1972,12 @@ async function scanTeamGuarded(env,team){
   const lockToken=await acquireScanLock(env,team);
   if(!lockToken){
     const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
-    if(cached)return {...cached,status:'ok',scanLocked:true,scanExecuted:false,lockNote:'a scan for this club was already in progress',cache:'HIT',refreshing:true};
+    if(cached)return withCurrentClubEvents(env,team,{...cached,status:'ok',scanLocked:true,scanExecuted:false,lockNote:'a scan for this club was already in progress',cache:'HIT',refreshing:true});
     throw new Error(`A scan for ${team} is already in progress. Try again shortly.`);
   }
   try{
     const report=await scanTeam(env,team,{force:true});
-    return {...report,scanExecuted:true};
+    return withCurrentClubEvents(env,team,{...report,scanExecuted:true});
   }finally{
     await releaseScanLock(env,team,lockToken);
   }
@@ -1928,7 +1997,11 @@ async function cacheFirstTeamReport(env,team,ctx,{force=false}={}){
       await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:error?.message||String(error)}),{expirationTtl:86400});
     }));
   }
-  return {...cached,cache:'HIT',stale,refreshing:stale};
+  // The team's OWN scan may not run again for hours (or, for a quiet club,
+  // days). A transaction can legitimately reach this team's truth through a
+  // DIFFERENT club's scan -- via mirrorClubTransactions -- entirely between
+  // this team's own scans. Cache hits must not wait for that scan to arrive.
+  return withCurrentClubEvents(env,team,{...cached,cache:'HIT',stale,refreshing:stale});
 }
 
 /* ==================================================================
@@ -2356,7 +2429,7 @@ export default {
           if(!gate.allowed){
             // Never fail a user outright: serve what we have and explain.
             const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
-            if(cached)return json({status:'ok',forceThrottled:true,forceThrottleReason:gate.reason,retryAfterSec:gate.retryAfterSec,...cached,cache:'HIT'},200,env);
+            if(cached)return json(await withCurrentClubEvents(env,team,{status:'ok',forceThrottled:true,forceThrottleReason:gate.reason,retryAfterSec:gate.retryAfterSec,...cached,cache:'HIT'}),200,env);
             return json({status:'error',error:gate.reason,retryAfterSec:gate.retryAfterSec},429,env);
           }
         }
@@ -2377,7 +2450,16 @@ export default {
         const team=String(u.searchParams.get('team')||'').toUpperCase();
         const mode=String(u.searchParams.get('mode')||'current').toLowerCase();
         if(team){
-          const report=await env.ROLE_KV.get(`latest:${team}`,'json'),history=Array.isArray(report?.clubEvents)?report.clubEvents:[],current=history.filter(isCurrentClubEvent);
+          // RC5.0.16: serve the canonical ledger directly, not the frozen
+          // report snapshot. This is the endpoint the brief's screenshots
+          // trace back to -- it was the most direct client-facing bypass of
+          // the validator, reading `latest:${team}` without ever touching
+          // `club-events:${team}` at all.
+          const [report,history]=await Promise.all([
+            env.ROLE_KV.get(`latest:${team}`,'json'),
+            loadClubEventLedger(env,team)
+          ]);
+          const current=history.filter(isCurrentClubEvent);
           return json({status:'ok',team,generatedAt:report?.generatedAt||null,events:mode==='history'?history:current,current,historyCount:history.length},200,env)
         }
         const latest=await allLatest(env),history=[];for(const [code,report] of Object.entries(latest))for(const e of (report?.clubEvents||[]))history.push({...e,team:e.team||code});
