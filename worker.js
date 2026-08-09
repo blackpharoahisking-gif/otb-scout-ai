@@ -14,11 +14,17 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
+const TRANSACTION_REGRESSION_CASES = Object.freeze({
+  NEW_BRUNO_DEPARTURE: 'previously-seen official Newcastle departure remains recoverable',
+  ARS_BRUNO_SIGNING: 'official Arsenal signing remains visible',
+  NON_MENS_SUPPRESSED: 'women/academy transactions do not enter men FPL Scout'
+});
+
 const SCHEMA_VERSION = '1.28.0';   // wire format: UNCHANGED in RC5.0.9 (no field/shape change)
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.13-rc5.0.13-publisher-recency';
+const WORKER_BUILD = 'v2.14-rc5.0.14-transaction-retention';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -258,6 +264,14 @@ function cleanText(s){return String(s||'').replace(/\s+/g,' ').trim()}
  *  makes cross-document boilerplate detection possible. */
 function cleanLines(s){return String(s||'').replace(/[ \t\u00a0]+/g,' ').replace(/\n{2,}/g,'\n').split('\n').map(l=>l.trim()).filter(Boolean).join('\n')}
 function normal(s){return cleanText(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9 ]/g,'')}
+function isMensFirstTeamSource(url,text=''){
+  const u=String(url||'').toLowerCase();
+  const t=normal(text||'');
+  if(/\/women(?:\/|$)|\/womens(?:\/|$)|\/academy(?:\/|$)|\/u21(?:\/|$)|\/u18(?:\/|$)|\/under-21|\/under-18|girls|women-s/.test(u))return false;
+  if(/\bwomen'?s team\b|\bwomen'?s first team\b|\bgirls'? academy\b|\bacademy side\b|\bunder-21s?\b|\bunder-18s?\b|\bu21s?\b|\bu18s?\b/.test(t))return false;
+  return true;
+}
+
 function hashString(s){
   // Two independent FNV-1a passes -> 64 bits. A single 32-bit pass collides with
   // ~0.3% probability across a season of article URLs, and a collision would
@@ -738,9 +752,20 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
 
   // Transaction/news priority lane. Reserve up to two places for URLs whose
   // slugs strongly indicate transfers, loans, availability or first-team role.
-  const priorityLane=eligible.filter(x=>/signing|new-signing|joins?|signed|transfer|loan|departure|leaves?|returns?|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|breaking-down|what-will-he-bring|ready-to-be-your/.test(decodeURIComponent(new URL(x.url).pathname).toLowerCase()))
+  const firstTeamEligible=eligible.filter(x=>isMensFirstTeamSource(x.url,''));
+  const priorityLane=firstTeamEligible.filter(x=>/signing|new-signing|joins?|signed|transfer|loan|departure|leaves?|returns?|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|breaking-down|what-will-he-bring|ready-to-be-your/.test(decodeURIComponent(new URL(x.url).pathname).toLowerCase()))
     .sort((a,b)=>unseenFirst(a,b)||b.score-a.score||a.index-b.index);
-  for(const x of priorityLane){add(x);if(chosen.length>=Math.min(2,limit))break}
+
+  const unseenPriority=priorityLane.filter(x=>!x.seen);
+  if(unseenPriority.length)add(unseenPriority[0]);
+
+  const seenTransaction=priorityLane.find(x=>x.seen && /signing|new-signing|joins?|signed|transfer|loan|departure|leaves?|returns?/.test(decodeURIComponent(new URL(x.url).pathname).toLowerCase()));
+  if(seenTransaction)add(seenTransaction);
+
+  for(const x of priorityLane){
+    if(chosen.length>=Math.min(2,limit))break;
+    add(x);
+  }
 
   const reserve=Math.max(1,Math.floor(limit/2));
   for(const x of freshLane){add(x);if(chosen.length>=reserve)break}
@@ -988,6 +1013,7 @@ function subjectFromHeadlineOrSlug(doc){
 }
 
 function classifyClubEvent(doc,clubName){
+  if(!isMensFirstTeamSource(doc?.url,doc?.text))return {type:'non_mens',actionable:false,reason:'non-men first-team source suppressed'};
   const lines=headlineLines(doc), headline=firstHeadline(doc);
   let path='';try{path=decodeURIComponent(new URL(doc.url).pathname).toLowerCase()}catch{}
   const body=String(doc.text||'').slice(0,9000),headlineHay=`${headline}\n${path}`,hay=`${headlineHay}\n${body}`;
@@ -1128,6 +1154,7 @@ function fastPathClubEvents(team,clubName,documents){
 
     const subject=subjectFromHeadlineOrSlug(d);
     if(!subject)continue;
+    if(subject.length>80||/^the\s+\d|^the\s+\w+[- ]year[- ]old|capped by|under-\d|years? old/i.test(subject))continue;
 
     out.push({
       id:`club-${hashString([team,tx.type,subject,d.url].join('|'))}`,
@@ -1552,6 +1579,8 @@ async function scanTeam(env,team,{force=false}={}){
     const d=docByUrl.get(String(e.source||''));
     const subject=cleanText(e.subject).slice(0,100);
     if(!d||!subject)continue;
+    if(!isMensFirstTeamSource(d.url,d.text))continue;
+    if(subject.length>80||/^the\s+\d|^the\s+\w+[- ]year[- ]old|capped by|under-\d|years? old/i.test(subject))continue;
     const nt=normal(d.text||''),ns=normal(subject);
     if(!nt.includes(ns))continue;
     const tx=classifyClubEvent(d,club.name);
@@ -1685,6 +1714,7 @@ async function scanTeam(env,team,{force=false}={}){
       workerOwnedEvidenceDates:events.filter(e=>!!e.evidenceDate).length,
       confirmedClubEvents:clubEvents.length,
       recoveredClubEvents:clubEvents.filter(e=>e.recovered).length,
+      nonMensClubEventsSuppressed:transactionDiagnostics.filter(x=>x.type==='non_mens').length,
       transactionDiagnostics:transactionDiagnostics.slice(0,30),
       suppressedContractRenewals:transactionDiagnostics.filter(x=>x.type==='contract_renewal').length,
       taxonomySignals:{
