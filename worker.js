@@ -18,7 +18,7 @@ const SCHEMA_VERSION = '1.28.0';   // wire format: UNCHANGED in RC5.0.9 (no fiel
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.11-rc5.0.11-evidence-integrity';
+const WORKER_BUILD = 'v2.12-rc5.0.12-information-first';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -689,8 +689,16 @@ function scoreLink(url,host,currentYear){
   const depth=p.split('/').filter(Boolean).length;if(depth>=2)score+=1;
   if(/press-conference|injury-update|starting-xi|confirmed-line-up|team-news|squad-news/.test(p))score+=4;
   if(/how-to-watch|watch-live|live-stream|tv-guide|broadcast|listen-live|quiz|competition-|matchday-guide|where-to-watch/.test(p))score-=20;
+
+  // Information-first Scout: pages that are legitimate club content but have
+  // negligible first-team/FPL value must not consume the scarce article budget.
+  if(/safeguard|disabled-support|supporters-association|gay-gooners|stadium-access|access-guide|ticketing-guide|membership|community|history|sustainability|advisory-board|local-residents|meeting-and-events|meetings-and-events|hospitality|commercial|foundation/.test(p))score-=24;
+
   if(/privacy|cookie|terms|ticket|shop|store|account|login|register|video|gallery|women|academy|hospitality|commercial|foundation|sitemap|contact/.test(p))score-=12;
   if(/preview|fixtures|highlights|\/watch-|watch--|match-gallery|photos/.test(p))score-=8;
+
+  // Strong first-team editorial signals.
+  if(/breaking-down|what-will-he-bring|ready-to-be-your|first-team|manager|press-conference|training|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|signing|new-signing|joins?|signed|transfer|loan|return/.test(p))score+=8;
   if(p==='/'||/\/news\/?$/.test(p))score-=12;
   return {score,reason:score>1?'candidate':'low-score',depth};
 }
@@ -727,6 +735,13 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
   const keywordLane=eligible.slice().sort((a,b)=>unseenFirst(a,b)||b.score-a.score||a.index-b.index);
 
   const seen=new Set(),chosen=[],add=x=>{if(!x||seen.has(x.url)||chosen.length>=limit)return;seen.add(x.url);chosen.push(x.url)};
+
+  // Transaction/news priority lane. Reserve up to two places for URLs whose
+  // slugs strongly indicate transfers, loans, availability or first-team role.
+  const priorityLane=eligible.filter(x=>/signing|new-signing|joins?|signed|transfer|loan|departure|leaves?|returns?|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|breaking-down|what-will-he-bring|ready-to-be-your/.test(decodeURIComponent(new URL(x.url).pathname).toLowerCase()))
+    .sort((a,b)=>unseenFirst(a,b)||b.score-a.score||a.index-b.index);
+  for(const x of priorityLane){add(x);if(chosen.length>=Math.min(2,limit))break}
+
   const reserve=Math.max(1,Math.floor(limit/2));
   for(const x of freshLane){add(x);if(chosen.length>=reserve)break}
   for(const x of keywordLane)add(x);
@@ -1057,6 +1072,17 @@ function classifyClubEvent(doc,clubName){
 
   if(/\bhas left the club\b|\bhas left us\b|\bleaves? the club\b|\bdeparts? the club\b|\bhas joined [^.\n]{2,80} (?:on|in) a permanent transfer\b/i.test(hay))
     return {type:'departure',actionable:true,reason:'explicit outbound transfer language'};
+
+
+  // 5b) Transaction recovery from official follow-up content.
+  // Clubs often stop using the original "joins/signs" headline after day one.
+  // Subsequent official articles may say "our new signing", "summer signing",
+  // "new recruit", "new number 39", etc. That is enough to preserve the FACT
+  // of the transaction in News, but NOT enough to assign xMins to an incumbent.
+  if(/\b(?:our|the club'?s?)\s+new signing\b|\bnew signing\b|\bsummer signing\b|\bnew recruit\b|\bnew arrival\b|\bour new number\s+\d+\b/i.test(hay))
+    return {type:'signing',actionable:true,reason:'official follow-up confirms new signing'};
+  if(/\bformer [^.]{2,60} player\b|\bafter leaving (?:us|the club)\b|\bdeparted (?:the club|us)\b|\bcompleted (?:a )?move away\b/i.test(hay))
+    return {type:'departure',actionable:true,reason:'official follow-up confirms departure'};
 
   // 6) Operational football news classification stays broad.
   if(termHit('injuryOut',hay))return {type:'injury_status',actionable:false,reason:'official unavailable/injury language'};
@@ -1488,6 +1514,47 @@ async function scanTeam(env,team,{force=false}={}){
   // otherwise dominate the model input with ~26k chars of teasers.
   const modelInput=articleDocs;
   const raw=modelInput.length?await aiExtract(env,team,club.name,roster.current.players,modelInput,roster):[];
+
+  // Information-only transaction recovery.
+  // A raw AI event can restore the transaction FACT into clubEvents only when:
+  // - the source is one of the official documents actually read,
+  // - the subject name is present in that source text,
+  // - the event type is a transaction,
+  // - the source text itself contains transaction language.
+  // It never creates an xMins effect by itself.
+  const docByUrl=new Map(modelInput.map(d=>[d.url,d]));
+  const aiRecoveredClubEvents=[];
+  for(const e of Array.isArray(raw)?raw:[]){
+    if(!['signing','departure','loan_in','loan_out','loan_return'].includes(e?.type))continue;
+    const d=docByUrl.get(String(e.source||''));
+    const subject=cleanText(e.subject).slice(0,100);
+    if(!d||!subject)continue;
+    const nt=normal(d.text||''),ns=normal(subject);
+    if(!nt.includes(ns))continue;
+    const tx=classifyClubEvent(d,club.name);
+    if(!['signing','departure','loan_in','loan_out','loan_return'].includes(tx.type))continue;
+    aiRecoveredClubEvents.push({
+      id:`club-${hashString([team,tx.type,subject,d.url].join('|'))}`,
+      team,type:tx.type,subject,confidence:0.95,source:d.url,
+      reason:`Official ${club.name} ${tx.type.replaceAll('_',' ')} information recovered from a current club article. Role/xMins impact remains separate until player-specific evidence justifies it.`,
+      evidenceDate:Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'',
+      detectedAt:new Date().toISOString(),
+      firstSeenAt:new Date().toISOString(),
+      official:true,fastPath:false,recovered:true,classificationReason:tx.reason
+    });
+  }
+
+  // Merge any recovered transaction FACTS into the persistent News ledger before
+  // validating player-specific xMins events.
+  if(aiRecoveredClubEvents.length){
+    const mergedRecovered=[...clubEvents,...aiRecoveredClubEvents]
+      .sort((a,b)=>Date.parse(b.evidenceDate||b.detectedAt||0)-Date.parse(a.evidenceDate||a.detectedAt||0))
+      .filter((e,i,arr)=>arr.findIndex(x=>(x.id||[x.team,x.type,normal(x.subject),x.source].join('|'))===(e.id||[e.team,e.type,normal(e.subject),e.source].join('|')))===i)
+      .slice(0,120);
+    clubEvents.splice(0,clubEvents.length,...mergedRecovered);
+    try{await saveClubEventLedger(env,team,clubEvents)}catch{}
+  }
+
   const events=validateEvents(team,roster.current.players,raw,modelInput);
 
   const browserFallbackUsed=perUrl.some(x=>x.browserUsed)||discovery.some(d=>d.browserUsed);
@@ -1594,6 +1661,7 @@ async function scanTeam(env,team,{force=false}={}){
       acceptedCompetitionEvents:events.filter(e=>['signing','departure','injury','return'].includes(e?.type)).length,
       workerOwnedEvidenceDates:events.filter(e=>!!e.evidenceDate).length,
       confirmedClubEvents:clubEvents.length,
+      recoveredClubEvents:clubEvents.filter(e=>e.recovered).length,
       transactionDiagnostics:transactionDiagnostics.slice(0,30),
       suppressedContractRenewals:transactionDiagnostics.filter(x=>x.type==='contract_renewal').length,
       taxonomySignals:{
