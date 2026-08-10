@@ -14,20 +14,11 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const TRANSACTION_REGRESSION_CASES = Object.freeze({
-  NEW_BRUNO_DEPARTURE: 'Arsenal official signing can mirror a Newcastle departure and persist independently of Newcastle article novelty',
-  ARS_BRUNO_SIGNING: 'official Arsenal signing remains visible',
-  NON_MENS_SUPPRESSED: 'women/academy/U23/U21/U18 transactions never enter men FPL Scout',
-  INDEX_PAGES_SUPPRESSED: 'listing/index pages cannot establish official transactions',
-  DUPLICATES_COLLAPSED: 'multiple articles for one player/team/type collapse into one canonical transaction fact',
-  FRIENDLY_CALIBRATED: 'pre-season XI and precautionary absences cannot create competitive-strength xMins swings'
-});
-
-const SCHEMA_VERSION = '1.28.0';   // wire format: UNCHANGED in RC5.0.9 (no field/shape change)
+const SCHEMA_VERSION = '1.29.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.17-rc5.0.17-counterpart-identity-fix';
+const WORKER_BUILD = 'v2.18-rc5.0.18-confirmed-departure';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -35,6 +26,12 @@ const LANDING_MIN_CHARS = 800;     // below this, the landing page is a JS shell
 const DEFAULT_BROWSER_BUDGET = 3;  // max Browser Run calls per scan (see notes: free tier = 3 new instances/min)
 const DEFAULT_BROWSER_SPACING_MS = 2500; // Browser Run enforces a per-second fill rate, not a burst allowance
 const DEFAULT_SCAN_BUDGET_MS = 45000;
+const DEFAULT_AI_TIMEOUT_MS = 20000;
+const AI_DOC_CHARS = 7000;
+const AI_TOTAL_DOC_CHARS = 48000;
+const BACKGROUND_SCAN_BUDGET_MS = 26000; // HTTP waitUntil is cancelled after 30s
+const BACKGROUND_AI_TIMEOUT_MS = 7000;
+const BACKGROUND_MAX_ARTICLES = 4;
 const ARTICLE_CACHE_DAYS = 45;
 const MUTABLE_CACHE_MINUTES = 90;
 const MUTABLE_ARTICLE_RE = /(?:team-news|fitness-update|injury-update|press-conference|squad-news|starting-xi|confirmed-line-up|line-up|lineup|availability|ruled-out|doubtful|training|matchday-live|live-blog)/i;
@@ -286,10 +283,11 @@ function validTransactionSubject(subject){
   // was passing every check above -- short, letters present, no banned phrase
   // -- and produced a duplicate transaction fact under a different canonical
   // key from the clean 'Caleb Yirenkyi' extraction of the same signing.
-  // Reject field-label prefixes, stray quote/brace/bracket characters, and
-  // colons, none of which appear in a real player name.
+  // Reject field-label prefixes, metadata punctuation and stray quotes while
+  // preserving real internal apostrophes such as O'Riley or D'Angelo.
   if(/^[a-z_]{2,20}\s*:/i.test(s))return false;
-  if(/["'{}\[\]<>]|https?:\/\//i.test(s))return false;
+  if(/["{}[\]<>]|https?:\/\//i.test(s))return false;
+  if(/(^|[^\p{L}])'|'($|[^\p{L}])/u.test(s))return false;
   const words=s.split(/\s+/).filter(Boolean);
   if(words.length>6)return false;
   return words.some(w=>/[A-Za-zÀ-ÖØ-öø-ÿĀ-ž]/.test(w));
@@ -343,7 +341,7 @@ function makeBudget(env){
     async pace(){
       if(!lastCallAt||!spacing)return;
       const wait=Math.min(spacing-(Date.now()-lastCallAt),this.remainingMs());
-      if(wait>0)await new Promise(r=>setTimeout(r,wait));
+      if(wait>0)await new Promise(r=>{setTimeout(r,wait)});
     },
     spendBrowser(){browserCalls++;lastCallAt=Date.now()},
     noteRateLimit(){rateLimitHits++},
@@ -501,10 +499,58 @@ function extractLinkTimesFromHtml(markup,baseUrl){
   const uniqueLinks=[...new Set(anchors.map(a=>a.url))];
   return {times,sources,coverage:uniqueLinks.length?times.size/uniqueLinks.length:0};
 }
-function extractPagePublicationFromHtml(markup){
+
+/** Some JS-heavy publishers (notably Chelsea) ship their article cards inside
+ *  HTML-escaped application state rather than as anchors. Recover those links
+ *  without paying for a browser render. Chelsea's card media URL also carries
+ *  a Cloudinary version timestamp; it is safe for discovery ordering (not as
+ *  an authoritative article publication date) and is labelled accordingly. */
+function extractEmbeddedArticleCards(markup,baseUrl){
+  const raw=String(markup||'');
+  if(!raw.includes('/news/article/'))return {links:[],times:new Map(),sources:new Map()};
+  const decoded=raw.replace(/&quot;/gi,'"').replace(/&#(?:x27|39);/gi,"'").replace(/&amp;/gi,'&');
+  const links=[],times=new Map(),sources=new Map(),seen=new Set();
+  const re=/"url"\s*:\s*"([^"\\]{2,400})"/g;
+  let match;
+  while((match=re.exec(decoded))&&links.length<160){
+    const value=match[1].replaceAll('\\/','/');
+    if(!/\/news\/article\//i.test(value))continue;
+    let url;try{url=new URL(value,baseUrl).toString()}catch{continue}
+    if(seen.has(url))continue;seen.add(url);links.push(url);
+    const nearby=decoded.slice(match.index,match.index+5000);
+    const mediaVersion=nearby.match(/\/image\/upload\/v(\d{10})(?:\/|$)/i);
+    if(mediaVersion){
+      const timestamp=Number(mediaVersion[1])*1000;
+      if(timestamp>=Date.UTC(2020,0,1)&&timestamp<=Date.now()+7*86400000){
+        times.set(url,timestamp);sources.set(url,'embedded-media-version');
+      }
+    }
+  }
+  return {links,times,sources};
+}
+function combineLandingSignals(markup,baseUrl,parsed,recency){
+  const embedded=extractEmbeddedArticleCards(markup,baseUrl);
+  const links=[...new Set([...(parsed.links||[]),...embedded.links])];
+  // Explicit publisher dates outrank the media-upload fallback when both exist.
+  const times=new Map([...embedded.times,...recency.times]);
+  const timeSources=new Map([...embedded.sources,...recency.sources]);
+  const coverageLinks=embedded.links.length?embedded.links:links;
+  const timestampCoverage=coverageLinks.length
+    ? coverageLinks.filter(url=>Number.isFinite(times.get(url))).length/coverageLinks.length
+    : Number(recency.coverage||0);
+  return {links,times,timeSources,timestampCoverage,embeddedCards:embedded.links.length};
+}
+function extractPagePublicationFromHtml(markup,pageUrl=''){
   const html=String(markup||''),hits=[];
   const push=(raw,source,priority)=>{const t=Date.parse(raw||'');if(Number.isFinite(t))hits.push({t,source,priority})};
   let m;
+  // Chelsea exposes the authoritative publication timestamp in HTML-escaped
+  // application state rather than a meta tag or JSON-LD block.
+  if(/\/news\/article\//i.test(String(pageUrl||''))){
+    const decoded=html.replace(/&quot;/gi,'"').replace(/\\u002B/gi,'+');
+    const embeddedPublishRe=/"content_publish_date"\s*:\s*"([^"]+)"/gi;
+    while((m=embeddedPublishRe.exec(decoded)))push(m[1],'embedded:content_publish_date',0);
+  }
   const metaRe=/<meta\b[^>]*(?:property|name)=["']([^"']+)["'][^>]*content=["']([^"']+)["'][^>]*>/gi;
   while((m=metaRe.exec(html))){
     const k=String(m[1]||'').toLowerCase(),v=m[2];
@@ -563,8 +609,9 @@ async function fetchPage(url,{etag=null,lastModified=null}={}){
   const markup=await r.text();
   const parsed=await parseHtmlResponse(new Response(markup,{headers:{'content-type':ct||'text/html'}}),r.url);
   const recency=extractLinkTimesFromHtml(markup,r.url);
-  const pageDate=extractPagePublicationFromHtml(markup);
-  return {url:r.url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,etag:r.headers.get('etag')||null,lastModified:r.headers.get('last-modified')||null,mode:'fetch',status:r.status,redirected:r.url!==url};
+  const landing=combineLandingSignals(markup,r.url,parsed,recency);
+  const pageDate=extractPagePublicationFromHtml(markup,r.url);
+  return {url:r.url,text:parsed.text,links:landing.links,times:landing.times,timeSources:landing.timeSources,timestampCoverage:landing.timestampCoverage,embeddedCards:landing.embeddedCards,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,etag:r.headers.get('etag')||null,lastModified:r.headers.get('last-modified')||null,mode:'fetch',status:r.status,redirected:r.url!==url};
 }
 
 /* ------------------------------------------------------------ Browser Run */
@@ -606,7 +653,7 @@ async function browserCall(env,budget,action,payload){
       if(e.quotaExhausted){budget.markQuotaExhausted();throw e}
       if(e.rateLimited&&attempt===0&&budget.remainingMs()>8000){
         budget.noteRateLimit();
-        await new Promise(r=>setTimeout(r,Math.min(5000,budget.remainingMs()-2000)));
+        await new Promise(r=>{setTimeout(r,Math.min(5000,budget.remainingMs()-2000))});
         continue;
       }
       throw e;
@@ -629,14 +676,9 @@ async function browserRender(env,url,budget){
   const response=new Response(markup,{headers:{'content-type':'text/html; charset=utf-8'}});
   const parsed=await parseHtmlResponse(response,url);
   const recency=extractLinkTimesFromHtml(markup,url);
-  const pageDate=extractPagePublicationFromHtml(markup);
-  return {url,text:parsed.text,links:parsed.links,times:recency.times,timeSources:recency.sources,timestampCoverage:recency.coverage,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,mode:'browser-content',status:200,redirected:false};
-}
-
-async function browserMarkdown(env,url,budget){
-  const result=await browserCall(env,budget,'markdown',{url,gotoOptions:GOTO});
-  const markdown=typeof result==='string'?result:(result?.markdown||result?.content||'');
-  return {url,text:cleanLines(markdown).slice(0,65000),links:[],mode:'browser-markdown',status:200,redirected:false};
+  const landing=combineLandingSignals(markup,url,parsed,recency);
+  const pageDate=extractPagePublicationFromHtml(markup,url);
+  return {url,text:parsed.text,links:landing.links,times:landing.times,timeSources:landing.timeSources,timestampCoverage:landing.timestampCoverage,embeddedCards:landing.embeddedCards,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,mode:'browser-content',status:200,redirected:false};
 }
 
 /* --------------------------------------------------------- article cache */
@@ -840,6 +882,7 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
     source:url,mode:'fetch',linksFound:0,textChars:0,browserUsed:false,
     browserError:null,fetchError:null,timestampCoverage:0,recencyUsed:false,
     staticCandidates:0,staticUnprocessedCandidates:0,
+    embeddedCards:0,
     dynamicEscalated:false,dynamicEscalationReason:null
   };
   let landing=null;
@@ -851,6 +894,7 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
     record.textChars=landing.text.length;
     record.source=landing.url;
     record.timestampCoverage=Number(landing.timestampCoverage||0);
+    record.embeddedCards=Number(landing.embeddedCards||0);
   }catch(e){
     record.fetchError=`${e.kind||'error'}: ${e.message}`;
   }
@@ -902,6 +946,7 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
         record.linksFound=landing.links.length;
         record.textChars=landing.text.length;
         record.timestampCoverage=Number(landing.timestampCoverage||0);
+        record.embeddedCards=Math.max(record.embeddedCards,Number(landing.embeddedCards||0));
 
         const renderedEligible=landing.links.filter(l=>scoreLink(l,hostOf(landing.url),year).score>1);
         record.renderedCandidates=renderedEligible.length;
@@ -995,7 +1040,7 @@ async function readArticle(env,url,budget,{force=false}={}){
 let BOOTSTRAP_MEMO = null;
 const BOOTSTRAP_MEMO_MS = 90000;
 
-async function getBootstrap(env){
+async function getBootstrap(){
   const now=Date.now();
   if(BOOTSTRAP_MEMO&&now-BOOTSTRAP_MEMO.at<BOOTSTRAP_MEMO_MS)return BOOTSTRAP_MEMO.data;
   const r=await fetch(FPL_BOOTSTRAP,{headers:{Accept:'application/json'}});
@@ -1006,7 +1051,7 @@ async function getBootstrap(env){
 }
 
 async function fplContext(env,team){
-  const data=await getBootstrap(env);const teamRow=(data.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
+  const data=await getBootstrap();const teamRow=(data.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
   if(!teamRow)throw new Error(`Club ${team} is not present in the current FPL bootstrap.`);
   const pos=Object.fromEntries((data.element_types||[]).map(x=>[x.id,x.singular_name_short]));
   const currentRound=Number((data.events||[]).find(e=>e.is_current)?.id)||Number((data.events||[]).filter(e=>e.finished).pop()?.id)||0;
@@ -1050,6 +1095,23 @@ function subjectFromHeadlineOrSlug(doc){
   }catch{return ''}
 }
 
+/** Resolve destination-bearing transfer language without guessing direction.
+ *  The named destination is compared with the club whose official site is
+ *  being scanned. This covers both buying-club and selling-club phrasing. */
+function movementDestination(line){
+  const s=String(line||'');
+  const patterns=[
+    /\b(?:has\s+)?complet(?:e|es|ed)\s+(?:(?:a|his|her|their)\s+)?(?:permanent\s+)?(?:transfer|move)\s+to\s+([^,.!;\n]{2,100})/i,
+    /\b(?:has\s+)?(?:moved|moves?|transferred|transfers?)\s+to\s+([^,.!;\n]{2,100})/i,
+    /\b(?:has\s+)?signed\s+for\s+([^,.!;\n]{2,100})/i
+  ];
+  for(const re of patterns){
+    const match=s.match(re);
+    if(match)return cleanText(match[1]).replace(/\s+from\s+.+$/i,'').trim();
+  }
+  return '';
+}
+
 function classifyClubEvent(doc,clubName){
   if(!isMensFirstTeamSource(doc?.url,doc?.text))return {type:'non_mens',actionable:false,reason:'non-men first-team source suppressed'};
   if(isAggregatorTransactionSource(doc?.url))return {type:'index_page',actionable:false,reason:'listing/index page cannot establish a transaction'};
@@ -1077,23 +1139,25 @@ function classifyClubEvent(doc,clubName){
       ? {type:'signing',actionable:true,reason:'headline signs for current club'}
       : {type:'departure',actionable:true,reason:'headline signs for another club'};
 
-    // "completes a move to X" / "moves to X" name a destination, exactly like
-    // "joins X" and "signs for X" above, so direction must be resolved the
-    // same way: compare the named destination against the club whose site is
-    // being scanned. Treating this as unconditionally outbound was wrong --
-    // a buying club's own announcement routinely opens with wording like
-    // "Player has completed a move to Arsenal from Newcastle United", and
-    // that sentence would have been misclassified as Arsenal's departure.
-    mm=line.match(/\bcompletes?\s+(?:a\s+)?move\s+to\s+(.{2,100}?)(?:\s+from\s+.{2,100})?[.!]?$/i)
-      ||line.match(/\bmoves?\s+to\s+(.{2,100}?)(?:\s+from\s+.{2,100})?[.!]?$/i);
-    if(mm)return normal(mm[1]).includes(club)
+    // "permanent transfer to X", "move to X" and "signs for X" all name a
+    // destination. Chelsea's Chalobah announcement uses the first form.
+    const destination=movementDestination(line);
+    if(destination)return normal(destination).includes(club)
       ? {type:'signing',actionable:true,reason:'headline/opening line: completes move to current club'}
       : {type:'departure',actionable:true,reason:'headline/opening line: completes move to another club'};
 
-    // "leaves the club" / "departs the club" are genuinely self-referential --
-    // "the club" always means whichever site is being read -- so these stay
-    // unconditional, unlike the destination-naming patterns above.
-    if(/\bleaves? the club\b|\bdeparts? the club\b/i.test(line))
+    // Selling clubs frequently headline departures as "Player leaves Chelsea
+    // for Como". This is self-evidently outbound even though neither generic
+    // "leaves the club" nor "moves to" is present.
+    const normalizedLine=normal(line);
+    if(/\bleaves?\s+(?:us|the club)\b/i.test(line)
+      ||normalizedLine.includes(`leaves ${club}`)
+      ||normalizedLine.includes(`leave ${club}`))
+      return {type:'departure',actionable:true,reason:'headline confirms departure from current club'};
+
+    if(/\bdeparts? (?:from )?(?:us|the club)\b/i.test(line)
+      ||normalizedLine.includes(`departs ${club}`)
+      ||normalizedLine.includes(`departs from ${club}`))
       return {type:'departure',actionable:true,reason:'explicit outbound headline language'};
 
     if(/\b(?:new signing|joins us|has joined us|signs for us|arrives at|welcome to)\b/i.test(line))
@@ -1129,9 +1193,8 @@ function classifyClubEvent(doc,clubName){
   // Body-level destination language needs the same direction check as headlines.
   // This covers articles whose headline is generic but whose body says
   // "Player has completed a move to Arsenal from Newcastle United".
-  let bodyMove=hay.match(/\bhas completed\s+(?:a\s+)?move\s+to\s+([^\.\n]{2,100}?)(?:\s+from\s+[^\.\n]{2,100})?(?:[\.\n]|$)/i)
-    ||hay.match(/\bhas moved\s+to\s+([^\.\n]{2,100}?)(?:\s+from\s+[^\.\n]{2,100})?(?:[\.\n]|$)/i);
-  if(bodyMove)return normal(bodyMove[1]).includes(club)
+  const bodyDestination=movementDestination(hay);
+  if(bodyDestination)return normal(bodyDestination).includes(club)
     ? {type:'signing',actionable:true,reason:'body confirms move to current club'}
     : {type:'departure',actionable:true,reason:'body confirms move to another club'};
 
@@ -1304,6 +1367,71 @@ function fastPathClubEvents(team,clubName,documents){
   return mergeClubEventRows(out);
 }
 
+/* ------------------------------------------------ confirmed departures */
+// FPL's bootstrap can legitimately lag an official transfer announcement. The
+// club-news fact therefore has a tiny, deterministic bridge into the xMins
+// contract: while the departed player is still present in this club's FPL
+// roster, publish direct unavailability with availability=0. No beneficiary or
+// tactical knock-on effect is inferred.
+
+function departureEvidenceKey(team){return `direct-departure:${team}`}
+function roleEvidenceIdentity(e){
+  return String(e?.id||[e?.team,e?.type,normal(e?.subject),normal(e?.affected),e?.source].join('|'));
+}
+function mergeRoleEvidence(rows){
+  const byId=new Map();
+  for(const e of rows||[]){if(e&&e.type)byId.set(roleEvidenceIdentity(e),e)}
+  return [...byId.values()].sort((a,b)=>Number(b.createdAt||Date.parse(b.evidenceDate||0)||0)-Number(a.createdAt||Date.parse(a.evidenceDate||0)||0));
+}
+function rosterPlayerForSubject(players,subject){
+  const wanted=normal(subject);if(!wanted)return null;
+  const exact=(players||[]).filter(p=>wanted===normal(p.fullName)||wanted===normal(p.name));
+  if(exact.length===1)return exact[0];
+  // Official headlines normally use the full name while FPL may expose only a
+  // surname. Accept a suffix match only when it identifies exactly one player.
+  const suffix=(players||[]).filter(p=>{
+    const full=normal(p.fullName),short=normal(p.name);
+    return (short&&wanted.endsWith(` ${short}`))||(full&&full.endsWith(` ${wanted}`));
+  });
+  return suffix.length===1?suffix[0]:null;
+}
+function confirmedDepartureEvidence(team,players,clubEvents){
+  const out=[];
+  for(const fact of clubEvents||[]){
+    if(!['departure','loan_out'].includes(String(fact?.type||'')))continue;
+    if(fact.official===false||!fact.subjectTransactionVerified||!isCurrentClubEvent(fact))continue;
+    const player=rosterPlayerForSubject(players,fact.subject);if(!player)continue;
+    const evidenceDate=fact.evidenceDate||fact.detectedAt||new Date().toISOString();
+    const effectiveMs=Date.parse(evidenceDate)||Date.now();
+    const movement=fact.type==='loan_out'?'official loan away':'official permanent departure';
+    out.push({
+      id:`direct-${hashString([team,fact.type,normal(fact.subject),player.id,fact.source].join('|'))}`,
+      createdAt:effectiveMs,team,type:'unavailable',rawType:'unavailable',originType:`confirmed_${fact.type}`,
+      transactionType:fact.type,subject:player.name,role:null,affected:player.name,affectedApiId:player.id,
+      overlap:1,hierarchy:1,confidence:1,source:fact.source,
+      reason:`${movement} confirmed by ${CLUB_SOURCES[team]?.name||team}. FPL still lists ${player.name} at the club, so availability is held at zero until the roster feed catches up.`,
+      evidenceDate,evidenceDateSource:'official-club',evidenceClass:'availability',authorityTier:1,sourceAuthority:1,
+      effectiveFrom:new Date(effectiveMs).toISOString(),expiresAt:new Date(effectiveMs+45*86400000).toISOString(),
+      halfLifeHours:8760,maxMinuteImpact:90,directImpact:true,preseasonCalibrated:false,
+      verificationStatus:'official-source',minutesCap:0,directAvailability:0,selectionCertainty:0,
+      productionImpact:0,fixtureId:null,competition:null,kickoff:null,gameweek:null,
+      auto:true,worker:true,oop:false
+    });
+  }
+  return mergeRoleEvidence(out);
+}
+async function saveDepartureEvidence(env,team,events){
+  await env.ROLE_KV.put(departureEvidenceKey(team),JSON.stringify({updatedAt:new Date().toISOString(),events:events||[]}),{expirationTtl:60*60*24*60});
+}
+async function loadDepartureEvidence(env,team){
+  const row=await env.ROLE_KV.get(departureEvidenceKey(team),'json');
+  const now=Date.now();
+  return mergeRoleEvidence((Array.isArray(row?.events)?row.events:[]).filter(e=>{
+    const expiry=Date.parse(e?.expiresAt||'');
+    return String(e?.originType||'').startsWith('confirmed_')&&(!Number.isFinite(expiry)||expiry>now);
+  }));
+}
+
 /* ------------------------------------------------------------- extraction */
 
 function extractionSchema(){return {
@@ -1320,9 +1448,16 @@ function extractionSchema(){return {
     }}}}
 }}
 
-async function aiExtract(env,team,clubName,players,documents,rosterDelta){
+async function aiExtract(env,team,clubName,players,documents,rosterDelta,{timeoutMs=DEFAULT_AI_TIMEOUT_MS}={}){
+  const started=Date.now();
+  if(!env.AI?.run)return {events:[],status:'unavailable',elapsedMs:0,error:'Workers AI binding is unavailable'};
   const playerList=players.map(p=>`${p.name} [${p.fplPosition}]`).join(', ');
-  const docs=documents.map((d,i)=>`SOURCE ${i+1}: ${d.url}\nSOURCE_PUBLISHED_AT: ${Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'unknown'}\nSOURCE_DATE_ORIGIN: ${d.dateSource||'unknown'}\n${d.text.slice(0,12000)}`).join('\n\n');
+  let remaining=AI_TOTAL_DOC_CHARS;
+  const docs=documents.map((d,i)=>{
+    const take=Math.max(0,Math.min(AI_DOC_CHARS,remaining));
+    const body=String(d.text||'').slice(0,take);remaining-=body.length;
+    return `SOURCE ${i+1}: ${d.url}\nSOURCE_PUBLISHED_AT: ${Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'unknown'}\nSOURCE_DATE_ORIGIN: ${d.dateSource||'unknown'}\n${body}`;
+  }).join('\n\n');
   const prompt=`You are the OTB football role-intelligence extractor. Analyse only the supplied official-club text and FPL roster evidence for ${clubName} (${team}).
 Return only current, source-grounded structured events that can materially change EXPECTED MINUTES for players registered in FPL.
 
@@ -1364,14 +1499,26 @@ RULES:
 - Return no event when evidence is insufficient.
 
 OFFICIAL MATERIAL:\n${docs}`;
-  const result=await env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast',{
+  const run=env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast',{
     messages:[{role:'system',content:'Extract conservative, source-grounded Premier League team-role events as JSON. Never invent facts.'},{role:'user',content:prompt}],
     response_format:{type:'json_schema',json_schema:{name:'otb_role_events',strict:true,schema:extractionSchema()}},
     temperature:0
   });
-  let out=result?.response ?? result;
-  if(typeof out==='string'){try{out=JSON.parse(out)}catch{return []}}
-  return Array.isArray(out?.events)?out.events:[];
+  const limit=Math.max(1000,Math.min(60000,Number(timeoutMs)||DEFAULT_AI_TIMEOUT_MS));
+  let timer;
+  const settled=await Promise.race([
+    run.then(value=>({value}),error=>({error})),
+    new Promise(resolve=>{timer=setTimeout(()=>resolve({timedOut:true}),limit)})
+  ]);
+  if(timer)clearTimeout(timer);
+  if(settled.timedOut)return {events:[],status:'timeout',elapsedMs:Date.now()-started,error:`Workers AI exceeded ${limit}ms`};
+  if(settled.error)return {events:[],status:'error',elapsedMs:Date.now()-started,error:settled.error?.message||String(settled.error)};
+  let out=settled.value?.response ?? settled.value;
+  if(typeof out==='string'){
+    try{out=JSON.parse(out)}
+    catch{return {events:[],status:'parse-error',elapsedMs:Date.now()-started,error:'Workers AI returned invalid JSON'}}
+  }
+  return {events:Array.isArray(out?.events)?out.events:[],status:'ok',elapsedMs:Date.now()-started,error:null};
 }
 
 function isPreseasonOrFriendlySource(url,text=''){
@@ -1481,7 +1628,7 @@ async function recordCalibrationRows(env,team,events,roster){
 
 /** Diffs due rows against the live bootstrap and writes the observed outcome. */
 async function resolveCalibration(env,{limit=200}={}){
-  const data=await getBootstrap(env);
+  const data=await getBootstrap();
   const round=Number((data.events||[]).find(e=>e.is_current)?.id)
     ||Number((data.events||[]).filter(e=>e.finished).pop()?.id)||0;
   const live=new Map((data.elements||[]).map(p=>[p.id,p]));
@@ -1569,10 +1716,11 @@ function buildRecencySummary(discovery,articleDocs){
   };
 }
 
-async function scanTeam(env,team,{force=false}={}){
+async function scanTeam(env,team,{force=false,profile='foreground'}={}){
   team=String(team||'').toUpperCase();
   const club=CLUB_SOURCES[team];
   if(!club)throw new Error(`Unsupported team code: ${team}`);
+  profile=['foreground','background','scheduled'].includes(profile)?profile:'foreground';
 
   const cacheKey=`latest:${team}`;
   if(!force){
@@ -1580,9 +1728,22 @@ async function scanTeam(env,team,{force=false}={}){
     if(cached)return {...cached,cache:'HIT'};
   }
 
-  const budget=makeBudget(env);
+  const background=profile==='background';
+  const configuredBrowserBudget=Number.isFinite(Number(env.BROWSER_BUDGET))
+    ? Math.max(0,Number(env.BROWSER_BUDGET))
+    : DEFAULT_BROWSER_BUDGET;
+  // An HTTP waitUntil task is cancelled 30 seconds after the response. Keep
+  // stale-while-revalidate scans below that ceiling and reserve them for
+  // deterministic discovery; cron/manual scans perform full AI extraction.
+  const scanEnv=background?{
+    ...env,
+    SCAN_BUDGET_MS:Math.min(Math.max(10000,Number(env.SCAN_BUDGET_MS)||DEFAULT_SCAN_BUDGET_MS),BACKGROUND_SCAN_BUDGET_MS),
+    BROWSER_BUDGET:Math.min(1,configuredBrowserBudget)
+  }:env;
+  const budget=makeBudget(scanEnv);
   const roster=await fplContext(env,team);
-  const max=Math.max(3,Math.min(12,Number(env.MAX_ARTICLES_PER_SCAN)||8));
+  const configuredMax=Math.max(3,Math.min(12,Number(env.MAX_ARTICLES_PER_SCAN)||8));
+  const max=background?Math.min(BACKGROUND_MAX_ARTICLES,configuredMax):configuredMax;
 
   const documents=[];
   const errors=[];
@@ -1625,6 +1786,7 @@ async function scanTeam(env,team,{force=false}={}){
         rankedCandidates:ranked,
         staticCandidates:record.staticCandidates,
         staticUnprocessedCandidates:record.staticUnprocessedCandidates,
+        embeddedCards:record.embeddedCards,
         renderedCandidates:record.renderedCandidates??null,
         renderedUnprocessedCandidates:record.renderedUnprocessedCandidates??null,
         dynamicEscalated:record.dynamicEscalated,
@@ -1705,6 +1867,11 @@ async function scanTeam(env,team,{force=false}={}){
   const priorLatestClubEvents=Array.isArray(priorLatest?.clubEvents)?priorLatest.clubEvents:[];
   const clubEvents=mergeClubEventRows([...currentClubEvents,...priorClubEvents,...priorLatestClubEvents]);
   try{await saveClubEventLedger(env,team,clubEvents)}catch{}
+  // Persist this before the model call. Even if Workers AI is slow or the
+  // request disconnects, confirmed outgoing transfers are already reflected
+  // in both the News ledger and the direct-availability overlay.
+  let departureEvents=confirmedDepartureEvidence(team,roster.current.players,clubEvents);
+  try{await saveDepartureEvidence(env,team,departureEvents)}catch{}
   // RC5.0.16: a bare catch{} here is exactly what let the TEAMS bug above
   // fail silently on every call for the life of RC5.0.15. Record failures
   // where they can actually be found (mirror-error:<team>), without letting
@@ -1721,7 +1888,16 @@ async function scanTeam(env,team,{force=false}={}){
   // across the site, so it survives boilerplate stripping intact and would
   // otherwise dominate the model input with ~26k chars of teasers.
   const modelInput=articleDocs;
-  const raw=modelInput.length?await aiExtract(env,team,club.name,roster.current.players,modelInput,roster):[];
+  let aiResult={events:[],status:'not-needed',elapsedMs:0,error:null};
+  if(modelInput.length){
+    const configuredAiTimeout=Math.max(1000,Number(env.AI_TIMEOUT_MS)||DEFAULT_AI_TIMEOUT_MS);
+    const profileTimeout=background?Math.min(configuredAiTimeout,BACKGROUND_AI_TIMEOUT_MS):configuredAiTimeout;
+    const available=Math.max(0,budget.remainingMs()-1200);
+    aiResult=available>=1000
+      ? await aiExtract(env,team,club.name,roster.current.players,modelInput,roster,{timeoutMs:Math.min(profileTimeout,available)})
+      : {events:[],status:'deferred-budget',elapsedMs:0,error:'scan budget was exhausted before Workers AI extraction'};
+  }
+  const raw=aiResult.events;
 
   // Information-only transaction recovery.
   // A raw AI event can restore the transaction FACT into clubEvents only when:
@@ -1764,9 +1940,12 @@ async function scanTeam(env,team,{force=false}={}){
     try{await saveClubEventLedger(env,team,clubEvents)}catch{}
     try{await mirrorClubTransactions(env,aiRecoveredClubEvents)}
     catch(e){await env.ROLE_KV.put(`mirror-error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e?.message||String(e)}),{expirationTtl:86400}).catch(()=>{})}
+    departureEvents=confirmedDepartureEvidence(team,roster.current.players,clubEvents);
+    try{await saveDepartureEvidence(env,team,departureEvents)}catch{}
   }
 
-  const events=validateEvents(team,roster.current.players,raw,modelInput);
+  const modelEvents=validateEvents(team,roster.current.players,raw,modelInput);
+  const scanEvents=mergeRoleEvidence([...modelEvents,...departureEvents]);
 
   const browserFallbackUsed=perUrl.some(x=>x.browserUsed)||discovery.some(d=>d.browserUsed);
 
@@ -1775,17 +1954,20 @@ async function scanTeam(env,team,{force=false}={}){
   // it set out to read. Reading 1 of 8 because the browser allowance ran out is
   // NOT grounds for clearing evidence that an earlier full scan gathered.
   const coverage=attempted?articleDocs.length/attempted:0;
-  const evidenceAuthoritative=articleDocs.length>0
+  const evidenceAuthoritative=aiResult.status==='ok'
+    && articleDocs.length>0
     && !budget.quotaExhausted
     && (articleDocs.length>=3 || coverage>=0.5);
   const maxCarryMs=Math.max(1,Number(env.MAX_CARRY_DAYS)||7)*86400000;
 
-  let finalEvents=events;
+  let finalEvents=scanEvents;
   let evidenceGeneratedAt=new Date().toISOString();
   let evidenceCarriedForward=false;
   let evidenceNote=evidenceAuthoritative
     ? `Evidence derived from ${articleDocs.length} of ${attempted} article document(s) read in this scan.`
-    : (budget.quotaExhausted
+    : (aiResult.status!=='ok'&&aiResult.status!=='not-needed'
+        ? `Role extraction was not authoritative (${aiResult.status}); confirmed club transactions were still processed deterministically.`
+        : budget.quotaExhausted
         ? 'The Browser Run daily allowance was exhausted during this scan, so coverage was incomplete.'
         : `This scan read only ${articleDocs.length} of ${attempted} article document(s).`);
 
@@ -1807,7 +1989,7 @@ async function scanTeam(env,team,{force=false}={}){
     );
 
     if(stillValid.length&&withinCarryWindow){
-      finalEvents=stillValid;
+      finalEvents=mergeRoleEvidence([...stillValid,...departureEvents]);
       evidenceGeneratedAt=prior.evidenceGeneratedAt||prior.generatedAt;
       evidenceCarriedForward=true;
       const ageDays=Math.floor((Date.now()-anchor)/86400000);
@@ -1867,15 +2049,20 @@ async function scanTeam(env,team,{force=false}={}){
       elapsedMs:budget.elapsedMs,
       budgetExpired:budget.expired(),
       rawEvents:Array.isArray(raw)?raw.length:0,
-      acceptedEvents:events.length,
+      acceptedEvents:scanEvents.length,
+      modelAcceptedEvents:modelEvents.length,
+      confirmedDepartureGuards:departureEvents.length,
+      aiStatus:aiResult.status,
+      aiElapsedMs:aiResult.elapsedMs,
+      aiError:aiResult.error||null,
       rawCompetitionEvents:Array.isArray(raw)?raw.filter(e=>['signing','departure','loan_in','loan_out','injury','return'].includes(e?.type)).length:0,
-      acceptedCompetitionEvents:events.filter(e=>['signing','departure','injury','return'].includes(e?.type)).length,
-      workerOwnedEvidenceDates:events.filter(e=>!!e.evidenceDate).length,
+      acceptedCompetitionEvents:modelEvents.filter(e=>['signing','departure','injury','return'].includes(e?.type)).length,
+      workerOwnedEvidenceDates:scanEvents.filter(e=>!!e.evidenceDate).length,
       confirmedClubEvents:clubEvents.length,
       recoveredClubEvents:clubEvents.filter(e=>e.recovered).length,
       mirroredClubEvents:clubEvents.filter(e=>e.mirrored).length,
       canonicalTransactionCount:mergeClubEventRows(clubEvents).length,
-      preseasonCalibratedEvents:events.filter(e=>e.preseasonCalibrated).length,
+      preseasonCalibratedEvents:modelEvents.filter(e=>e.preseasonCalibrated).length,
       nonMensClubEventsSuppressed:transactionDiagnostics.filter(x=>x.type==='non_mens').length,
       transactionDiagnostics:transactionDiagnostics.slice(0,30),
       suppressedContractRenewals:transactionDiagnostics.filter(x=>x.type==='contract_renewal').length,
@@ -1905,12 +2092,12 @@ async function scanTeam(env,team,{force=false}={}){
       staticUnprocessedCandidates:discovery.reduce((a,d)=>a+Number(d.staticUnprocessedCandidates||0),0),
       renderedUnprocessedCandidates:discovery.reduce((a,d)=>a+Number(d.renderedUnprocessedCandidates||0),0),
       perUrl:perUrl.slice(0,60),
-      eventsFromThisScan:events.length,
+      eventsFromThisScan:scanEvents.length,
       evidenceAuthoritative,
       evidenceCarriedForward,
       timestampCoverage:recencySummary.landingCoverage,
       recencyRankingUsed: discovery.some(d=>d.recencyUsed),
-      scanMode: force?'forced-live':'background',
+      scanMode:profile==='foreground'?(force?'forced-live':'foreground'):profile,
       cacheState: 'MISS'
     },
     roster:{
@@ -1924,7 +2111,7 @@ async function scanTeam(env,team,{force=false}={}){
 
   // Log predictions for later calibration. Only events THIS scan produced —
   // carried-forward events were already logged when first discovered.
-  if(events.length){try{await recordCalibrationRows(env,team,events,roster)}catch{}}
+  if(modelEvents.length){try{await recordCalibrationRows(env,team,modelEvents,roster)}catch{}}
 
   await env.ROLE_KV.put(cacheKey,JSON.stringify(payload),{expirationTtl:60*60*24*14});
   return payload;
@@ -1966,12 +2153,18 @@ async function scanTeam(env,team,{force=false}={}){
  */
 async function withCurrentClubEvents(env,team,report){
   if(!report)return report;
-  try{
-    const events=await loadClubEventLedger(env,team);
-    return {...report,clubEvents:events};
-  }catch{
-    return report; // ledger read failure must never take down report serving
+  const [clubEvents,directEvents]=await Promise.all([
+    loadClubEventLedger(env,team).catch(()=>null),
+    loadDepartureEvidence(env,team).catch(()=>null)
+  ]);
+  const next={...report};
+  if(clubEvents!==null)next.clubEvents=clubEvents;
+  if(directEvents!==null){
+    const base=(Array.isArray(report.events)?report.events:[])
+      .filter(e=>!String(e?.originType||'').startsWith('confirmed_'));
+    next.events=mergeRoleEvidence([...base,...directEvents]);
   }
+  return next;
 }
 
 async function allLatest(env){
@@ -1990,7 +2183,7 @@ function reportAgeMs(report){
 
 /** Wraps scanTeam so two callers cannot burn the browser allowance twice on the
  *  same club. A blocked caller gets the cached report rather than an error. */
-async function scanTeamGuarded(env,team){
+async function scanTeamGuarded(env,team,{profile='foreground'}={}){
   const lockToken=await acquireScanLock(env,team);
   if(!lockToken){
     const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
@@ -1998,7 +2191,7 @@ async function scanTeamGuarded(env,team){
     throw new Error(`A scan for ${team} is already in progress. Try again shortly.`);
   }
   try{
-    const report=await scanTeam(env,team,{force:true});
+    const report=await scanTeam(env,team,{force:true,profile});
     return withCurrentClubEvents(env,team,{...report,scanExecuted:true});
   }finally{
     await releaseScanLock(env,team,lockToken);
@@ -2007,15 +2200,19 @@ async function scanTeamGuarded(env,team){
 
 async function cacheFirstTeamReport(env,team,ctx,{force=false}={}){
   team=String(team||'').toUpperCase();
-  if(force)return scanTeamGuarded(env,team);
+  if(force)return scanTeamGuarded(env,team,{profile:'foreground'});
 
   const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
-  if(!cached)return scanTeamGuarded(env,team);
+  if(!cached)return scanTeamGuarded(env,team,{profile:'foreground'});
 
-  const staleAfterMs=Math.max(15,Number(env.STALE_AFTER_MINUTES)||360)*60*1000;
+  // Transfer-window reports must not look current for most of a working day.
+  // A request after 90 minutes returns the cache immediately, then schedules
+  // the bounded background scan that the HTML auto-polls to completion.
+  const staleAfterMs=Math.max(15,Number(env.STALE_AFTER_MINUTES)||90)*60*1000;
   const stale=reportAgeMs(cached)>staleAfterMs;
-  if(stale&&ctx?.waitUntil){
-    ctx.waitUntil(scanTeamGuarded(env,team).catch(async error=>{
+  const refreshScheduled=!!(stale&&ctx?.waitUntil);
+  if(refreshScheduled){
+    ctx.waitUntil(scanTeamGuarded(env,team,{profile:'background'}).catch(async error=>{
       await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:error?.message||String(error)}),{expirationTtl:86400});
     }));
   }
@@ -2023,7 +2220,11 @@ async function cacheFirstTeamReport(env,team,ctx,{force=false}={}){
   // days). A transaction can legitimately reach this team's truth through a
   // DIFFERENT club's scan -- via mirrorClubTransactions -- entirely between
   // this team's own scans. Cache hits must not wait for that scan to arrive.
-  return withCurrentClubEvents(env,team,{...cached,cache:'HIT',stale,refreshing:stale});
+  return withCurrentClubEvents(env,team,{
+    ...cached,cache:'HIT',stale,refreshing:refreshScheduled,
+    refreshDeferred:stale&&!refreshScheduled,
+    refreshAfterMs:refreshScheduled?3000:null
+  });
 }
 
 /* ==================================================================
@@ -2579,6 +2780,6 @@ export default {
       // Math.max(1,...Number(x)||1), so 0 became 1 and the documented
       // escape hatch did nothing.
       if(Number.isFinite(configured)&&configured<=0)return;
-      const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.min(4,Math.max(1,Number.isFinite(configured)?configured:4));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeamGuarded(env,team)}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
+      const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.min(4,Math.max(1,Number.isFinite(configured)?configured:4));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeamGuarded(env,team,{profile:'scheduled'})}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
   }
 };
