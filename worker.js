@@ -1,4 +1,5 @@
 // OTB Role Intelligence Worker
+// v2.19 — RC5.0.19 role-constraint guard: friendly evidence normalization and cache migration
 // v2.11 — RC5.0.11 evidence-integrity hardening: source-owned dates, durable transactions, conservative competition mapping
 //
 // Changes vs v1.2 (all additive to the response contract):
@@ -14,11 +15,11 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.29.0';
+const SCHEMA_VERSION = '1.30.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.18-rc5.0.18-confirmed-departure';
+const WORKER_BUILD = 'v2.19-rc5.0.19-role-constraint';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -1528,6 +1529,15 @@ function isPreseasonOrFriendlySource(url,text=''){
 function hasCompetitiveAbsenceLanguage(text=''){
   return /\bwill miss\b|\bset to miss\b|\bruled out of (?:the )?(?:premier league|league|opening|opener|gameweek|gw)\b|\bunavailable for (?:the )?(?:premier league|league|opening|opener|gameweek|gw)\b|\bsuspended for\b/i.test(String(text||''));
 }
+function normalizeFriendlyEvidenceEvent(e){
+  if(!e?.preseasonCalibrated)return e;
+  const sourceType=String(e.sourceType||e.rawType||e.type||'');
+  if(!/confirmed_(?:start|bench)|friendly_(?:start|bench)/.test(`${sourceType} ${e.type||''}`))return e;
+  const type=/bench/.test(`${sourceType} ${e.type||''}`)?'friendly_bench':'friendly_start';
+  return {...e,type,rawType:type,sourceType,evidenceClass:'selection',authorityTier:Math.max(3,Number(e.authorityTier)||3),
+    halfLifeHours:Math.min(96,Number(e.halfLifeHours)||96),maxMinuteImpact:Math.min(8,Number(e.maxMinuteImpact)||8),
+    directImpact:false,selectionCertainty:null};
+}
 
 function validateEvents(team,players,events,sourceDocuments){
   const byName=new Map;for(const p of players){byName.set(normal(p.name),p);byName.set(normal(p.fullName),p)}const out=[];
@@ -1572,7 +1582,9 @@ function validateEvents(team,players,events,sourceDocuments){
     // Pre-season/friendly evidence updates the prior; it must not masquerade as
     // a confirmed Premier League lineup or a confirmed competitive absence.
     const preseason=isPreseasonOrFriendlySource(source,meta.text);
-    if(preseason&&['confirmed_start','confirmed_bench'].includes(e.type)){
+    const preseasonLineup=preseason&&['confirmed_start','confirmed_bench'].includes(e.type);
+    if(preseasonLineup){
+      normalizedType=e.type==='confirmed_bench'?'friendly_bench':'friendly_start';
       policy={...EVIDENCE_POLICY.observed_role,channel:'selection',tier:3,halfLifeHours:96,ttlHours:240,maxMinuteImpact:8,direct:false};
     }
     if(preseason&&['unavailable','minutes_restricted','fitness_doubt'].includes(e.type)&&!hasCompetitiveAbsenceLanguage(meta.text)){
@@ -1581,7 +1593,7 @@ function validateEvents(team,players,events,sourceDocuments){
     }
 
     const effectiveMs=authoritativeMs||Date.now();
-    out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,rawType:e.type,subject:cleanText(e.subject).slice(0,120),role:eventRole,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate,evidenceDateSource:meta.dateSource||null,evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.98,effectiveFrom:new Date(effectiveMs).toISOString(),expiresAt:new Date(effectiveMs+policy.ttlHours*3600000).toISOString(),halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,directImpact:!!policy.direct,preseasonCalibrated:preseason,verificationStatus:'official-source',minutesCap:Number.isFinite(Number(e.minutesCap))?clamp(Number(e.minutesCap),0,90):null,directAvailability:Number.isFinite(Number(e.directAvailability))?clamp(Number(e.directAvailability),0,1):null,selectionCertainty:Number.isFinite(Number(e.selectionCertainty))?clamp(Number(e.selectionCertainty),0,1):null,productionImpact:Number.isFinite(Number(e.productionImpact))?clamp(Number(e.productionImpact),-.25,.25):0,fixtureId:cleanText(e.fixtureId).slice(0,80)||null,competition:cleanText(e.competition).slice(0,80)||null,kickoff:cleanText(e.kickoff).slice(0,40)||null,gameweek:Number.isFinite(Number(e.gameweek))?Number(e.gameweek):null,auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
+    out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,rawType:preseasonLineup?normalizedType:e.type,sourceType:e.type,subject:cleanText(e.subject).slice(0,120),role:eventRole,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate,evidenceDateSource:meta.dateSource||null,evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.98,effectiveFrom:new Date(effectiveMs).toISOString(),expiresAt:new Date(effectiveMs+policy.ttlHours*3600000).toISOString(),halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,directImpact:!!policy.direct,preseasonCalibrated:preseason,verificationStatus:'official-source',minutesCap:Number.isFinite(Number(e.minutesCap))?clamp(Number(e.minutesCap),0,90):null,directAvailability:Number.isFinite(Number(e.directAvailability))?clamp(Number(e.directAvailability),0,1):null,selectionCertainty:preseasonLineup?null:(Number.isFinite(Number(e.selectionCertainty))?clamp(Number(e.selectionCertainty),0,1):null),productionImpact:Number.isFinite(Number(e.productionImpact))?clamp(Number(e.productionImpact),-.25,.25):0,fixtureId:cleanText(e.fixtureId).slice(0,80)||null,competition:cleanText(e.competition).slice(0,80)||null,kickoff:cleanText(e.kickoff).slice(0,40)||null,gameweek:Number.isFinite(Number(e.gameweek))?Number(e.gameweek):null,auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
   }
   const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),normal(e.affected),e.role,e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
 }
@@ -2159,11 +2171,10 @@ async function withCurrentClubEvents(env,team,report){
   ]);
   const next={...report};
   if(clubEvents!==null)next.clubEvents=clubEvents;
-  if(directEvents!==null){
-    const base=(Array.isArray(report.events)?report.events:[])
-      .filter(e=>!String(e?.originType||'').startsWith('confirmed_'));
-    next.events=mergeRoleEvidence([...base,...directEvents]);
-  }
+  const base=(Array.isArray(report.events)?report.events:[])
+    .filter(e=>!String(e?.originType||'').startsWith('confirmed_'))
+    .map(normalizeFriendlyEvidenceEvent);
+  next.events=directEvents!==null?mergeRoleEvidence([...base,...directEvents]):mergeRoleEvidence(base);
   return next;
 }
 
