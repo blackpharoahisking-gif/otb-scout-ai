@@ -109,6 +109,10 @@ test('commercial kit and cup-draw paths do not consume article slots',()=>{
   assert.ok(scoreLink(`https://${host}/news/2026/august/10/supporters-club-applications-open`,host,2026).score<=1);
   assert.ok(scoreLink(`https://${host}/news/2026/august/10/fantasy-premier-league-prices-revealed`,host,2026).score<=1);
   assert.ok(scoreLink(`https://${host}/news/2026/august/10/friendly-now-on-general-sale`,host,2026).score<=1);
+  assert.ok(scoreLink(`https://${host}/news/2026/august/10/the-seat-move-window-opens`,host,2026).score<=1);
+  assert.ok(scoreLink(`https://${host}/news/2026/august/10/loyalty-points-update`,host,2026).score<=1);
+  assert.ok(scoreLink(`https://${host}/news/2026/august/10/club-will-face-either-rival-in-round-two-of-the-carabao-cup`,host,2026).score<=1);
+  assert.equal(scoreLink(`https://${host}/news/clubservices.co.uk`,host,2026).score,-99);
 });
 
 test('valid first-team news remains selectable after hardening',()=>{
