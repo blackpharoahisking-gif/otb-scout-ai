@@ -59,7 +59,7 @@ jobs:
               if HEALTH_JSON="$health_json" node -e '
                 const health = JSON.parse(process.env.HEALTH_JSON);
                 const valid = health.status === "ok"
-                  && health.workerBuild === "v2.22.6-rc5.2.6-club-discovery"
+                  && health.workerBuild === "v2.22.7-rc5.2.7-source-read-contract"
                   && health.schemaVersion === "1.33.0"
                   && health.structuredFeedAvailable === true
                   && !("apiFootballAvailable" in health);
@@ -101,7 +101,7 @@ jobs:
           health_json="$(curl --fail --silent --show-error "$HEALTH_URL")"
           HEALTH_JSON="$health_json" node -e '
             const health = JSON.parse(process.env.HEALTH_JSON);
-            if (health.status !== "ok" || health.workerBuild !== "v2.22.6-rc5.2.6-club-discovery") {
+            if (health.status !== "ok" || health.workerBuild !== "v2.22.7-rc5.2.7-source-read-contract") {
               throw new Error("Scout health check failed after secret removal");
             }
             console.log("Scout remains healthy after secret cleanup.");

@@ -1,4 +1,5 @@
 // OTB Role Intelligence Worker
+// v2.22.7 — RC5.2.7 source-read / evidence-authority contract separation
 // v2.22.6 — RC5.2.6 order-tolerant rich-text extraction
 // v2.22.5 — RC5.2.5 structured short-article acceptance
 // v2.22.4 — RC5.2.4 discovery backfill cleanup
@@ -27,7 +28,7 @@ const SCHEMA_VERSION = '1.33.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.22.6-rc5.2.6-club-discovery';
+const WORKER_BUILD = 'v2.22.7-rc5.2.7-source-read-contract';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -2144,6 +2145,26 @@ function buildRecencySummary(discovery,articleDocs){
   };
 }
 
+// Source retrieval and evidence replacement are deliberately separate states.
+// A scan can read every selected article and still be non-authoritative when
+// the later role-extraction step times out. Keep the replacement safeguard as
+// strict as before while making the retrieval result independently observable.
+function sourceReadState({articleDocuments=0,attempted=0,browserQuotaExhausted=false,aiStatus='not-needed'}={}){
+  const sourceDocumentsRead=Math.max(0,Number(articleDocuments)||0);
+  const sourceDocumentsAttempted=Math.max(0,Number(attempted)||0);
+  const coverage=sourceDocumentsAttempted?sourceDocumentsRead/sourceDocumentsAttempted:0;
+  const sourceCoverageSufficient=sourceDocumentsRead>0
+    && !browserQuotaExhausted
+    && (sourceDocumentsRead>=3||coverage>=0.5);
+  return {
+    sourceDocumentsRead,
+    sourceDocumentsAttempted,
+    coverage,
+    sourceCoverageSufficient,
+    evidenceAuthoritative:aiStatus==='ok'&&sourceCoverageSufficient
+  };
+}
+
 async function scanTeam(env,team,{force=false,profile='foreground'}={}){
   team=String(team||'').toUpperCase();
   const club=CLUB_SOURCES[team];
@@ -2401,23 +2422,32 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
   // A scan is AUTHORITATIVE only if it read a meaningful share of the articles
   // it set out to read. Reading 1 of 8 because the browser allowance ran out is
   // NOT grounds for clearing evidence that an earlier full scan gathered.
-  const coverage=attempted?articleDocs.length/attempted:0;
-  const evidenceAuthoritative=aiResult.status==='ok'
-    && articleDocs.length>0
-    && !budget.quotaExhausted
-    && (articleDocs.length>=3 || coverage>=0.5);
+  const {
+    sourceDocumentsRead,
+    sourceDocumentsAttempted,
+    coverage,
+    sourceCoverageSufficient,
+    evidenceAuthoritative
+  }=sourceReadState({
+    articleDocuments:articleDocs.length,
+    attempted,
+    browserQuotaExhausted:budget.quotaExhausted,
+    aiStatus:aiResult.status
+  });
   const maxCarryMs=Math.max(1,Number(env.MAX_CARRY_DAYS)||7)*86400000;
+
+  const nonAuthoritativeReason=sourceCoverageSufficient
+    ? `Role extraction was not authoritative (${aiResult.status}) after reading ${sourceDocumentsRead} of ${sourceDocumentsAttempted} current article document(s)`
+    : budget.quotaExhausted
+      ? `The Browser Run daily allowance was exhausted after reading ${sourceDocumentsRead} of ${sourceDocumentsAttempted} article document(s)`
+      : `Source coverage was incomplete (${sourceDocumentsRead} of ${sourceDocumentsAttempted} article document(s) read)`;
 
   let finalEvents=scanEvents;
   let evidenceGeneratedAt=new Date().toISOString();
   let evidenceCarriedForward=false;
   let evidenceNote=evidenceAuthoritative
     ? `Evidence derived from ${articleDocs.length} of ${attempted} article document(s) read in this scan.`
-    : (aiResult.status!=='ok'&&aiResult.status!=='not-needed'
-        ? `Role extraction was not authoritative (${aiResult.status}); confirmed club transactions were still processed deterministically.`
-        : budget.quotaExhausted
-        ? 'The Browser Run daily allowance was exhausted during this scan, so coverage was incomplete.'
-        : `This scan read only ${articleDocs.length} of ${attempted} article document(s).`);
+    : `${nonAuthoritativeReason}; confirmed club transactions were still processed deterministically.`;
 
   if(!evidenceAuthoritative){
     const prior=await env.ROLE_KV.get(cacheKey,'json');
@@ -2442,12 +2472,12 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       evidenceCarriedForward=true;
       const ageDays=Math.floor((Date.now()-anchor)/86400000);
       const dropped=priorEvents.length-stillValid.length;
-      evidenceNote=`Coverage was incomplete, so ${stillValid.length} evidence item(s) from ${ageDays} day(s) ago were retained rather than cleared`
+      evidenceNote=`${nonAuthoritativeReason}, so ${stillValid.length} evidence item(s) from ${ageDays} day(s) ago were retained rather than cleared`
         +(dropped?`; ${dropped} were dropped because the player is no longer in the club's FPL roster.`:'.');
     }else if(priorEvents.length){
       evidenceNote=withinCarryWindow
-        ? 'Coverage was incomplete, and no previous evidence remained valid against the current roster.'
-        : 'Coverage was incomplete, and the previous evidence has aged out of the carry-forward window.';
+        ? `${nonAuthoritativeReason}, and no previous evidence remained valid against the current roster.`
+        : `${nonAuthoritativeReason}, and the previous evidence has aged out of the carry-forward window.`;
     }
   }
 
@@ -2470,6 +2500,9 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
     evidenceGeneratedAt,
     evidenceCarriedForward,
     evidenceNote,
+    sourceDocumentsRead,
+    sourceDocumentsAttempted,
+    sourceCoverageSufficient,
     sourcesScanned:[...new Set([...useful.map(d=>d.url),...(structuredFeed.sources||[])])],
     // sourceErrors stays reserved for conditions worth surfacing in the UI —
     // the frontend styles the panel 'warn' whenever this array is non-empty.
@@ -2485,6 +2518,9 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       documentsRead:retrieved.length,      // retained for frontend compatibility
       documentsUsed:useful.length,
       articleDocuments:articleDocs.length,
+      sourceDocumentsRead,
+      sourceDocumentsAttempted,
+      sourceCoverageSufficient,
       browserFallbackUsed,
       browserCalls:budget.browserCalls,
       browserBudget:budget.browserMax,
@@ -3193,7 +3229,18 @@ export default {
           generatedAt:report.generatedAt||null,
           cache:report.cache||null,
           summary:{
-            candidates:d.candidates||0,articleDocuments:d.articleDocuments||0,
+            candidates:d.candidates||0,
+            attempted:d.attempted||report.sourceDocumentsAttempted||0,
+            articleDocuments:d.articleDocuments||0,
+            sourceDocumentsRead:report.sourceDocumentsRead??d.sourceDocumentsRead??d.articleDocuments??0,
+            sourceCoverageSufficient:report.sourceCoverageSufficient??d.sourceCoverageSufficient??null,
+            evidenceAuthoritative:report.evidenceAuthoritative!==false,
+            evidenceCarriedForward:report.evidenceCarriedForward===true,
+            aiStatus:d.aiStatus||null,
+            aiError:d.aiError||null,
+            documentsRead:d.documentsRead||0,
+            documentsUsed:d.documentsUsed||0,
+            browserCalls:d.browserCalls||0,
             cacheHits:d.cacheHits||0,newCandidates:d.newCandidates||0,
             cachedCandidates:d.cachedCandidates||0,
             recencySource:d.recencySource||null,

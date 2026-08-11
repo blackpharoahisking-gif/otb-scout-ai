@@ -5,16 +5,38 @@ import test from 'node:test';
 
 const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
   .replace(/export default\s*\{/, 'const workerDefault = {')
-  +'\n;globalThis.__discoveryTest={CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks,fetchedArticleUsable};';
+  +'\n;globalThis.__discoveryTest={CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks,fetchedArticleUsable,sourceReadState};';
 const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto};
 vm.createContext(context);
 vm.runInContext(source,context,{filename:'worker.js'});
-const {CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks,fetchedArticleUsable}=context.__discoveryTest;
+const {CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks,fetchedArticleUsable,sourceReadState}=context.__discoveryTest;
 
 test('all 20 clubs use the shared discovery pipeline',()=>{
   assert.equal(Object.keys(CLUB_SOURCES).length,20);
   assert.equal(CLUB_SOURCES.BHA.urls[0],'https://www.brightonandhovealbion.com/latest-news-men');
   assert.equal(CLUB_SOURCES.TOT.urls[0],'https://www.tottenhamhotspur.com/teams/mens/latest');
+});
+
+test('source reads remain visible when later role extraction is non-authoritative',()=>{
+  const timedOut=sourceReadState({
+    articleDocuments:8,
+    attempted:8,
+    browserQuotaExhausted:false,
+    aiStatus:'timeout'
+  });
+  assert.equal(timedOut.sourceDocumentsRead,8);
+  assert.equal(timedOut.sourceCoverageSufficient,true);
+  assert.equal(timedOut.evidenceAuthoritative,false);
+
+  const noSources=sourceReadState({
+    articleDocuments:0,
+    attempted:8,
+    browserQuotaExhausted:false,
+    aiStatus:'ok'
+  });
+  assert.equal(noSources.sourceDocumentsRead,0);
+  assert.equal(noSources.sourceCoverageSufficient,false);
+  assert.equal(noSources.evidenceAuthoritative,false);
 });
 
 test('JSON-LD ItemList URLs and dates become article signals',()=>{
