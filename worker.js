@@ -1,4 +1,5 @@
 // OTB Role Intelligence Worker
+// v2.22.3 — RC5.2.3 Tottenham men's-feed isolation
 // v2.22.2 — RC5.2.2 structured article-body recovery
 // v2.22.1 — RC5.2.1 all-club discovery relevance follow-up
 // v2.22 — RC5.2.0 all-club official article discovery hardening
@@ -23,7 +24,7 @@ const SCHEMA_VERSION = '1.33.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.22.2-rc5.2.2-club-discovery';
+const WORKER_BUILD = 'v2.22.3-rc5.2.3-club-discovery';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -172,7 +173,10 @@ const CLUB_SOURCES = {
   NEW:{name:'Newcastle United',urls:['https://www.newcastleunited.com/en/news']},
   NFO:{name:'Nottingham Forest',urls:['https://www.nottinghamforest.co.uk/news']},
   SUN:{name:'Sunderland',urls:['https://www.safc.com/news']},
-  TOT:{name:'Tottenham Hotspur',urls:['https://www.tottenhamhotspur.com/news/']}
+  // Tottenham's generic news surface mixes men's and women's cards whose
+  // numeric article URLs do not encode the team. Use the club's own dedicated
+  // men's first-team feed so ambiguous slugs never enter the Scout queue.
+  TOT:{name:'Tottenham Hotspur',urls:['https://www.tottenhamhotspur.com/teams/mens/latest']}
 };
 
 const TEAM_ALIASES = {

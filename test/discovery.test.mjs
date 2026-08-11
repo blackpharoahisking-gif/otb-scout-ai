@@ -14,6 +14,7 @@ const {CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parse
 test('all 20 clubs use the shared discovery pipeline',()=>{
   assert.equal(Object.keys(CLUB_SOURCES).length,20);
   assert.equal(CLUB_SOURCES.BHA.urls[0],'https://www.brightonandhovealbion.com/latest-news-men');
+  assert.equal(CLUB_SOURCES.TOT.urls[0],'https://www.tottenhamhotspur.com/teams/mens/latest');
 });
 
 test('JSON-LD ItemList URLs and dates become article signals',()=>{
