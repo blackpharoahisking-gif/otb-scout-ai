@@ -1,4 +1,5 @@
 // OTB Role Intelligence Worker
+// v2.22 — RC5.2.0 all-club official article discovery hardening
 // v2.21 — RC5.1.1 provider-neutral structured availability feed
 // v2.19 — RC5.0.19 role-constraint guard: friendly evidence normalization and cache migration
 // v2.11 — RC5.0.11 evidence-integrity hardening: source-owned dates, durable transactions, conservative competition mapping
@@ -16,11 +17,11 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.32.0';
+const SCHEMA_VERSION = '1.33.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.21-rc5.1.1-provider-neutral';
+const WORKER_BUILD = 'v2.22-rc5.2.0-club-discovery';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -41,7 +42,10 @@ const MUTABLE_ARTICLE_RE = /(?:team-news|fitness-update|injury-update|press-conf
 // editorial evidence. Keep this list path-segment specific: it surgically
 // excludes legal/corporate boilerplate without changing the ranking of real
 // club news pages.
-const NON_ARTICLE_BOILERPLATE_RE = /(?:^|\/)(?:accessibility(?:-statement)?|msa-statement|modern-slavery(?:-act)?(?:-statement)?|privacy(?:-policy|-notice)?|terms(?:-of-use|-and-conditions)?|conditions-of-use|contact(?:-us)?|legal(?:-notice|-information)?|cookies?(?:-policy|-notice)?|corporate-(?:information|governance)|company-information)(?:\/|$)/i;
+const NON_ARTICLE_BOILERPLATE_RE = /(?:^|\/)(?:accessibility(?:-statement)?|msa-statement|modern-slavery(?:-act)?(?:-statement)?|privacy(?:-policy|-notice|-portal)?|terms(?:-of-use|-and-conditions)?|conditions-of-use|contact(?:-us)?|legal(?:-notice|-information)?|cookies?(?:-policy|-notice)?|corporate-(?:information|governance)|company-(?:information|details)|policies-and-reports|careers?|subscribe|partners?|about-us|club-information|attending-matches)(?:\/|$)/i;
+const NON_ARTICLE_LISTING_RE = /(?:^|\/)(?:listing|category)(?:\/|$)|\/(?:all|latest)-(?:news|stories)(?:\/|$)|\/(?:news|mens-news|club-news|media-article\/news)\/?$/i;
+const NON_ARTICLE_ROSTER_RE = /(?:^|\/)(?:first-team-men-squad|mens-first-team-squad|players|teams|squad)(?:\/|$)/i;
+const NON_ARTICLE_LOW_VALUE_RE = /how-to-watch|(?:^|\/)watch-|watch-live|live-stream|full-90|90-minutes|highlights?|gallery|photos|tv-guide|broadcast|listen-live|quiz|competition-|matchday-guide|where-to-watch|(?:^|[-\/])(?:third-)?kit(?:[-\/]|$)|shirt|retail|merchandise|programmes?|season-pass|tickets?|cup(?:-[a-z0-9]+){0,4}-draw|cup-games-confirmed|draw-details|fixture-details|fixtures?-confirmed|possible-opponents|partnership|sponsor|charity|giveaway|flutter|betting|beer|bratwurst/i;
 
 function isMutableArticleUrl(url){
   try{return MUTABLE_ARTICLE_RE.test(decodeURIComponent(new URL(url).pathname))}
@@ -57,6 +61,10 @@ const CACHE_FORMAT = 'v3';     // extracted article cache; mutable operational U
 const DISCOVERY_LEDGER_MAX = 320;
 const DISCOVERY_LEDGER_VERSION = 'v2';
 const RECENCY_COVERAGE_MIN = 0.25;
+const DISCOVERY_CANDIDATE_FLOOR = 6;
+const SITEMAP_CACHE_SECONDS = 6*60*60;
+const SITEMAP_MAX_BYTES = 4*1024*1024;
+const SITEMAP_MAX_LINKS = 240;
 
 /* ---------------------------------------------------------------- storage */
 
@@ -144,7 +152,10 @@ const CLUB_SOURCES = {
   AVL:{name:'Aston Villa',urls:['https://www.avfc.co.uk/news/']},
   BOU:{name:'Bournemouth',urls:['https://www.afcb.co.uk/news/']},
   BRE:{name:'Brentford',urls:['https://www.brentfordfc.com/en/news']},
-  BHA:{name:'Brighton',urls:['https://www.brightonandhovealbion.com/pages/en/media-article/news']},
+  // Brighton's generic news route mixes men's, women's and academy content.
+  // The men's feed is the official first-team surface and exposes structured
+  // article records even when it does not render article anchors server-side.
+  BHA:{name:'Brighton',urls:['https://www.brightonandhovealbion.com/latest-news-men']},
   CHE:{name:'Chelsea',urls:['https://www.chelseafc.com/en/news']},
   COV:{name:'Coventry City',urls:['https://www.ccfc.co.uk/news/']},
   CRY:{name:'Crystal Palace',urls:['https://www.cpfc.co.uk/news/']},
@@ -274,7 +285,7 @@ function normal(s){return cleanText(s).toLowerCase().normalize('NFD').replace(/[
 function isMensFirstTeamSource(url,text=''){
   const u=String(url||'').toLowerCase();
   const t=normal(text||'');
-  if(/\/women(?:\/|$)|\/womens(?:\/|$)|women-|womens-|women_|\/academy(?:\/|$)|academy-|\/u21(?:\/|$)|\/u18(?:\/|$)|\/under-21|\/under-18|girls|ladies/.test(u))return false;
+  if(/(?:^|[-_/])(?:women'?s?|academy|[mw]?u21s?|[mw]?u18s?|[mw]?u19s?|[mw]?u23s?|under-21s?|under-18s?|under-23s?|girls?|ladies|lioness(?:es)?)(?:[-_/]|$)/.test(u))return false;
   if(/\bwomen'?s team\b|\bwomen'?s first team\b|\bwomen'?s side\b|\bgirls'? academy\b|\bacademy side\b|\bunder-23s?\b|\bunder-21s?\b|\bunder-18s?\b|\bu23s?\b|\bu21s?\b|\bu18s?\b|\bladies\b/.test(t))return false;
   return true;
 }
@@ -507,33 +518,103 @@ function extractLinkTimesFromHtml(markup,baseUrl){
   return {times,sources,coverage:uniqueLinks.length?times.size/uniqueLinks.length:0};
 }
 
-/** Some JS-heavy publishers (notably Chelsea) ship their article cards inside
- *  HTML-escaped application state rather than as anchors. Recover those links
- *  without paying for a browser render. Chelsea's card media URL also carries
- *  a Cloudinary version timestamp; it is safe for discovery ordering (not as
- *  an authoritative article publication date) and is labelled accordingly. */
+/** Modern club sites commonly ship article cards in Nuxt/Next/Contentful
+ *  application state instead of anchors. Extract only same-host editorial
+ *  paths and feed them through the normal scorer; structured state never gets
+ *  a bypass around the first-team, boilerplate or listing exclusions. */
+function decodeEmbeddedMarkup(markup){
+  return String(markup||'')
+    .replace(/&quot;/gi,'"').replace(/&#(?:x27|39);/gi,"'").replace(/&amp;/gi,'&')
+    .replace(/\\u002[fF]|\\x2[fF]/g,'/').replace(/\\u003[aA]|\\x3[aA]/g,':')
+    .replace(/\\u0026|\\x26/g,'&').replaceAll('\\/','/');
+}
+function isEditorialDiscoveryPath(path=''){
+  return /(?:^|\/)(?:news|article|articles|story|stories|media-article)(?:\/|$)/i.test(String(path||''));
+}
+function editorialDateFromUrl(url){
+  let path='';try{path=decodeURIComponent(new URL(url).pathname).toLowerCase()}catch{return null}
+  const months={january:0,february:1,march:2,april:3,may:4,june:5,july:6,august:7,september:8,october:9,november:10,december:11,jan:0,feb:1,mar:2,apr:3,jun:5,jul:6,aug:7,sep:8,sept:8,oct:9,nov:10,dec:11};
+  const match=path.match(/\/(20\d{2})\/([a-z]+|\d{1,2})\/(\d{1,2})(?:\/|$)/i);
+  if(!match)return null;
+  const month=/^\d+$/.test(match[2])?Number(match[2])-1:months[match[2]];
+  const year=Number(match[1]),day=Number(match[3]);
+  if(!Number.isInteger(month)||month<0||month>11||day<1||day>31)return null;
+  return Date.UTC(year,month,day);
+}
+function embeddedArticlePrefix(host){
+  // Most publishers expose complete URLs. Brighton's Contentful state exposes
+  // typed Article records as slugs; this is its stable public article route.
+  return host==='brightonandhovealbion.com'?'/media-article/':'';
+}
 function extractEmbeddedArticleCards(markup,baseUrl){
-  const raw=String(markup||'');
-  if(!raw.includes('/news/article/'))return {links:[],times:new Map(),sources:new Map()};
-  const decoded=raw.replace(/&quot;/gi,'"').replace(/&#(?:x27|39);/gi,"'").replace(/&amp;/gi,'&');
-  const links=[],times=new Map(),sources=new Map(),seen=new Set();
-  const re=/"url"\s*:\s*"([^"\\]{2,400})"/g;
+  const raw=String(markup||''),decoded=decodeEmbeddedMarkup(raw);
+  const links=[],times=new Map(),sources=new Map(),seen=new Set(),breakdown={jsonLd:0,urlFields:0,typedSlugs:0};
+  const baseHost=hostOf(baseUrl);
+  const add=(value,source,date=null,index=0)=>{
+    const cleaned=cleanText(String(value||'')).replace(/^['"]|['"]$/g,'');
+    if(!cleaned||cleaned.length>600||/^(?:data|javascript|mailto|tel):/i.test(cleaned))return;
+    let u;try{u=new URL(cleaned,baseUrl)}catch{return}
+    u.hash='';
+    if(!u.protocol.startsWith('http')||hostOf(u.toString())!==baseHost)return;
+    if(!isEditorialDiscoveryPath(u.pathname)||/(?:url\(|[<>{}"'\\])/.test(decodeURIComponent(u.pathname))||/\.(?:jpe?g|png|gif|webp|svg|mp4|webm|pdf|css|js|json|xml)$/i.test(u.pathname))return;
+    const url=u.toString();
+    if(!seen.has(url)&&links.length<SITEMAP_MAX_LINKS){seen.add(url);links.push(url);if(Object.hasOwn(breakdown,source))breakdown[source]++}
+    const parsed=Date.parse(date||'');
+    if(Number.isFinite(parsed)){const prior=times.get(url);if(!Number.isFinite(prior)||parsed>prior){times.set(url,parsed);sources.set(url,source==='jsonLd'?'json-ld':'embedded-article-state')}}
+    // Chelsea embeds a media upload version close to each card. It is useful
+    // for ordering only, and remains explicitly labelled as a fallback.
+    if(!Number.isFinite(times.get(url))&&index){
+      const nearby=decoded.slice(index,index+5000),mediaVersion=nearby.match(/\/image\/upload\/v(\d{10})(?:\/|$)/i);
+      const mediaTime=Number(mediaVersion?.[1]||0)*1000;
+      if(mediaTime>=Date.UTC(2020,0,1)&&mediaTime<=Date.now()+7*86400000){times.set(url,mediaTime);sources.set(url,'embedded-media-version')}
+    }
+  };
+
+  // JSON-LD ItemLists are a high-quality cross-publisher article directory.
+  const ldRe=/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
   let match;
-  while((match=re.exec(decoded))&&links.length<160){
-    const value=match[1].replaceAll('\\/','/');
-    if(!/\/news\/article\//i.test(value))continue;
-    let url;try{url=new URL(value,baseUrl).toString()}catch{continue}
-    if(seen.has(url))continue;seen.add(url);links.push(url);
-    const nearby=decoded.slice(match.index,match.index+5000);
-    const mediaVersion=nearby.match(/\/image\/upload\/v(\d{10})(?:\/|$)/i);
-    if(mediaVersion){
-      const timestamp=Number(mediaVersion[1])*1000;
-      if(timestamp>=Date.UTC(2020,0,1)&&timestamp<=Date.now()+7*86400000){
-        times.set(url,timestamp);sources.set(url,'embedded-media-version');
+  while((match=ldRe.exec(raw))){
+    let data;try{data=JSON.parse(match[1])}catch{continue}
+    const walk=value=>{
+      if(!value)return;
+      if(Array.isArray(value)){value.forEach(walk);return}
+      if(typeof value!=='object')return;
+      const type=Array.isArray(value['@type'])?value['@type'].join(' '):String(value['@type']||'');
+      const date=value.datePublished||value.dateCreated||value.dateModified||null;
+      if(/NewsArticle|Article|BlogPosting|ListItem/i.test(type)){
+        const item=typeof value.item==='object'?value.item:{};
+        add(value.url||value['@id']||(typeof value.item==='string'?value.item:null)||item.url||item['@id']||value.mainEntityOfPage?.url||value.mainEntityOfPage?.['@id'],'jsonLd',date,match.index);
       }
+      for(const child of Object.values(value))if(child&&typeof child==='object')walk(child);
+    };
+    walk(data);
+  }
+
+  // JSON, devalue and assignment-style application state.
+  const fieldRe=/(?:["']?(?:url|href|path|canonicalUrl|articleUrl|webUrl|uri)["']?)\s*[:=]\s*["']([^"']{2,600})["']/gi;
+  while((match=fieldRe.exec(decoded))&&links.length<SITEMAP_MAX_LINKS)add(match[1],'urlFields',null,match.index);
+  const literalRe=/["']((?:https?:\/\/|\/)[^"']{1,580}(?:\/news\/|\/article\/|\/media-article\/)[^"']{1,580})["']/gi;
+  while((match=literalRe.exec(decoded))&&links.length<SITEMAP_MAX_LINKS)add(match[1],'urlFields',null,match.index);
+
+  // Typed Contentful records can expose only a slug. Reconstruct the public
+  // route only for hosts whose own page state establishes that route.
+  const prefix=embeddedArticlePrefix(baseHost);
+  if(prefix){
+    const typedSlugRe=/([A-Za-z_$][\w$]*)\.slug\s*=\s*["']([^"']{2,180})["']\s*;\s*\1\.mediaType\s*=\s*["']Article["']/g;
+    while((match=typedSlugRe.exec(decoded))&&links.length<SITEMAP_MAX_LINKS){
+      const tail=decoded.slice(match.index,match.index+1400);
+      const variable=match[1].replace(/[$]/g,'\\$&');
+      const date=(tail.match(new RegExp(variable+'\\.publishDateTime\\s*=\\s*["\\\']([^"\\\']+)','i'))||[])[1]||null;
+      add(prefix+match[2],'typedSlugs',date,match.index);
+    }
+    const objectSlugRe=/slug\s*:\s*["']([^"']{2,180})["'][\s\S]{0,240}?mediaType\s*:\s*["']Article["']/gi;
+    while((match=objectSlugRe.exec(decoded))&&links.length<SITEMAP_MAX_LINKS){
+      const nearby=decoded.slice(match.index,match.index+700);
+      const date=(nearby.match(/publishDateTime\s*:\s*["']([^"']+)["']/i)||[])[1]||null;
+      add(prefix+match[1],'typedSlugs',date,match.index);
     }
   }
-  return {links,times,sources};
+  return {links,times,sources,breakdown};
 }
 function combineLandingSignals(markup,baseUrl,parsed,recency){
   const embedded=extractEmbeddedArticleCards(markup,baseUrl);
@@ -545,7 +626,7 @@ function combineLandingSignals(markup,baseUrl,parsed,recency){
   const timestampCoverage=coverageLinks.length
     ? coverageLinks.filter(url=>Number.isFinite(times.get(url))).length/coverageLinks.length
     : Number(recency.coverage||0);
-  return {links,times,timeSources,timestampCoverage,embeddedCards:embedded.links.length};
+  return {links,times,timeSources,timestampCoverage,embeddedCards:embedded.links.length,embeddedBreakdown:embedded.breakdown};
 }
 function extractPagePublicationFromHtml(markup,pageUrl=''){
   const html=String(markup||''),hits=[];
@@ -618,7 +699,85 @@ async function fetchPage(url,{etag=null,lastModified=null}={}){
   const recency=extractLinkTimesFromHtml(markup,r.url);
   const landing=combineLandingSignals(markup,r.url,parsed,recency);
   const pageDate=extractPagePublicationFromHtml(markup,r.url);
-  return {url:r.url,text:parsed.text,links:landing.links,times:landing.times,timeSources:landing.timeSources,timestampCoverage:landing.timestampCoverage,embeddedCards:landing.embeddedCards,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,etag:r.headers.get('etag')||null,lastModified:r.headers.get('last-modified')||null,mode:'fetch',status:r.status,redirected:r.url!==url};
+  return {url:r.url,text:parsed.text,links:landing.links,times:landing.times,timeSources:landing.timeSources,timestampCoverage:landing.timestampCoverage,embeddedCards:landing.embeddedCards,embeddedBreakdown:landing.embeddedBreakdown,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,etag:r.headers.get('etag')||null,lastModified:r.headers.get('last-modified')||null,mode:'fetch',status:r.status,redirected:r.url!==url};
+}
+
+/* ----------------------------------------------------- sitemap discovery */
+// Sitemaps are a publisher-maintained directory, not an evidence source. They
+// are consulted only when the normal landing page exposes too few article
+// candidates, cached aggressively, and every URL still passes scoreLink.
+function parseSitemapXml(xml,baseUrl){
+  const body=String(xml||''),rows=[],childSitemaps=[];
+  const decode=value=>String(value||'').replace(/&amp;/gi,'&').replace(/&quot;/gi,'"').trim();
+  let match;
+  const sitemapRe=/<sitemap\b[^>]*>([\s\S]*?)<\/sitemap>/gi;
+  while((match=sitemapRe.exec(body))){
+    const raw=(match[1].match(/<loc\b[^>]*>([\s\S]*?)<\/loc>/i)||[])[1];
+    try{const url=new URL(decode(raw),baseUrl);url.hash='';if(hostOf(url.toString())===hostOf(baseUrl))childSitemaps.push(url.toString())}catch{}
+  }
+  const urlRe=/<url\b[^>]*>([\s\S]*?)<\/url>/gi;
+  while((match=urlRe.exec(body))){
+    const raw=(match[1].match(/<loc\b[^>]*>([\s\S]*?)<\/loc>/i)||[])[1];
+    const date=(match[1].match(/<lastmod\b[^>]*>([\s\S]*?)<\/lastmod>/i)||[])[1]||null;
+    try{
+      const url=new URL(decode(raw),baseUrl);url.hash='';
+      if(hostOf(url.toString())!==hostOf(baseUrl)||!isEditorialDiscoveryPath(url.pathname))continue;
+      const lastmod=Date.parse(decode(date)),urlTime=editorialDateFromUrl(url.toString());
+      const time=Number.isFinite(lastmod)?lastmod:urlTime;
+      rows.push({url:url.toString(),time:Number.isFinite(time)?time:null,timeSource:Number.isFinite(lastmod)?'sitemap:lastmod':(Number.isFinite(urlTime)?'sitemap:url-date':null)});
+    }catch{}
+  }
+  rows.sort((a,b)=>(Number(b.time)||0)-(Number(a.time)||0));
+  return {rows:rows.slice(0,SITEMAP_MAX_LINKS),childSitemaps:[...new Set(childSitemaps)]};
+}
+async function fetchSitemapDocument(url){
+  const response=await fetch(url,{headers:{
+    'User-Agent':'OTB-Scout-AI/1.3 (+FPL research; contact via otb-role-intelligence.workers.dev)',
+    'Accept':'application/xml,text/xml;q=0.9,*/*;q=0.2'
+  },redirect:'follow'});
+  if(!response.ok)throw new Error(`HTTP ${response.status}`);
+  const length=Number(response.headers.get('content-length')||0);
+  if(length>SITEMAP_MAX_BYTES){try{await response.body?.cancel()}catch{}throw new Error(`sitemap exceeds ${SITEMAP_MAX_BYTES} bytes`)}
+  const type=(response.headers.get('content-type')||'').toLowerCase();
+  if(!/(?:xml|text\/plain)/.test(type))throw new Error(`unsupported sitemap content-type: ${type||'unknown'}`);
+  const body=await response.text();
+  if(body.length>SITEMAP_MAX_BYTES)throw new Error(`sitemap exceeds ${SITEMAP_MAX_BYTES} bytes`);
+  return {url:response.url,body};
+}
+async function sitemapSignals(env,baseUrl){
+  const host=hostOf(baseUrl),key=`sitemap-discovery:v2:${host}`;
+  try{
+    const cached=await env.ROLE_KV.get(key,'json');
+    if(Array.isArray(cached?.links))return {
+      links:cached.links,times:new Map(cached.times||[]),sources:new Map(cached.timeSources||[]),
+      cache:'HIT',documents:Number(cached.documents||1),error:null
+    };
+  }catch{}
+  const root=new URL('/sitemap.xml',baseUrl).toString();
+  try{
+    const first=await fetchSitemapDocument(root),parsed=parseSitemapXml(first.body,first.url);
+    let rows=parsed.rows,documents=1;
+    if(!rows.length&&parsed.childSitemaps.length){
+      const ordered=parsed.childSitemaps.slice().sort((a,b)=>{
+        const ar=/news|article|post|story/i.test(a)?0:1,br=/news|article|post|story/i.test(b)?0:1;
+        return ar-br;
+      }).slice(0,2);
+      const children=await Promise.allSettled(ordered.map(fetchSitemapDocument));
+      for(const child of children){
+        if(child.status!=='fulfilled')continue;
+        documents++;
+        rows.push(...parseSitemapXml(child.value.body,child.value.url).rows);
+      }
+      rows.sort((a,b)=>(Number(b.time)||0)-(Number(a.time)||0));
+    }
+    const byUrl=new Map();for(const row of rows)if(!byUrl.has(row.url))byUrl.set(row.url,row);
+    const selected=[...byUrl.values()].slice(0,SITEMAP_MAX_LINKS),links=selected.map(row=>row.url);
+    const timed=selected.filter(row=>Number.isFinite(row.time)),timeRows=timed.map(row=>[row.url,row.time]),timeSources=timed.map(row=>[row.url,row.timeSource||'sitemap:url-date']);
+    try{await env.ROLE_KV.put(key,JSON.stringify({fetchedAt:new Date().toISOString(),documents,links,times:timeRows,timeSources}),{expirationTtl:SITEMAP_CACHE_SECONDS})}catch{}
+    return {links,times:new Map(timeRows),sources:new Map(timeSources),cache:'MISS',documents,error:null};
+  }catch(error){
+    return {links:[],times:new Map(),sources:new Map(),cache:'MISS',documents:0,error:error?.message||String(error)};
+  }
 }
 
 /* ------------------------------------------------------------ Browser Run */
@@ -685,7 +844,7 @@ async function browserRender(env,url,budget){
   const recency=extractLinkTimesFromHtml(markup,url);
   const landing=combineLandingSignals(markup,url,parsed,recency);
   const pageDate=extractPagePublicationFromHtml(markup,url);
-  return {url,text:parsed.text,links:landing.links,times:landing.times,timeSources:landing.timeSources,timestampCoverage:landing.timestampCoverage,embeddedCards:landing.embeddedCards,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,mode:'browser-content',status:200,redirected:false};
+  return {url,text:parsed.text,links:landing.links,times:landing.times,timeSources:landing.timeSources,timestampCoverage:landing.timestampCoverage,embeddedCards:landing.embeddedCards,embeddedBreakdown:landing.embeddedBreakdown,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,mode:'browser-content',status:200,redirected:false};
 }
 
 /* --------------------------------------------------------- article cache */
@@ -783,18 +942,20 @@ function scoreLink(url,host,currentYear){
   let score=0,u;try{u=new URL(url)}catch{return {score:-99,reason:'unparseable'}}
   if(u.hostname.replace(/^www\./,'')!==host)return {score:-99,reason:'off-host'};
   const p=decodeURIComponent(u.pathname).toLowerCase();
+  if(/(?:url\(|[<>{}"'\\])/.test(p))return {score:-99,reason:'malformed-path'};
   if(NON_ARTICLE_BOILERPLATE_RE.test(p))return {score:-99,reason:'boilerplate-path'};
+  if(NON_ARTICLE_LISTING_RE.test(p)||NON_ARTICLE_ROSTER_RE.test(p))return {score:-99,reason:'listing-path'};
+  if(NON_ARTICLE_LOW_VALUE_RE.test(p))return {score:-99,reason:'low-value-path'};
+  if(!isMensFirstTeamSource(url,''))return {score:-99,reason:'non-mens-path'};
   if(/\/news\//.test(p))score+=7;
-  if(/article|story|press|interview|team-news|fitness-update|injury-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|squad|pre-season|preseason|friendly|match-report|injury|contract/.test(p))score+=6;
+  if(/article|story|interview|press-conference|team-news|fitness-update|injury-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|pre-season|preseason|friendly|match-report|injury|contract/.test(p))score+=6;
   if(new RegExp(`/${currentYear}/`).test(p))score+=1;
   if(new RegExp(`/${currentYear-1}/`).test(p))score-=2;
   const depth=p.split('/').filter(Boolean).length;if(depth>=2)score+=1;
   if(/press-conference|injury-update|starting-xi|confirmed-line-up|team-news|squad-news/.test(p))score+=4;
-  if(/how-to-watch|watch-live|live-stream|tv-guide|broadcast|listen-live|quiz|competition-|matchday-guide|where-to-watch/.test(p))score-=20;
-
   // Information-first Scout: pages that are legitimate club content but have
   // negligible first-team/FPL value must not consume the scarce article budget.
-  if(/safeguard|disabled-support|supporters-association|gay-gooners|stadium-access|access-guide|ticketing-guide|membership|community|history|sustainability|advisory-board|local-residents|meeting-and-events|meetings-and-events|hospitality|commercial|foundation/.test(p))score-=24;
+  if(/safeguard|disabled-support|supporters-association|gay-gooners|stadium-access|access-guide|ticketing-guide|membership|community|history|sustainability|advisory-board|local-residents|meeting-and-events|meetings-and-events|hospitality|commercial|partnership|sponsor|charity|foundation/.test(p))score-=24;
 
   if(/privacy|cookie|terms|ticket|shop|store|account|login|register|video|gallery|women|academy|hospitality|commercial|foundation|sitemap|contact/.test(p))score-=12;
   if(/preview|fixtures|highlights|\/watch-|watch--|match-gallery|photos/.test(p))score-=8;
@@ -834,7 +995,7 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
   const freshLane=useTimestamp
     ? eligible.filter(x=>Number.isFinite(x.time)).sort((a,b)=>unseenFirst(a,b)||b.time-a.time||b.score-a.score||a.index-b.index)
     : eligible.slice().sort((a,b)=>unseenFirst(a,b)||a.index-b.index||b.score-a.score);
-  const keywordLane=eligible.slice().sort((a,b)=>unseenFirst(a,b)||b.score-a.score||a.index-b.index);
+  const keywordLane=eligible.slice().sort((a,b)=>unseenFirst(a,b)||(useTimestamp?(Number(b.time)||0)-(Number(a.time)||0):0)||b.score-a.score||a.index-b.index);
 
   const seen=new Set(),chosen=[],add=x=>{if(!x||seen.has(x.url)||chosen.length>=limit)return;seen.add(x.url);chosen.push(x.url)};
 
@@ -842,7 +1003,7 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
   // slugs strongly indicate transfers, loans, availability or first-team role.
   const firstTeamEligible=eligible.filter(x=>isMensFirstTeamSource(x.url,''));
   const priorityLane=firstTeamEligible.filter(x=>/signing|new-signing|joins?|signed|transfer|loan|departure|leaves?|returns?|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|breaking-down|what-will-he-bring|ready-to-be-your/.test(decodeURIComponent(new URL(x.url).pathname).toLowerCase()))
-    .sort((a,b)=>unseenFirst(a,b)||b.score-a.score||a.index-b.index);
+    .sort((a,b)=>unseenFirst(a,b)||(useTimestamp?(Number(b.time)||0)-(Number(a.time)||0):0)||b.score-a.score||a.index-b.index);
 
   const unseenPriority=priorityLane.filter(x=>!x.seen);
   if(unseenPriority.length)add(unseenPriority[0]);
@@ -863,7 +1024,7 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
   pass=`${pass}+${recencySource}${force?'+unprocessed-first':''}`;
 
   const rejected=scored.filter(x=>!seen.has(x.url)).map(x=>({
-    url:x.url,status:x.reason==='off-host'?'rejected-off-host':(x.reason==='boilerplate-path'?'rejected-boilerplate':'rejected-low-score'),
+    url:x.url,status:x.reason==='off-host'?'rejected-off-host':(x.reason==='boilerplate-path'?'rejected-boilerplate':(x.reason==='listing-path'?'rejected-listing':(x.reason==='low-value-path'?'rejected-low-value':(x.reason==='non-mens-path'?'rejected-non-mens':(x.reason==='malformed-path'?'rejected-malformed':'rejected-low-score'))))),
     score:x.score,time:x.time,seen:x.seen,index:x.index
   }));
 
@@ -890,7 +1051,8 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
     source:url,mode:'fetch',linksFound:0,textChars:0,browserUsed:false,
     browserError:null,fetchError:null,timestampCoverage:0,recencyUsed:false,
     staticCandidates:0,staticUnprocessedCandidates:0,
-    embeddedCards:0,
+    embeddedCards:0,embeddedBreakdown:{jsonLd:0,urlFields:0,typedSlugs:0},
+    sitemapUsed:false,sitemapCache:null,sitemapDocuments:0,sitemapLinks:0,sitemapCandidates:0,sitemapError:null,
     dynamicEscalated:false,dynamicEscalationReason:null
   };
   let landing=null;
@@ -903,18 +1065,44 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
     record.source=landing.url;
     record.timestampCoverage=Number(landing.timestampCoverage||0);
     record.embeddedCards=Number(landing.embeddedCards||0);
+    record.embeddedBreakdown=landing.embeddedBreakdown||record.embeddedBreakdown;
   }catch(e){
     record.fetchError=`${e.kind||'error'}: ${e.message}`;
   }
 
   const host=hostOf(landing?.url||url);
   const year=new Date().getUTCFullYear();
-  const staticEligible=(landing?.links||[]).filter(l=>scoreLink(l,host,year).score>1);
-  const candidateCount=staticEligible.length;
-  const staticUnprocessed=staticEligible.filter(l=>!processedUrls.has(l)).length;
+  let staticEligible=(landing?.links||[]).filter(l=>scoreLink(l,host,year).score>1);
+  let candidateCount=staticEligible.length;
+  let staticUnprocessed=staticEligible.filter(l=>!processedUrls.has(l)).length;
   record.candidatesFromFetch=candidateCount;
   record.staticCandidates=candidateCount;
   record.staticUnprocessedCandidates=staticUnprocessed;
+
+  // A same-host sitemap is both cheaper and more deterministic than rendering
+  // a JS shell. Consult it only when the landing/state extractor has too few
+  // candidates, then let the normal scorer and selection lanes decide.
+  if(landing&&candidateCount<DISCOVERY_CANDIDATE_FLOOR){
+    const sitemap=await sitemapSignals(env,landing.url);
+    record.sitemapCache=sitemap.cache;
+    record.sitemapDocuments=sitemap.documents;
+    record.sitemapLinks=sitemap.links.length;
+    record.sitemapError=sitemap.error;
+    if(sitemap.links.length){
+      record.sitemapUsed=true;
+      landing={
+        ...landing,
+        links:[...new Set([...(landing.links||[]),...sitemap.links])],
+        times:new Map([...(landing.times?.entries?.()||[]),...sitemap.times]),
+        timeSources:new Map([...(landing.timeSources?.entries?.()||[]),...sitemap.sources]),
+        timestampCoverage:Math.max(Number(landing.timestampCoverage||0),sitemap.links.length?sitemap.times.size/sitemap.links.length:0)
+      };
+      staticEligible=landing.links.filter(l=>scoreLink(l,hostOf(landing.url),year).score>1);
+      candidateCount=staticEligible.length;
+      staticUnprocessed=staticEligible.filter(l=>!processedUrls.has(l)).length;
+      record.sitemapCandidates=candidateCount-record.staticCandidates;
+    }
+  }
 
   // A manual Fresh Live Scan has a stronger contract than a background fetch.
   // If static HTML yields no new processable URLs OR no usable publication
@@ -923,7 +1111,7 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
   let escalationReason=null;
   if(!landing)escalationReason='static-fetch-failed';
   else if(candidateCount===0)escalationReason='no-static-candidates';
-  else if(landing.text.length<LANDING_MIN_CHARS)escalationReason='static-shell';
+  else if(landing.text.length<LANDING_MIN_CHARS&&candidateCount<DISCOVERY_CANDIDATE_FLOOR)escalationReason='static-shell';
   else if(force&&staticUnprocessed===0)escalationReason='forced-scan-no-unprocessed-links';
   else if(force&&Number(landing.timestampCoverage||0)<RECENCY_COVERAGE_MIN)escalationReason='forced-scan-low-date-coverage';
 
@@ -955,6 +1143,7 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
         record.textChars=landing.text.length;
         record.timestampCoverage=Number(landing.timestampCoverage||0);
         record.embeddedCards=Math.max(record.embeddedCards,Number(landing.embeddedCards||0));
+        record.embeddedBreakdown=rendered.embeddedBreakdown||record.embeddedBreakdown;
 
         const renderedEligible=landing.links.filter(l=>scoreLink(l,hostOf(landing.url),year).score>1);
         record.renderedCandidates=renderedEligible.length;
@@ -1919,6 +2108,7 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
 
   const documents=[];
   const errors=[];
+  const warnings=[];
   const discovery=[];
   const perUrl=[];
   // Start the supplemental feed beside official-site discovery so its bounded
@@ -1966,6 +2156,13 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
         staticCandidates:record.staticCandidates,
         staticUnprocessedCandidates:record.staticUnprocessedCandidates,
         embeddedCards:record.embeddedCards,
+        embeddedBreakdown:record.embeddedBreakdown,
+        sitemapUsed:record.sitemapUsed,
+        sitemapCache:record.sitemapCache,
+        sitemapDocuments:record.sitemapDocuments,
+        sitemapLinks:record.sitemapLinks,
+        sitemapCandidates:record.sitemapCandidates,
+        sitemapError:record.sitemapError,
         renderedCandidates:record.renderedCandidates??null,
         renderedUnprocessedCandidates:record.renderedUnprocessedCandidates??null,
         dynamicEscalated:record.dynamicEscalated,
@@ -1992,7 +2189,7 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
 
       // Explicit diagnostic when scoring admitted nothing — the silent path in v1.2.
       if(!candidates.length){
-        errors.push(`${landing.url}: ${landing.links.length} links discovered, none scored as article candidates`);
+        warnings.push(`${landing.url}: landing loaded, but ${landing.links.length} discovered links produced no first-team article candidates`);
         for(const r of rejected.slice(0,10))perUrl.push({url:r.url,status:r.status,kind:'article',score:r.score,chars:0});
       }
 
@@ -2210,6 +2407,9 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
     // sourceErrors stays reserved for conditions worth surfacing in the UI —
     // the frontend styles the panel 'warn' whenever this array is non-empty.
     sourceErrors:errors.slice(0,10),
+    // Discovery gaps are not network failures. Expose them separately so a
+    // successful landing request is never reported to users as a failed source.
+    discoveryWarnings:warnings.slice(0,10),
     diagnostics:{
       discovery,
       linksFound,
@@ -2283,6 +2483,11 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
 
       dynamicDiscoveryEscalated:discovery.some(d=>d.dynamicEscalated),
       dynamicEscalationReasons:[...new Set(discovery.map(d=>d.dynamicEscalationReason).filter(Boolean))],
+      embeddedArticleCards:discovery.reduce((a,d)=>a+Number(d.embeddedCards||0),0),
+      sitemapDiscoveryUsed:discovery.some(d=>d.sitemapUsed),
+      sitemapLinks:discovery.reduce((a,d)=>a+Number(d.sitemapLinks||0),0),
+      sitemapCandidates:discovery.reduce((a,d)=>a+Number(d.sitemapCandidates||0),0),
+      discoveryWarnings:warnings.slice(0,10),
       staticUnprocessedCandidates:discovery.reduce((a,d)=>a+Number(d.staticUnprocessedCandidates||0),0),
       renderedUnprocessedCandidates:discovery.reduce((a,d)=>a+Number(d.renderedUnprocessedCandidates||0),0),
       perUrl:perUrl.slice(0,60),
@@ -2930,6 +3135,11 @@ export default {
             dynamicEscalationReasons:d.dynamicEscalationReasons||[],
             staticUnprocessedCandidates:d.staticUnprocessedCandidates||0,
             renderedUnprocessedCandidates:d.renderedUnprocessedCandidates||0,
+            embeddedArticleCards:d.embeddedArticleCards||0,
+            sitemapDiscoveryUsed:!!d.sitemapDiscoveryUsed,
+            sitemapLinks:d.sitemapLinks||0,
+            sitemapCandidates:d.sitemapCandidates||0,
+            discoveryWarnings:d.discoveryWarnings||report.discoveryWarnings||[],
             confirmedClubEvents:d.confirmedClubEvents||0,
             acceptedEvents:d.acceptedEvents||0,
             scanExecuted:report.scanExecuted===true,
@@ -2943,6 +3153,14 @@ export default {
             dynamicEscalationReason:x.dynamicEscalationReason,
             staticCandidates:x.staticCandidates,
             staticUnprocessedCandidates:x.staticUnprocessedCandidates,
+            embeddedCards:x.embeddedCards,
+            embeddedBreakdown:x.embeddedBreakdown,
+            sitemapUsed:x.sitemapUsed,
+            sitemapCache:x.sitemapCache,
+            sitemapDocuments:x.sitemapDocuments,
+            sitemapLinks:x.sitemapLinks,
+            sitemapCandidates:x.sitemapCandidates,
+            sitemapError:x.sitemapError,
             renderedCandidates:x.renderedCandidates,
             renderedUnprocessedCandidates:x.renderedUnprocessedCandidates,
             selectedCandidates:x.selectedCandidates,

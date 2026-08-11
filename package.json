@@ -5,6 +5,8 @@
   "description": "Cache-first OTB team role intelligence Worker",
   "main": "worker.js",
   "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "audit:discovery": "node scripts/audit-live-discovery.mjs",
     "deploy": "wrangler deploy",
     "preview": "wrangler versions upload"
   },
