@@ -1,4 +1,5 @@
 // OTB Role Intelligence Worker
+// v2.22.1 — RC5.2.1 all-club discovery relevance follow-up
 // v2.22 — RC5.2.0 all-club official article discovery hardening
 // v2.21 — RC5.1.1 provider-neutral structured availability feed
 // v2.19 — RC5.0.19 role-constraint guard: friendly evidence normalization and cache migration
@@ -21,7 +22,7 @@ const SCHEMA_VERSION = '1.33.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.22-rc5.2.0-club-discovery';
+const WORKER_BUILD = 'v2.22.1-rc5.2.1-club-discovery';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -45,7 +46,7 @@ const MUTABLE_ARTICLE_RE = /(?:team-news|fitness-update|injury-update|press-conf
 const NON_ARTICLE_BOILERPLATE_RE = /(?:^|\/)(?:accessibility(?:-statement)?|msa-statement|modern-slavery(?:-act)?(?:-statement)?|privacy(?:-policy|-notice|-portal)?|terms(?:-of-use|-and-conditions)?|conditions-of-use|contact(?:-us)?|legal(?:-notice|-information)?|cookies?(?:-policy|-notice)?|corporate-(?:information|governance)|company-(?:information|details)|policies-and-reports|careers?|subscribe|partners?|about-us|club-information|attending-matches)(?:\/|$)/i;
 const NON_ARTICLE_LISTING_RE = /(?:^|\/)(?:listing|category)(?:\/|$)|\/(?:all|latest)-(?:news|stories)(?:\/|$)|\/(?:news|mens-news|club-news|media-article\/news)\/?$/i;
 const NON_ARTICLE_ROSTER_RE = /(?:^|\/)(?:first-team-men-squad|mens-first-team-squad|players|teams|squad)(?:\/|$)/i;
-const NON_ARTICLE_LOW_VALUE_RE = /how-to-watch|(?:^|\/)watch-|watch-live|live-stream|full-90|90-minutes|highlights?|gallery|photos|tv-guide|broadcast|listen-live|quiz|competition-|matchday-guide|where-to-watch|(?:^|[-\/])(?:third-)?kit(?:[-\/]|$)|shirt|retail|merchandise|programmes?|season-pass|tickets?|cup(?:-[a-z0-9]+){0,4}-draw|cup-games-confirmed|draw-details|fixture-details|fixtures?-confirmed|possible-opponents|partnership|sponsor|charity|giveaway|flutter|betting|beer|bratwurst/i;
+const NON_ARTICLE_LOW_VALUE_RE = /how-to-watch|(?:^|\/)watch-|watch-live|live-stream|full-90|90-minutes|highlights?|gallery|photos|tv-guide|broadcast|listen-live|quiz|competition-|matchday-guide|where-to-watch|(?:^|[-\/])(?:third-)?kit(?:[-\/]|$)|shirt|retail|merchandise|programmes?|season-pass|tickets?|general-sale|now-on-sale|mascot|supporters?-club|fan-club|fantasy-premier-league-prices|fpl-prices|cup(?:-[a-z0-9]+){0,4}-draw|cup-games-confirmed|draw-details|fixture-details|fixtures?-confirmed|possible-opponents|partnership|sponsor|charity|giveaway|flutter|betting|beer|bratwurst/i;
 
 function isMutableArticleUrl(url){
   try{return MUTABLE_ARTICLE_RE.test(decodeURIComponent(new URL(url).pathname))}
