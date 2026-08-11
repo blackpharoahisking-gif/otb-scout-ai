@@ -1,5 +1,5 @@
 // OTB Role Intelligence Worker
-// v2.20 — RC5.1.0 API-Football structured injury/lineup feed
+// v2.21 — RC5.1.1 provider-neutral structured availability feed
 // v2.19 — RC5.0.19 role-constraint guard: friendly evidence normalization and cache migration
 // v2.11 — RC5.0.11 evidence-integrity hardening: source-owned dates, durable transactions, conservative competition mapping
 //
@@ -16,11 +16,11 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.31.0';
+const SCHEMA_VERSION = '1.32.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.20-rc5.1.0-api-football';
+const WORKER_BUILD = 'v2.21-rc5.1.1-provider-neutral';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -37,6 +37,11 @@ const BACKGROUND_MAX_ARTICLES = 4;
 const ARTICLE_CACHE_DAYS = 45;
 const MUTABLE_CACHE_MINUTES = 90;
 const MUTABLE_ARTICLE_RE = /(?:team-news|fitness-update|injury-update|press-conference|squad-news|starting-xi|confirmed-line-up|line-up|lineup|availability|ruled-out|doubtful|training|matchday-live|live-blog)/i;
+// Relaxed discovery must still reject pages that can never be first-team
+// editorial evidence. Keep this list path-segment specific: it surgically
+// excludes legal/corporate boilerplate without changing the ranking of real
+// club news pages.
+const NON_ARTICLE_BOILERPLATE_RE = /(?:^|\/)(?:accessibility(?:-statement)?|msa-statement|modern-slavery(?:-act)?(?:-statement)?|privacy(?:-policy|-notice)?|terms(?:-of-use|-and-conditions)?|conditions-of-use|contact(?:-us)?|legal(?:-notice|-information)?|cookies?(?:-policy|-notice)?|corporate-(?:information|governance)|company-information)(?:\/|$)/i;
 
 function isMutableArticleUrl(url){
   try{return MUTABLE_ARTICLE_RE.test(decodeURIComponent(new URL(url).pathname))}
@@ -778,6 +783,7 @@ function scoreLink(url,host,currentYear){
   let score=0,u;try{u=new URL(url)}catch{return {score:-99,reason:'unparseable'}}
   if(u.hostname.replace(/^www\./,'')!==host)return {score:-99,reason:'off-host'};
   const p=decodeURIComponent(u.pathname).toLowerCase();
+  if(NON_ARTICLE_BOILERPLATE_RE.test(p))return {score:-99,reason:'boilerplate-path'};
   if(/\/news\//.test(p))score+=7;
   if(/article|story|press|interview|team-news|fitness-update|injury-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|squad|pre-season|preseason|friendly|match-report|injury|contract/.test(p))score+=6;
   if(new RegExp(`/${currentYear}/`).test(p))score+=1;
@@ -857,7 +863,7 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
   pass=`${pass}+${recencySource}${force?'+unprocessed-first':''}`;
 
   const rejected=scored.filter(x=>!seen.has(x.url)).map(x=>({
-    url:x.url,status:x.reason==='off-host'?'rejected-off-host':'rejected-low-score',
+    url:x.url,status:x.reason==='off-host'?'rejected-off-host':(x.reason==='boilerplate-path'?'rejected-boilerplate':'rejected-low-score'),
     score:x.score,time:x.time,seen:x.seen,index:x.index
   }));
 
@@ -1434,303 +1440,159 @@ async function loadDepartureEvidence(env,team){
   }));
 }
 
-/* --------------------------------------- RC5.1.0 structured football feed */
+/* -------------------------------- provider-neutral structured football feed */
 
-/* API-Football is a supplemental, structured source. It never replaces the
-   official-club scanner and it never infers a role, beneficiary or competitor.
-   It contributes only facts the feed states directly:
-   - a current FPL player is listed as unavailable/suspended for a fixture;
-   - a current FPL player is listed in a confirmed start XI or on the bench.
+/* Structured providers are supplemental adapters. They can state direct
+   availability or confirmed lineup facts for the same FPL player, but they
+   never infer tactical roles, beneficiaries, competitors, role probabilities
+   or xMin. Provider failures are isolated and a failed refresh never replaces
+   a previously valid cached feed.
 
-   The directness rules above preserve the RC5.0.19 role-constraint guard. A
-   provider position (G/D/M/F) is intentionally NOT translated into one of the
-   tactical ROLE_VALUES, and friendly lineups still pass through the existing
-   friendly-evidence normalizer before they can reach the response contract. */
-const API_FOOTBALL_HOST='https://v3.football.api-sports.io';
-const API_FOOTBALL_PROVIDER='api-football-v3.9.3';
-const API_FOOTBALL_DEFAULT_LEAGUE=39; // Premier League; stable provider ID
-const API_FOOTBALL_CACHE_TTL=60*60*24*7;
+   RC5.1.1 intentionally starts with the official FPL bootstrap already used
+   for roster identity. FotMob, RotoWire and Sofascore were technically
+   prototyped but are not production adapters because their published terms
+   prohibit automated extraction. A licensed adapter can be added to the
+   registry below without changing normalization or scan/carry-forward logic. */
+const STRUCTURED_FEED_VERSION='provider-neutral-v1';
+const STRUCTURED_FEED_CACHE_TTL=60*60*24*14;
+const STRUCTURED_PROVIDER_CATALOG=Object.freeze([
+  Object.freeze({id:'fpl-bootstrap',version:'bootstrap-static-v1',capabilities:['availability'],authority:'official-current-state'})
+]);
 
-function apiFootballSeason(env,now=Date.now()){
-  const configured=String(env.API_FOOTBALL_SEASON||env.SEASON||'').match(/\b(20\d{2})\b/);
-  if(configured)return Number(configured[1]);
-  const d=new Date(now);
-  return d.getUTCMonth()>=6?d.getUTCFullYear():d.getUTCFullYear()-1;
-}
-function apiFootballLeague(env){
-  const n=Number(env.API_FOOTBALL_LEAGUE_ID);
-  return Number.isInteger(n)&&n>0?n:API_FOOTBALL_DEFAULT_LEAGUE;
-}
-function apiFootballDailyCap(env){
-  const n=Number(env.API_FOOTBALL_DAILY_CAP);
-  return Number.isFinite(n)&&n>=0?n:40;
-}
-function apiFootballRefreshMinutes(env,kind){
-  const key=kind==='injuries'?'API_FOOTBALL_INJURY_REFRESH_MINUTES':'API_FOOTBALL_FIXTURE_REFRESH_MINUTES';
-  const n=Number(env[key]);
-  if(Number.isFinite(n)&&n>0)return n;
-  return kind==='injuries'?240:360; // provider updates injuries every four hours
-}
-function apiFootballIsoDate(ms){return new Date(ms).toISOString().slice(0,10)}
-function apiFootballErrorText(errors){
-  if(Array.isArray(errors))return errors.map(cleanText).filter(Boolean).join('; ');
-  if(errors&&typeof errors==='object')return Object.entries(errors).map(([k,v])=>`${k}: ${cleanText(v)}`).join('; ');
-  return cleanText(errors);
-}
-function apiFootballSource(endpoint,params={}){
-  const q=new URLSearchParams();
-  for(const [k,v] of Object.entries(params))if(v!==null&&v!==undefined&&v!=='')q.set(k,String(v));
-  const query=q.toString();
-  return `${API_FOOTBALL_HOST}${endpoint}${query?`?${query}`:''}`;
-}
-function apiFootballRateLimit(headers){return {
-  dailyRemaining:headers.get('x-ratelimit-requests-remaining'),
-  minuteRemaining:headers.get('x-ratelimit-remaining')
-}}
+function structuredFeedCacheKey(team){return 'structured-feed:v2:'+team}
 
-async function reserveApiFootballCall(env){
-  const cap=apiFootballDailyCap(env);
-  const day=new Date().toISOString().slice(0,10),key=`api-football:calls:${day}`;
-  const used=Number(await env.ROLE_KV.get(key)||0);
-  if(used>=cap)return {allowed:false,used,cap};
-  await env.ROLE_KV.put(key,String(used+1),{expirationTtl:172800});
-  return {allowed:true,used:used+1,cap};
-}
-
-async function apiFootballRequest(env,endpoint,params={}){
-  if(!env.API_FOOTBALL_KEY)return {status:'disabled',error:'API_FOOTBALL_KEY not configured'};
-  const allowance=await reserveApiFootballCall(env);
-  if(!allowance.allowed)return {status:'capped',error:`API-Football daily cap of ${allowance.cap} reached`,allowance};
-  const url=apiFootballSource(endpoint,params);
-  const timeout=Math.max(2000,Math.min(20000,Number(env.API_FOOTBALL_TIMEOUT_MS)||8000));
-  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeout);
-  let res;
-  try{
-    res=await fetch(url,{headers:{accept:'application/json','x-apisports-key':env.API_FOOTBALL_KEY},signal:controller.signal});
-  }catch(e){
-    return {status:'error',stage:'fetch',error:e?.name==='AbortError'?`API-Football timed out after ${timeout}ms`:(e?.message||String(e)),allowance};
-  }finally{clearTimeout(timer)}
-  const rateLimit=apiFootballRateLimit(res.headers);
-  if(!res.ok)return {status:'error',stage:'http',httpStatus:res.status,error:`API-Football HTTP ${res.status}`,rateLimit,allowance};
-  let body;
-  try{body=await res.json()}
-  catch(e){return {status:'error',stage:'parse',error:e?.message||'invalid JSON',rateLimit,allowance}}
-  const providerError=apiFootballErrorText(body?.errors);
-  if(providerError)return {status:'error',stage:'provider',error:providerError.slice(0,500),rateLimit,allowance};
-  if(!Array.isArray(body?.response))return {status:'error',stage:'shape',error:'API-Football response is not an array',rateLimit,allowance};
-  return {status:'ok',records:body.response,paging:body.paging||{current:1,total:1},results:Number(body.results)||body.response.length,rateLimit,allowance};
-}
-
-async function apiFootballCollection(env,endpoint,params,{maxPages=1}={}){
-  const rows=[];let page=1,total=1,last=null,warning=null;
-  do{
-    const result=await apiFootballRequest(env,endpoint,{...params,page});
-    if(result.status!=='ok'){
-      if(!rows.length)return result;
-      warning=result.error||result.status;
-      break;
-    }
-    last=result;rows.push(...result.records);
-    total=Math.max(1,Number(result.paging?.total)||1);page++;
-  }while(page<=Math.min(total,Math.max(1,maxPages)));
-  return {status:warning?'partial':'ok',records:rows,pagesFetched:page-1,pagesAvailable:total,warning,rateLimit:last?.rateLimit||null};
-}
-
-async function cachedApiFootballCollection(env,{cacheKey,endpoint,params,freshMinutes,maxPages=1,allowRefresh=true}){
-  const cached=await env.ROLE_KV.get(cacheKey,'json');
-  const ageMinutes=cached?Math.max(0,(Date.now()-Date.parse(cached.fetchedAt))/60000):Infinity;
-  if(cached&&ageMinutes<freshMinutes)return {...cached,status:'cached',ageMinutes:Math.round(ageMinutes)};
-  if(!allowRefresh)return cached
-    ? {...cached,status:'stale',ageMinutes:Math.round(ageMinutes),refreshDeferred:true}
-    : {status:'cache-miss',records:[],refreshDeferred:true};
-  const live=await apiFootballCollection(env,endpoint,params,{maxPages});
-  if(['ok','partial'].includes(live.status)){
-    const payload={...live,fetchedAt:new Date().toISOString(),source:apiFootballSource(endpoint,params)};
-    await env.ROLE_KV.put(cacheKey,JSON.stringify(payload),{expirationTtl:API_FOOTBALL_CACHE_TTL});
-    return payload;
+function fplAvailabilityFact(player){
+  const status=String(player?.status||'').toLowerCase();
+  const chanceRaw=player?.chance;
+  const chance=chanceRaw===null||chanceRaw===undefined||chanceRaw===''?null:Number(chanceRaw);
+  if(status==='s')return {type:'suspension',confidence:.99,directAvailability:0,ttlHours:48};
+  if(status==='u'||status==='n'||chance===0)return {type:'unavailable',confidence:.96,directAvailability:0,ttlHours:48};
+  if(status==='i'&&!Number.isFinite(chance))return {type:'unavailable',confidence:.94,directAvailability:0,ttlHours:36};
+  if(status==='i'||status==='d'||(Number.isFinite(chance)&&chance<100)){
+    return {type:'fitness_doubt',confidence:.86,directAvailability:Number.isFinite(chance)?clamp(chance/100,0,1):null,ttlHours:24};
   }
-  return cached
-    ? {...cached,status:'stale',ageMinutes:Math.round(ageMinutes),refreshError:live.error||live.status}
-    : {...live,records:[]};
-}
-
-async function apiFootballBaseFeed(env,{allowRefresh=true,now=Date.now()}={}){
-  if(!env.API_FOOTBALL_KEY)return {status:'disabled',injuries:{records:[]},fixtures:{records:[]},errors:[]};
-  const season=apiFootballSeason(env,now),league=apiFootballLeague(env);
-  const from=apiFootballIsoDate(now-2*86400000),to=apiFootballIsoDate(now+7*86400000);
-  const injuries=await cachedApiFootballCollection(env,{
-    cacheKey:`api-football:injuries:${league}:${season}`,endpoint:'/injuries',
-    params:{league,season,timezone:'UTC'},freshMinutes:apiFootballRefreshMinutes(env,'injuries'),maxPages:4,allowRefresh
-  });
-  const fixtures=await cachedApiFootballCollection(env,{
-    cacheKey:`api-football:fixtures:${league}:${season}:${from}:${to}`,endpoint:'/fixtures',
-    params:{league,season,from,to,timezone:'UTC'},freshMinutes:apiFootballRefreshMinutes(env,'fixtures'),maxPages:2,allowRefresh
-  });
-  const errors=[];
-  for(const [kind,result] of [['injuries',injuries],['fixtures',fixtures]]){
-    const message=result.refreshError||result.error||result.warning;
-    if(message)errors.push(`${kind}: ${message}`);
-  }
-  const hardFailure=['error','capped','cache-miss'].includes(injuries.status)&&['error','capped','cache-miss'].includes(fixtures.status);
-  return {status:hardFailure?'error':(errors.length?'partial':'ok'),season,league,from,to,injuries,fixtures,errors};
-}
-
-function apiFootballTeamCode(team){
-  const exact=TEAM_ALIASES[normal(team?.name)]||TEAM_ALIASES[normal(team?.code)];
-  return exact||marketTeamCode(team?.name)||null;
-}
-function apiFootballFixtureForTeam(row,team){
-  return apiFootballTeamCode(row?.teams?.home)===team||apiFootballTeamCode(row?.teams?.away)===team;
-}
-function apiFootballFixtureTeamId(row,team){
-  for(const side of [row?.teams?.home,row?.teams?.away])if(apiFootballTeamCode(side)===team)return Number(side?.id)||null;
   return null;
 }
-function apiFootballCompetition(row){return cleanText(row?.league?.name)||'Premier League'}
-function apiFootballGameweek(row){
-  const m=String(row?.league?.round||'').match(/(\d+)\s*$/);
-  return m?Number(m[1]):null;
-}
-function apiFootballIsFriendly(row){return /friendl|pre[- ]?season/i.test(`${row?.league?.name||''} ${row?.league?.round||''}`)}
 
-function apiFootballInjuryEvents(team,players,rows,fetchedAt){
-  const events=[],unmatched=[];const fetchedMs=Date.parse(fetchedAt)||Date.now();
-  for(const row of rows||[]){
-    if(apiFootballTeamCode(row?.team)!==team)continue;
-    const subject=cleanText(row?.player?.name);const player=rosterPlayerForSubject(players,subject);
-    if(!player){unmatched.push({kind:'injury',player:subject||null,providerId:row?.player?.id||null});continue}
-    const detail=cleanText(`${row?.type||''} ${row?.reason||''}`);
-    const type=/suspend/i.test(detail)?'suspension':'unavailable';
-    const fixtureId=Number(row?.fixture?.id)||null,kickoff=Date.parse(row?.fixture?.date||'');
-    if(Number.isFinite(kickoff)&&Date.now()-kickoff>12*3600000)continue;
-    const expiresMs=Number.isFinite(kickoff)&&kickoff>fetchedMs
-      ? Math.max(fetchedMs+8*3600000,kickoff+6*3600000)
-      : fetchedMs+8*3600000;
-    const source=apiFootballSource('/injuries',fixtureId?{fixture:fixtureId}:{team:row?.team?.id||''});
+function fplStructuredAvailabilityEvents(team,players,fetchedAt=new Date().toISOString()){
+  const events=[],fetchedMs=Date.parse(fetchedAt)||Date.now();
+  for(const player of players||[]){
+    const fact=fplAvailabilityFact(player);if(!fact)continue;
+    const detail=cleanText(player.news).slice(0,240);
+    const label=fact.type==='suspension'?'suspended':(fact.type==='unavailable'?'unavailable':'a fitness doubt');
     events.push({
-      id:`structured-${hashString([team,type,player.id,fixtureId||'',detail].join('|'))}`,
-      createdAt:fetchedMs,team,type,rawType:type,originType:'api_football_injury',subject:player.name,role:null,
-      affected:player.name,affectedApiId:player.id,structuredPlayerId:Number(row?.player?.id)||null,
-      overlap:1,hierarchy:1,confidence:.96,source,
-      reason:`API-Football lists ${player.name} as not participating${row?.reason?`: ${cleanText(row.reason)}`:''}. No beneficiary or tactical role is inferred.`,
-      evidenceDate:new Date(fetchedMs).toISOString(),evidenceDateSource:API_FOOTBALL_PROVIDER,
-      evidenceClass:'availability',authorityTier:1,sourceAuthority:.94,
-      effectiveFrom:new Date(fetchedMs).toISOString(),expiresAt:new Date(expiresMs).toISOString(),
-      halfLifeHours:96,maxMinuteImpact:90,directImpact:true,preseasonCalibrated:false,
-      verificationStatus:'structured-feed',minutesCap:0,directAvailability:0,selectionCertainty:0,
-      productionImpact:0,fixtureId:fixtureId?String(fixtureId):null,
-      competition:cleanText(row?.league?.name)||null,kickoff:Number.isFinite(kickoff)?new Date(kickoff).toISOString():null,
-      gameweek:apiFootballGameweek(row),auto:true,worker:true,structuredFeed:true,provider:'api-football',oop:false
+      // One identity per provider/player availability lane. If FPL moves a
+      // player from OUT to doubtful, the newer fact replaces the older one
+      // during carry-forward instead of both adjustments being applied.
+      id:'structured-'+hashString([team,'fpl-bootstrap','availability',player.id].join('|')),
+      createdAt:fetchedMs,team,type:fact.type,rawType:fact.type,originType:'structured_fpl_availability',
+      subject:player.name,role:null,affected:player.name,affectedApiId:player.id,structuredPlayerId:null,
+      overlap:1,hierarchy:1,confidence:fact.confidence,source:FPL_BOOTSTRAP,
+      reason:'Fantasy Premier League currently lists '+player.name+' as '+label+(detail?': '+detail:'')+'. No beneficiary or tactical role is inferred.',
+      evidenceDate:new Date(fetchedMs).toISOString(),evidenceDateSource:'fpl-bootstrap-current-state',
+      evidenceClass:'availability',authorityTier:2,sourceAuthority:.9,
+      effectiveFrom:new Date(fetchedMs).toISOString(),expiresAt:new Date(fetchedMs+fact.ttlHours*3600000).toISOString(),
+      halfLifeHours:fact.type==='fitness_doubt'?24:48,maxMinuteImpact:fact.type==='fitness_doubt'?25:90,
+      directImpact:true,preseasonCalibrated:false,verificationStatus:'structured-feed',
+      minutesCap:fact.type==='fitness_doubt'?null:0,directAvailability:fact.directAvailability,
+      selectionCertainty:null,productionImpact:0,fixtureId:null,competition:'Premier League',
+      kickoff:null,gameweek:null,auto:true,worker:true,structuredFeed:true,provider:'fpl-bootstrap',oop:false
     });
   }
-  return {events:mergeRoleEvidence(events),unmatched};
+  return mergeRoleEvidence(events);
 }
 
-function apiFootballLineupCandidate(fixtures,now=Date.now()){
-  const eligible=(fixtures||[]).filter(row=>{
-    const kickoff=Date.parse(row?.fixture?.date||'');if(!Number.isFinite(kickoff))return false;
-    const status=String(row?.fixture?.status?.short||'').toUpperCase();
-    if(['PST','CANC','ABD','AWD','WO'].includes(status))return false;
-    const delta=kickoff-now;
-    return (status==='NS'&&delta<=90*60000&&delta>=-15*60000)
-      ||(status!=='NS'&&delta<=0&&delta>=-36*3600000);
-  });
-  eligible.sort((a,b)=>{
-    const da=Date.parse(a.fixture.date)-now,db=Date.parse(b.fixture.date)-now;
-    const pa=da>=0?Math.abs(da):90*60000+Math.abs(da),pb=db>=0?Math.abs(db):90*60000+Math.abs(db);
-    return pa-pb;
-  });
-  return eligible[0]||null;
-}
-
-async function apiFootballLineups(env,fixture,{allowRefresh=true}={}){
-  const id=Number(fixture?.fixture?.id);if(!id)return {status:'not-applicable',records:[]};
-  const cacheKey=`api-football:lineups:${id}`;const cached=await env.ROLE_KV.get(cacheKey,'json');
-  const ageMinutes=cached?Math.max(0,(Date.now()-Date.parse(cached.fetchedAt))/60000):Infinity;
-  const complete=Array.isArray(cached?.records)&&cached.records.length>=2;
-  const status=String(fixture?.fixture?.status?.short||'').toUpperCase();
-  const freshMinutes=complete?720:(status==='NS'?12:60);
-  if(cached&&ageMinutes<freshMinutes)return {...cached,status:'cached',ageMinutes:Math.round(ageMinutes)};
-  if(!allowRefresh)return cached
-    ? {...cached,status:'stale',ageMinutes:Math.round(ageMinutes),refreshDeferred:true}
-    : {status:'cache-miss',records:[],refreshDeferred:true};
-  const live=await apiFootballCollection(env,'/fixtures/lineups',{fixture:id},{maxPages:1});
-  if(live.status==='ok'){
-    const payload={...live,fetchedAt:new Date().toISOString(),source:apiFootballSource('/fixtures/lineups',{fixture:id})};
-    await env.ROLE_KV.put(cacheKey,JSON.stringify(payload),{expirationTtl:API_FOOTBALL_CACHE_TTL});
-    return payload;
-  }
-  return cached
-    ? {...cached,status:'stale',ageMinutes:Math.round(ageMinutes),refreshError:live.error||live.status}
-    : {...live,records:[]};
-}
-
-function apiFootballLineupEvents(team,players,fixture,lineups,fetchedAt){
-  const events=[],unmatched=[];const targetTeamId=apiFootballFixtureTeamId(fixture,team);
-  const kickoff=Date.parse(fixture?.fixture?.date||''),fetchedMs=Date.parse(fetchedAt)||Date.now();
-  const expiresMs=Number.isFinite(kickoff)?kickoff+30*3600000:fetchedMs+30*3600000;
-  const fixtureId=Number(fixture?.fixture?.id)||null,competition=apiFootballCompetition(fixture);
-  const friendly=apiFootballIsFriendly(fixture),source=apiFootballSource('/fixtures/lineups',{fixture:fixtureId});
-  for(const lineup of lineups||[]){
-    const lineupCode=apiFootballTeamCode(lineup?.team);
-    if(lineupCode!==team&&Number(lineup?.team?.id)!==targetTeamId)continue;
-    for(const [field,type] of [['startXI','confirmed_start'],['substitutes','confirmed_bench']]){
-      for(const item of Array.isArray(lineup?.[field])?lineup[field]:[]){
-        const raw=item?.player||item||{},subject=cleanText(raw.name),player=rosterPlayerForSubject(players,subject);
-        if(!player){unmatched.push({kind:type,player:subject||null,providerId:raw.id||null,fixtureId});continue}
-        let event={
-          id:`structured-${hashString([team,type,player.id,fixtureId||''].join('|'))}`,
-          createdAt:fetchedMs,team,type,rawType:type,sourceType:type,originType:'api_football_lineup',
-          subject:player.name,role:null,affected:player.name,affectedApiId:player.id,structuredPlayerId:Number(raw.id)||null,
-          overlap:1,hierarchy:1,confidence:.98,source,
-          reason:`API-Football lists ${player.name} in the ${type==='confirmed_start'?'starting XI':'substitutes'} for ${competition}. No tactical role is inferred from the provider's coarse position.`,
-          evidenceDate:new Date(fetchedMs).toISOString(),evidenceDateSource:API_FOOTBALL_PROVIDER,
-          evidenceClass:'lineup',authorityTier:1,sourceAuthority:.96,
-          effectiveFrom:new Date(fetchedMs).toISOString(),expiresAt:new Date(expiresMs).toISOString(),
-          halfLifeHours:18,maxMinuteImpact:35,directImpact:true,preseasonCalibrated:friendly,
-          verificationStatus:'structured-feed',minutesCap:null,directAvailability:1,
-          selectionCertainty:type==='confirmed_start'?1:0,productionImpact:0,
-          fixtureId:fixtureId?String(fixtureId):null,competition,
-          kickoff:Number.isFinite(kickoff)?new Date(kickoff).toISOString():null,
-          gameweek:apiFootballGameweek(fixture),auto:true,worker:true,structuredFeed:true,provider:'api-football',oop:false
-        };
-        event=normalizeFriendlyEvidenceEvent(event);events.push(event);
-      }
+const STRUCTURED_PROVIDER_ADAPTERS=Object.freeze([
+  Object.freeze({
+    id:'fpl-bootstrap',version:'bootstrap-static-v1',capabilities:['availability'],
+    enabled:env=>String(env.STRUCTURED_FEED_DISABLED||'')!=='1',
+    async collect({team,players,fetchedAt}){
+      const events=fplStructuredAvailabilityEvents(team,players,fetchedAt);
+      return {
+        status:'ok',events,sources:[FPL_BOOTSTRAP],errors:[],unmatched:[],
+        diagnostics:{availabilityEvents:events.length,lineupEvents:0,requestCount:0}
+      };
     }
-  }
-  return {events:mergeRoleEvidence(events),unmatched};
-}
+  })
+]);
 
-async function structuredFeedForTeam(env,team,players,{profile='foreground',force=false}={}){
-  if(!env.API_FOOTBALL_KEY)return {status:'disabled',enabled:false,events:[],sources:[],errors:[],unmatched:[]};
-  const allowRefresh=force||profile!=='background';
-  const base=await apiFootballBaseFeed(env,{allowRefresh});
-  const teamFixtures=(base.fixtures?.records||[]).filter(row=>apiFootballFixtureForTeam(row,team));
-  const injuries=apiFootballInjuryEvents(team,players,base.injuries?.records||[],base.injuries?.fetchedAt||new Date().toISOString());
-  const fixture=apiFootballLineupCandidate(teamFixtures);
-  const lineupResult=fixture?await apiFootballLineups(env,fixture,{allowRefresh}):{status:'not-due',records:[]};
-  const lineups=fixture
-    ? apiFootballLineupEvents(team,players,fixture,lineupResult.records||[],lineupResult.fetchedAt||new Date().toISOString())
-    : {events:[],unmatched:[]};
-  const errors=[...(base.errors||[])];
-  if(lineupResult.error||lineupResult.refreshError)errors.push(`lineups: ${lineupResult.error||lineupResult.refreshError}`);
-  const events=mergeRoleEvidence([...injuries.events,...lineups.events]);
-  const sources=[...new Set(events.map(e=>e.source).filter(Boolean))];
+async function runStructuredProviders(context,adapters=STRUCTURED_PROVIDER_ADAPTERS){
+  const active=(adapters||[]).filter(adapter=>{
+    try{return typeof adapter?.enabled==='function'?adapter.enabled(context.env)!==false:true}
+    catch{return false}
+  });
+  if(!active.length)return {
+    status:'disabled',enabled:false,feedVersion:STRUCTURED_FEED_VERSION,providers:[],
+    fetchedAt:context.fetchedAt,events:[],sources:[],errors:[],unmatched:[],
+    diagnostics:{providers:[],availabilityEvents:0,lineupEvents:0,requestCount:0}
+  };
+  const results=await Promise.all(active.map(async adapter=>{
+    try{
+      const out=await adapter.collect(context);
+      return {
+        provider:adapter.id,providerVersion:adapter.version,capabilities:adapter.capabilities||[],
+        status:out?.status||'ok',events:Array.isArray(out?.events)?out.events:[],
+        sources:Array.isArray(out?.sources)?out.sources:[],errors:Array.isArray(out?.errors)?out.errors:[],
+        unmatched:Array.isArray(out?.unmatched)?out.unmatched:[],diagnostics:out?.diagnostics||{}
+      };
+    }catch(error){
+      return {
+        provider:adapter.id,providerVersion:adapter.version,capabilities:adapter.capabilities||[],
+        status:'error',events:[],sources:[],unmatched:[],
+        errors:[error?.message||String(error)],diagnostics:{stage:'adapter'}
+      };
+    }
+  }));
+  const errors=results.flatMap(result=>(result.errors||[]).map(error=>result.provider+': '+error));
+  const events=mergeRoleEvidence(results.flatMap(result=>result.events||[]));
+  const providers=results.map(result=>({
+    id:result.provider,version:result.providerVersion,capabilities:result.capabilities,
+    status:result.status,eventCount:result.events.length,diagnostics:result.diagnostics
+  }));
+  const hardFailures=results.filter(result=>result.status==='error').length;
   return {
-    status:base.status==='error'&&!events.length?'error':(errors.length?'partial':'ok'),enabled:true,
-    provider:'api-football',providerVersion:API_FOOTBALL_PROVIDER,season:base.season,league:base.league,
-    fetchedAt:new Date().toISOString(),events,sources,errors,
-    unmatched:[...injuries.unmatched,...lineups.unmatched].slice(0,40),
+    status:hardFailures===results.length&&!events.length?'error':(errors.length||hardFailures?'partial':'ok'),
+    enabled:true,feedVersion:STRUCTURED_FEED_VERSION,providers,
+    fetchedAt:context.fetchedAt,events,
+    sources:[...new Set(results.flatMap(result=>result.sources||[]).filter(Boolean))],
+    errors,unmatched:results.flatMap(result=>result.unmatched||[]).slice(0,40),
     diagnostics:{
-      injuryFeedStatus:base.injuries?.status||null,fixtureFeedStatus:base.fixtures?.status||null,
-      lineupFeedStatus:lineupResult.status||null,injuryRows:(base.injuries?.records||[]).length,
-      teamFixtures:teamFixtures.length,injuryEvents:injuries.events.length,lineupEvents:lineups.events.length,
-      fixtureId:fixture?.fixture?.id||null,
-      rateLimit:lineupResult.rateLimit||base.injuries?.rateLimit||base.fixtures?.rateLimit||null
+      providers,
+      availabilityEvents:events.filter(event=>event.evidenceClass==='availability').length,
+      lineupEvents:events.filter(event=>event.evidenceClass==='lineup').length,
+      requestCount:results.reduce((sum,result)=>sum+Number(result.diagnostics?.requestCount||0),0)
     }
   };
 }
 
+async function structuredFeedForTeam(env,team,players,{profile='foreground',force=false}={}){
+  const fetchedAt=new Date().toISOString();
+  const result=await runStructuredProviders({env,team,players,profile,force,fetchedAt});
+  // A provider outage must never overwrite the last valid normalized feed.
+  if(result.status!=='error'){
+    try{await env.ROLE_KV.put(structuredFeedCacheKey(team),JSON.stringify(result),{expirationTtl:STRUCTURED_FEED_CACHE_TTL})}catch{}
+  }
+  return result;
+}
+
+async function cachedStructuredFeedForTeam(env,team){
+  const cached=await env.ROLE_KV.get(structuredFeedCacheKey(team),'json');
+  if(!cached)return {
+    status:'cache-miss',enabled:true,feedVersion:STRUCTURED_FEED_VERSION,
+    providers:STRUCTURED_PROVIDER_CATALOG,events:[],sources:[],errors:[],unmatched:[],
+    diagnostics:{cache:'MISS',providers:[],availabilityEvents:0,lineupEvents:0,requestCount:0}
+  };
+  const fetchedMs=Date.parse(cached.fetchedAt||'');
+  const ageMinutes=Number.isFinite(fetchedMs)?Math.max(0,(Date.now()-fetchedMs)/60000):null;
+  const events=(Array.isArray(cached.events)?cached.events:[]).filter(event=>{
+    const expiry=Date.parse(event?.expiresAt||'');
+    return !Number.isFinite(expiry)||expiry>Date.now();
+  });
+  return {
+    ...cached,status:'cached',events,cache:'HIT',ageMinutes:ageMinutes===null?null:Math.round(ageMinutes),
+    diagnostics:{...(cached.diagnostics||{}),cache:'HIT',ageMinutes:ageMinutes===null?null:Math.round(ageMinutes)}
+  };
+}
 /* ------------------------------------------------------------- extraction */
 
 function extractionSchema(){return {
@@ -2063,7 +1925,7 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
   // network wait does not extend the scan's critical path. A provider failure
   // is captured as diagnostics and can never clear official or carried evidence.
   const structuredFeedPromise=structuredFeedForTeam(env,team,roster.current.players,{profile,force}).catch(e=>({
-    status:'error',enabled:!!env.API_FOOTBALL_KEY,provider:'api-football',events:[],sources:[],unmatched:[],
+    status:'error',enabled:true,feedVersion:STRUCTURED_FEED_VERSION,providers:[],events:[],sources:[],unmatched:[],
     errors:[e?.message||String(e)],diagnostics:{stage:'unexpected'}
   }));
   const priorProcessed=await loadDiscoveryLedger(env,team);
@@ -2265,7 +2127,7 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
   const structuredFeed=await structuredFeedPromise;
   const structuredEvents=Array.isArray(structuredFeed.events)?structuredFeed.events:[];
   if(['error','partial'].includes(structuredFeed.status)){
-    for(const error of structuredFeed.errors||[])errors.push(`API-Football: ${error}`);
+    for(const error of structuredFeed.errors||[])errors.push(`Structured feed: ${error}`);
   }
   const scanEvents=mergeRoleEvidence([...modelEvents,...departureEvents,...structuredEvents]);
 
@@ -2325,7 +2187,7 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
     }
   }
 
-  if(structuredEvents.length)evidenceNote+=` API-Football contributed ${structuredEvents.length} direct structured event(s); no tactical role or beneficiary was inferred.`;
+  if(structuredEvents.length)evidenceNote+=` The structured feed contributed ${structuredEvents.length} direct event(s); no tactical role or beneficiary was inferred.`;
 
   try{await saveDiscoveryLedger(env,team,[...priorProcessed,...processedThisScan])}catch{}
 
@@ -2378,8 +2240,9 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       confirmedDepartureGuards:departureEvents.length,
       structuredFeedStatus:structuredFeed.status,
       structuredEvents:structuredEvents.length,
-      structuredInjuryEvents:structuredFeed.diagnostics?.injuryEvents||0,
+      structuredAvailabilityEvents:structuredFeed.diagnostics?.availabilityEvents||0,
       structuredLineupEvents:structuredFeed.diagnostics?.lineupEvents||0,
+      structuredProviders:structuredFeed.providers||[],
       structuredFeedErrors:(structuredFeed.errors||[]).slice(0,10),
       structuredFeedUnmatched:(structuredFeed.unmatched||[]).slice(0,40),
       structuredFeed:structuredFeed.diagnostics||{},
@@ -2961,7 +2824,7 @@ export default {
     env = await withD1(env);
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
-      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:WORKER_BUILD,schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,apiFootballAvailable:!!env.API_FOOTBALL_KEY,generatedAt:new Date().toISOString()},200,env);
+      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:WORKER_BUILD,schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,structuredFeedAvailable:String(env.STRUCTURED_FEED_DISABLED||'')!=='1',structuredFeedVersion:STRUCTURED_FEED_VERSION,structuredFeedProviders:STRUCTURED_PROVIDER_CATALOG,generatedAt:new Date().toISOString()},200,env);
       // Derived team numbers for the projection engine. Public and
       // read-only: it never triggers a fetch, so it cannot burn credits.
       if(u.pathname==='/api/market/teams'){
@@ -2972,16 +2835,17 @@ export default {
       }
       if(!originAllowed(request,env))return json({status:'error',error:'origin not allowed'},403,env);
 
-      // Cache-only by default so an Engine read can never spend provider quota.
-      // An admin may add ?fresh=1 (or ?force=1) to refresh the structured feed.
+      // Cache-only by default so an Engine read can never trigger an external
+      // request. An admin may add ?fresh=1 (or ?force=1) to rebuild the feed.
       if(u.pathname==='/api/scout/structured-feed'){
         const team=String(u.searchParams.get('team')||'').toUpperCase();
         if(!team)return json({status:'error',error:'team is required'},400,env);
         if(!CLUB_SOURCES[team])return json({status:'error',error:`unsupported team code: ${team}`},400,env);
         const force=u.searchParams.get('fresh')==='1'||u.searchParams.get('force')==='1';
         if(force&&!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
-        const roster=await fplContext(env,team);
-        const result=await structuredFeedForTeam(env,team,roster.current.players,{profile:force?'foreground':'background',force});
+        const result=force
+          ? await fplContext(env,team).then(roster=>structuredFeedForTeam(env,team,roster.current.players,{profile:'foreground',force:true}))
+          : await cachedStructuredFeedForTeam(env,team);
         return json({team,generatedAt:new Date().toISOString(),...result},200,env);
       }
       if(u.pathname==='/api/scout/structured-sync'&&request.method==='POST'){
