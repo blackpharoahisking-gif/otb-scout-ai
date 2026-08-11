@@ -5,11 +5,11 @@ import test from 'node:test';
 
 const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
   .replace(/export default\s*\{/, 'const workerDefault = {')
-  +'\n;globalThis.__discoveryTest={CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks};';
+  +'\n;globalThis.__discoveryTest={CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks,fetchedArticleUsable};';
 const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto};
 vm.createContext(context);
 vm.runInContext(source,context,{filename:'worker.js'});
-const {CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks}=context.__discoveryTest;
+const {CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks,fetchedArticleUsable}=context.__discoveryTest;
 
 test('all 20 clubs use the shared discovery pipeline',()=>{
   assert.equal(Object.keys(CLUB_SOURCES).length,20);
@@ -54,6 +54,12 @@ test('typed SSR article state yields the requested body without related-card ble
   assert.match(out.text,/manager confirmed/);
   assert.doesNotMatch(out.text,/RELATED BODY/);
   assert.equal(out.publishedAt,Date.parse('2026-08-10T06:30+01:00'));
+});
+
+test('verified structured article state accepts legitimate short notices',()=>{
+  assert.equal(fetchedArticleUsable({mode:'fetch-embedded-state',text:'x'.repeat(250)}),true);
+  assert.equal(fetchedArticleUsable({mode:'fetch',text:'x'.repeat(899)}),false);
+  assert.equal(fetchedArticleUsable({mode:'fetch',text:'x'.repeat(900)}),true);
 });
 
 test('sitemap discovery keeps same-host editorial URLs and lastmod order',()=>{

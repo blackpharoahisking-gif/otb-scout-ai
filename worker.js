@@ -1,4 +1,5 @@
 // OTB Role Intelligence Worker
+// v2.22.5 — RC5.2.5 structured short-article acceptance
 // v2.22.4 — RC5.2.4 discovery backfill cleanup
 // v2.22.3 — RC5.2.3 Tottenham men's-feed isolation
 // v2.22.2 — RC5.2.2 structured article-body recovery
@@ -25,7 +26,7 @@ const SCHEMA_VERSION = '1.33.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.22.4-rc5.2.4-club-discovery';
+const WORKER_BUILD = 'v2.22.5-rc5.2.5-club-discovery';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -1216,6 +1217,16 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
 
 /* ---------------------------------------------------------- article reading */
 
+function fetchedArticleUsable(page){
+  if(!page?.text)return false;
+  if(page.text.length>=ARTICLE_MIN_CHARS)return true;
+  // Assignment-style SSR state is the publisher's typed article record, not
+  // an unverified page shell. Short transfer notices are legitimately below
+  // 900 characters, so accept them at the normal evidence floor instead of
+  // spending Browser calls that can only return the surrounding shared shell.
+  return page.mode==='fetch-embedded-state'&&page.text.length>=AI_MIN_DOC_CHARS;
+}
+
 async function readArticle(env,url,budget,{force=false}={}){
   const entry={url,status:'pending',mode:null,chars:0,httpStatus:null,error:null,browserUsed:false,cached:false,revalidated:false,mutable:isMutableArticleUrl(url)};
   let hit=null;
@@ -1239,7 +1250,7 @@ async function readArticle(env,url,budget,{force=false}={}){
       return {doc:{url,text:hit.text,mode:'cache-revalidated',status:200,publishedAt:hit.publishedAt||null,dateSource:hit.dateSource||null,etag:refreshed.etag,lastModified:refreshed.lastModified},entry};
     }
     entry.httpStatus=page.status;entry.mode=page.mode;entry.chars=page.text.length;
-    if(page.text.length>=ARTICLE_MIN_CHARS){
+    if(fetchedArticleUsable(page)){
       entry.status='accepted';entry.publishedAt=page.publishedAt||null;entry.dateSource=page.dateSource||null;
       await storeArticle(env,url,page);
       return {doc:page,entry};
