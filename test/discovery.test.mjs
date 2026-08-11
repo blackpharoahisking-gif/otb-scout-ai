@@ -5,11 +5,11 @@ import test from 'node:test';
 
 const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
   .replace(/export default\s*\{/, 'const workerDefault = {')
-  +'\n;globalThis.__discoveryTest={CLUB_SOURCES,extractEmbeddedArticleCards,parseSitemapXml,scoreLink,selectArticleLinks};';
+  +'\n;globalThis.__discoveryTest={CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks};';
 const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto};
 vm.createContext(context);
 vm.runInContext(source,context,{filename:'worker.js'});
-const {CLUB_SOURCES,extractEmbeddedArticleCards,parseSitemapXml,scoreLink,selectArticleLinks}=context.__discoveryTest;
+const {CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks}=context.__discoveryTest;
 
 test('all 20 clubs use the shared discovery pipeline',()=>{
   assert.equal(Object.keys(CLUB_SOURCES).length,20);
@@ -43,6 +43,16 @@ test('typed Brighton Contentful article slugs become public article URLs',()=>{
   const url='https://www.brightonandhovealbion.com/media-article/player-returns-to-training';
   assert.ok(out.links.includes(url));
   assert.equal(out.times.get(url),Date.parse('2026-08-10T06:30+01:00'));
+});
+
+test('typed SSR article state yields the requested body without related-card bleed',()=>{
+  const detail='Player is ready and it is his first full training week. The manager confirmed the selection decision after training. '.repeat(4);
+  const html=`<script>(function(a,b){a.name="Team news";a.slug="team-news";a.mediaType="Article";a.publishDateTime="2026-08-10T06:30+01:00";a.articleBody={body:{content:[{nodeType:"text",value:${JSON.stringify(detail)},marks:[]}]}};a.tags=[];b.name="Related";b.slug="related";b.mediaType="Article";b.articleBody={body:{content:[{nodeType:"text",value:"RELATED BODY MUST NOT APPEAR",marks:[]}]}};return {a,b}})</script>`;
+  const out=extractEmbeddedArticleBody(html,'https://club.example/media-article/team-news');
+  assert.match(out.text,/Player is ready/);
+  assert.match(out.text,/manager confirmed/);
+  assert.doesNotMatch(out.text,/RELATED BODY/);
+  assert.equal(out.publishedAt,Date.parse('2026-08-10T06:30+01:00'));
 });
 
 test('sitemap discovery keeps same-host editorial URLs and lastmod order',()=>{

@@ -1,4 +1,5 @@
 // OTB Role Intelligence Worker
+// v2.22.2 — RC5.2.2 structured article-body recovery
 // v2.22.1 — RC5.2.1 all-club discovery relevance follow-up
 // v2.22 — RC5.2.0 all-club official article discovery hardening
 // v2.21 — RC5.1.1 provider-neutral structured availability feed
@@ -22,7 +23,7 @@ const SCHEMA_VERSION = '1.33.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.22.1-rc5.2.1-club-discovery';
+const WORKER_BUILD = 'v2.22.2-rc5.2.2-club-discovery';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -666,6 +667,44 @@ function extractPagePublicationFromHtml(markup,pageUrl=''){
   return {publishedAt:hits[0].t,dateSource:hits[0].source};
 }
 
+/** Recover a current article's rich-text body from assignment-style SSR state.
+ *  Yinzcam/Contentful pages expose typed records such as
+ *  `a.slug=...;a.mediaType="Article";...;a.articleBody=...;a.tags=...`.
+ *  The page slug and variable identity bound extraction to the requested
+ *  article so related-card bodies cannot bleed into the document. */
+function extractEmbeddedArticleBody(markup,pageUrl){
+  let slug='';try{slug=decodeURIComponent(new URL(pageUrl).pathname.split('/').filter(Boolean).pop()||'')}catch{}
+  if(!slug)return {text:'',publishedAt:null,dateSource:null};
+  const decoded=decodeEmbeddedMarkup(markup),escapedSlug=slug.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const recordRe=new RegExp('([A-Za-z_$][\\w$]*)\\.slug\\s*=\\s*["\\\']'+escapedSlug+'["\\\']\\s*;\\s*\\1\\.mediaType\\s*=\\s*["\\\']Article["\\\']','g');
+  let match;
+  while((match=recordRe.exec(decoded))){
+    const variable=match[1],escapedVariable=variable.replace(/[$]/g,'\\$&');
+    const bodyStart=decoded.indexOf(variable+'.articleBody=',match.index);
+    if(bodyStart<0||bodyStart-match.index>12000)continue;
+    const tail=decoded.slice(bodyStart,bodyStart+70000);
+    const tagsAt=tail.search(new RegExp(';'+escapedVariable+'\\.tags\\s*='));
+    const returnAt=tail.search(/;return\s/);
+    const endCandidates=[tagsAt,returnAt,60000].filter(index=>index>0);
+    const body=tail.slice(0,Math.min(...endCandidates));
+    const values=[];
+    const textRe=/nodeType\s*:\s*"text"\s*,\s*value\s*:\s*"((?:\\.|[^"\\])*)"/g;
+    let textMatch;
+    while((textMatch=textRe.exec(body))&&values.length<240){
+      let value=textMatch[1];
+      try{value=JSON.parse('"'+value+'"')}catch{value=value.replace(/\\n/g,'\n').replace(/\\"/g,'"').replace(/\\'/g,"'")}
+      value=cleanText(value);if(value)values.push(value);
+    }
+    const header=decoded.slice(match.index,bodyStart);
+    const name=(header.match(new RegExp(escapedVariable+'\\.name\\s*=\\s*["\\\']([^"\\\']+)["\\\']','i'))||[])[1]||'';
+    const publishedRaw=(header.match(new RegExp(escapedVariable+'\\.publishDateTime\\s*=\\s*["\\\']([^"\\\']+)["\\\']','i'))||[])[1]||'';
+    const text=cleanLines([name,...values].filter(Boolean).join('\n')).slice(0,65000);
+    const publishedAt=Date.parse(publishedRaw);
+    if(text.length>=AI_MIN_DOC_CHARS)return {text,publishedAt:Number.isFinite(publishedAt)?publishedAt:null,dateSource:Number.isFinite(publishedAt)?'embedded-article-state:publishDateTime':null};
+  }
+  return {text:'',publishedAt:null,dateSource:null};
+}
+
 
 async function fetchPage(url,{etag=null,lastModified=null}={}){
   let r;
@@ -700,7 +739,9 @@ async function fetchPage(url,{etag=null,lastModified=null}={}){
   const recency=extractLinkTimesFromHtml(markup,r.url);
   const landing=combineLandingSignals(markup,r.url,parsed,recency);
   const pageDate=extractPagePublicationFromHtml(markup,r.url);
-  return {url:r.url,text:parsed.text,links:landing.links,times:landing.times,timeSources:landing.timeSources,timestampCoverage:landing.timestampCoverage,embeddedCards:landing.embeddedCards,embeddedBreakdown:landing.embeddedBreakdown,publishedAt:pageDate.publishedAt,dateSource:pageDate.dateSource,etag:r.headers.get('etag')||null,lastModified:r.headers.get('last-modified')||null,mode:'fetch',status:r.status,redirected:r.url!==url};
+  const embeddedBody=extractEmbeddedArticleBody(markup,r.url);
+  const text=embeddedBody.text?cleanLines(`${parsed.text}\n${embeddedBody.text}`).slice(0,65000):parsed.text;
+  return {url:r.url,text,links:landing.links,times:landing.times,timeSources:landing.timeSources,timestampCoverage:landing.timestampCoverage,embeddedCards:landing.embeddedCards,embeddedBreakdown:landing.embeddedBreakdown,publishedAt:pageDate.publishedAt||embeddedBody.publishedAt,dateSource:pageDate.dateSource||embeddedBody.dateSource,etag:r.headers.get('etag')||null,lastModified:r.headers.get('last-modified')||null,mode:embeddedBody.text?'fetch-embedded-state':'fetch',status:r.status,redirected:r.url!==url};
 }
 
 /* ----------------------------------------------------- sitemap discovery */
@@ -870,6 +911,10 @@ async function cachedArticle(env,url,{force=false}={}){
       try{await env.ROLE_KV.put(`cachemismatch:${hashString(url)}`,JSON.stringify({requested:url,stored:hit.url,at:new Date().toISOString()}),{expirationTtl:60*60*24*14})}catch{}
       return null;
     }
+    // RC5.2.2: Brighton's old browser cache entries contained only a short
+    // shared shell. Re-fetch just those records so the structured-state body
+    // extractor can replace them; do not invalidate healthy caches globally.
+    if(hostOf(url)==='brightonandhovealbion.com'&&hit.mode==='browser-content'&&hit.text.length<1200)return null;
     return hit;
   }catch{}
   return null;
