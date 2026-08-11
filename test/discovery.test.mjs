@@ -48,10 +48,12 @@ test('typed Brighton Contentful article slugs become public article URLs',()=>{
 
 test('typed SSR article state yields the requested body without related-card bleed',()=>{
   const detail='Player is ready and it is his first full training week. The manager confirmed the selection decision after training. '.repeat(4);
-  const html=`<script>(function(a,b){a.name="Team news";a.slug="team-news";a.mediaType="Article";a.publishDateTime="2026-08-10T06:30+01:00";a.articleBody={body:{content:[{nodeType:"text",value:${JSON.stringify(detail)},marks:[]}]}};a.tags=[];b.name="Related";b.slug="related";b.mediaType="Article";b.articleBody={body:{content:[{nodeType:"text",value:"RELATED BODY MUST NOT APPEAR",marks:[]}]}};return {a,b}})</script>`;
+  const reversed='The defender has left the club after his contract expired. '.repeat(5);
+  const html=`<script>(function(a,b){a.name="Team news";a.slug="team-news";a.mediaType="Article";a.publishDateTime="2026-08-10T06:30+01:00";a.articleBody={body:{content:[{nodeType:"text",value:${JSON.stringify(detail)},marks:[]},{marks:[],value:${JSON.stringify(reversed)},nodeType:"text"}]}};a.tags=[];b.name="Related";b.slug="related";b.mediaType="Article";b.articleBody={body:{content:[{nodeType:"text",value:"RELATED BODY MUST NOT APPEAR",marks:[]}]}};return {a,b}})</script>`;
   const out=extractEmbeddedArticleBody(html,'https://club.example/media-article/team-news');
   assert.match(out.text,/Player is ready/);
   assert.match(out.text,/manager confirmed/);
+  assert.match(out.text,/contract expired/);
   assert.doesNotMatch(out.text,/RELATED BODY/);
   assert.equal(out.publishedAt,Date.parse('2026-08-10T06:30+01:00'));
 });

@@ -1,4 +1,5 @@
 // OTB Role Intelligence Worker
+// v2.22.6 — RC5.2.6 order-tolerant rich-text extraction
 // v2.22.5 — RC5.2.5 structured short-article acceptance
 // v2.22.4 — RC5.2.4 discovery backfill cleanup
 // v2.22.3 — RC5.2.3 Tottenham men's-feed isolation
@@ -26,7 +27,7 @@ const SCHEMA_VERSION = '1.33.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.22.5-rc5.2.5-club-discovery';
+const WORKER_BUILD = 'v2.22.6-rc5.2.6-club-discovery';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -694,10 +695,13 @@ function extractEmbeddedArticleBody(markup,pageUrl){
     const endCandidates=[tagsAt,returnAt,60000].filter(index=>index>0);
     const body=tail.slice(0,Math.min(...endCandidates));
     const values=[];
-    const textRe=/nodeType\s*:\s*"text"\s*,\s*value\s*:\s*"((?:\\.|[^"\\])*)"/g;
+    // Contentful serializers do not guarantee object-key order: both
+    // `nodeType:"text",value:"..."` and `value:"...",nodeType:"text"`
+    // occur on current club pages. Accept either ordering within the node.
+    const textRe=/(?:nodeType\s*:\s*"text"\s*,\s*value\s*:\s*"((?:\\.|[^"\\])*)")|(?:value\s*:\s*"((?:\\.|[^"\\])*)"\s*,\s*nodeType\s*:\s*"text")/g;
     let textMatch;
     while((textMatch=textRe.exec(body))&&values.length<240){
-      let value=textMatch[1];
+      let value=textMatch[1]??textMatch[2]??'';
       try{value=JSON.parse('"'+value+'"')}catch{value=value.replace(/\\n/g,'\n').replace(/\\"/g,'"').replace(/\\'/g,"'")}
       value=cleanText(value);if(value)values.push(value);
     }
