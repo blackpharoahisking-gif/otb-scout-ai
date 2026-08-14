@@ -100,8 +100,8 @@ test('Kinsky low OTB start security is a material Bench Boost risk',()=>{
 test('Tier 1 negative evidence cannot be silently overruled by weak optimism',()=>{
   const ctx=validated(),player=ctx.players.find(p=>p.name==='Calafiori');
   const evidence=[
-    {id:'official',authorityTier:1,weight:.95,signal:'negative',publisher:'Arsenal',summary:'Officially ruled out',title:'Team news',url:'https://www.arsenal.com/news/team-news'},
-    {id:'rumour',authorityTier:4,weight:.2,signal:'positive',publisher:'Aggregator',summary:'Could start',title:'Predicted XI',url:'https://example.test'}
+    {id:'official',authorityTier:1,weight:.95,signal:'negative',publisher:'Arsenal',summary:'Officially ruled out',title:'Team news',url:'https://www.arsenal.com/news/team-news',relevantDate:new Date().toISOString()},
+    {id:'rumour',authorityTier:4,weight:.2,signal:'positive',publisher:'Aggregator',summary:'Could start',title:'Predicted XI',url:'https://example.test',relevantDate:new Date().toISOString()}
   ];
   const result=api.enforceFreshVerdict(ctx,player,evidence,{classification:'STRONG UPGRADE',status:'OPPORTUNITY',confidence:'LOW',rationale:'Weak report says he may start.',freshEvidenceSummary:'Mixed.',monitorPoint:'Team news.',evidenceIds:['rumour']});
   assert.equal(result.classification,'DOWNGRADE');
@@ -110,7 +110,7 @@ test('Tier 1 negative evidence cannot be silently overruled by weak optimism',()
 
 test('positive disagreement can upgrade a conservative OTB assumption',()=>{
   const ctx=validated(),player={...ctx.players.find(p=>p.name==='Wirtz'),startProbability:.52};
-  const evidence=[{id:'lineup',authorityTier:1,weight:.9,signal:'positive',publisher:'Liverpool',summary:'Started final first-team preparation match',title:'Confirmed XI',url:'https://www.liverpoolfc.com/news'}];
+  const evidence=[{id:'lineup',authorityTier:1,weight:.9,signal:'positive',publisher:'Liverpool',summary:'Started final first-team preparation match',title:'Confirmed XI',url:'https://www.liverpoolfc.com/news',relevantDate:new Date().toISOString()}];
   const result=api.enforceFreshVerdict(ctx,player,evidence,{classification:'STRONG UPGRADE',status:'OPPORTUNITY',confidence:'HIGH',rationale:'Recent official first-team selection is stronger than OTB.',freshEvidenceSummary:'Recent official selection.',monitorPoint:'Final press conference.',evidenceIds:['lineup']});
   assert.equal(result.classification,'STRONG UPGRADE');
   assert.equal(result.status,'OPPORTUNITY');
@@ -122,6 +122,15 @@ test('missing evidence produces UNKNOWN rather than invented certainty',()=>{
   assert.equal(result.classification,'UNKNOWN');
   assert.equal(result.confidence,'LOW');
   assert.equal(result.evidenceIds.length,0);
+});
+
+test('stale-only or undated evidence stays visible but cannot drive a gameweek verdict',()=>{
+  const ctx=validated(),player=ctx.players.find(p=>p.name==='Calafiori'),evidence=[{id:'old',authorityTier:1,weight:.18,signal:'negative',publisher:'Arsenal',summary:'Old injury report',title:'Historical team news',url:'https://www.arsenal.com/news/old',relevantDate:'2025-12-01T12:00:00Z'}];
+  const result=api.enforceFreshVerdict(ctx,player,evidence,{classification:'STRONG DOWNGRADE',confidence:'HIGH',rationale:'Old evidence says out.',freshEvidenceSummary:'Old report.',monitorPoint:'',evidenceIds:['old']});
+  assert.equal(result.classification,'UNKNOWN');
+  assert.equal(result.confidence,'LOW');
+  assert.equal(result.evidenceIds.length,0);
+  assert.match(result.freshEvidenceSummary,/historical|undated/i);
 });
 
 test('changed-squad review identifies only new additions for selective research',()=>{

@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.23.2 — RC5.3.2 decision recency gate and official-publisher recovery
 // v2.23.1 — RC5.3.1 Cloudflare-safe public news search transport fallback
 // v2.23.0 — RC5.3.0 authenticated, cached, source-ranked Fresh Squad Review
 // v2.22.7 — RC5.2.7 source-read / evidence-authority contract separation
@@ -30,7 +31,7 @@ const SCHEMA_VERSION = '1.34.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.23.1-rc5.3.1-fresh-squad-review-search-fallback';
+const WORKER_BUILD = 'v2.23.2-rc5.3.2-fresh-squad-review-recency-gate';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -3310,8 +3311,9 @@ function freshPublisherTier(publisher,url,title=''){
   const hay=normal(`${publisher} ${url} ${title}`);
   const host=hostOf(url);
   const officialHosts=new Set([...Object.values(CLUB_SOURCES).flatMap(c=>c.urls.map(hostOf)),'premierleague.com','fantasy.premierleague.com','thefa.com','uefa.com']);
-  if(officialHosts.has(host)||/official club|premier league|the fa|uefa/.test(hay))return 1;
-  if(/rotowire|bbc sport|sky sports|the athletic|guardian|telegraph|independent|reuters|associated press|espn|times|mail sport|liverpool echo|manchester evening news|evening standard|yorkshire evening post|chronicle live|football london|pa media|optus sport/.test(hay))return 2;
+  const publisherName=normal(publisher),officialNames=Object.values(CLUB_SOURCES).map(c=>normal(c.name));
+  if(officialHosts.has(host)||[...officialHosts].some(value=>publisherName.includes(normal(value)))||officialNames.some(value=>value.length>=5&&publisherName.includes(value))||/official club|premier league|the fa|uefa/.test(hay))return 1;
+  if(/rotowire|\bbbc\b|sky sports|the athletic|guardian|telegraph|independent|reuters|associated press|espn|times|mail sport|liverpool echo|manchester evening news|evening standard|standard co uk|yorkshire evening post|chronicle live|football london|pa media|optus sport/.test(hay))return 2;
   if(/reddit|supporter|fans? network|fan site|forum|blog|arsenal vision|anfield watch|this is anfield|leeds live|geordie boot boys|roker report|we are brighton|true faith/.test(hay))return 3;
   return 4;
 }
@@ -3501,30 +3503,35 @@ function statusForFreshPlayer(context,player,classification){
   return 'GREEN';
 }
 function enforceFreshVerdict(context,player,evidence,draft){
-  let classification=FRESH_CLASSIFICATIONS.has(draft?.classification)?draft.classification:fallbackFreshClassification(player,evidence);
-  const authoritative=evidence.filter(e=>e.authorityTier===1&&e.weight>=0.45&&e.signal!=='neutral');
+  const decisionEvidence=evidence.filter(item=>{const recency=freshRecency(item.relevantDate);return recency.ageHours!==null&&recency.ageHours<=45*24});
+  let classification=FRESH_CLASSIFICATIONS.has(draft?.classification)?draft.classification:fallbackFreshClassification(player,decisionEvidence);
+  const supportingPositive=decisionEvidence.some(e=>e.signal==='positive'&&e.weight>=0.2),supportingNegative=decisionEvidence.some(e=>e.signal==='negative'&&e.weight>=0.2);
+  if(['STRONG UPGRADE','UPGRADE'].includes(classification)&&!supportingPositive)classification=fallbackFreshClassification(player,decisionEvidence);
+  if(['STRONG DOWNGRADE','DOWNGRADE'].includes(classification)&&!supportingNegative)classification=fallbackFreshClassification(player,decisionEvidence);
+  const authoritative=decisionEvidence.filter(e=>e.authorityTier===1&&e.weight>=0.45&&e.signal!=='neutral');
   const positive=authoritative.some(e=>e.signal==='positive'),negative=authoritative.some(e=>e.signal==='negative');
   if(positive&&negative)classification='MONITOR';
   else if(negative&&['STRONG UPGRADE','UPGRADE'].includes(classification))classification=player.startProbability>0.55?'DOWNGRADE':'MONITOR';
   else if(positive&&['STRONG DOWNGRADE','DOWNGRADE'].includes(classification))classification=player.startProbability<0.8?'UPGRADE':'MONITOR';
-  if(!evidence.length)classification='UNKNOWN';
+  if(!decisionEvidence.length)classification='UNKNOWN';
   const status=statusForFreshPlayer(context,player,classification);
-  const allowedIds=new Set(evidence.map(e=>e.id));
+  const allowedIds=new Set(decisionEvidence.map(e=>e.id));
   const cited=[...new Set(Array.isArray(draft?.evidenceIds)?draft.evidenceIds.filter(id=>allowedIds.has(id)):[])];
-  const strongest=evidence[0];
-  const defaultSummary=strongest?`${strongest.publisher}: ${strongest.summary}`:'No usable current external evidence was available.';
+  const strongest=decisionEvidence[0];
+  const defaultSummary=strongest?`${strongest.publisher}: ${strongest.summary}`:evidence.length?'Only historical or undated evidence was found; no source cleared the 45-day decision window.':'No usable current external evidence was available.';
   let rationale=cleanText(draft?.rationale||'');
-  if(!rationale){
+  if(!decisionEvidence.length)rationale=evidence.length?'Older context was preserved for audit, but it is too stale or undated to challenge OTB for this gameweek.':'External evidence is unavailable or too weak to challenge the OTB assumption.';
+  else if(!rationale){
     if(classification==='UNKNOWN')rationale='External evidence is unavailable or too weak to challenge the OTB assumption.';
     else rationale=`The source-ranked evidence supports a ${classification.toLowerCase()} relative to OTB's current minutes and start assumption.`;
   }
   if(context.activeChip==='BENCH_BOOST'&&(player.startProbability<0.5||player.expectedMinutes<45))rationale=`Bench Boost makes this player scoring-critical, while OTB itself gives only ${Math.round(player.startProbability*100)}% start and ${player.expectedMinutes} xMins. ${rationale}`;
   if(context.activeChip==='TRIPLE_CAPTAIN'&&player.captain)rationale=`Triple Captain increases the decision weight of this evidence. ${rationale}`;
   return {
-    freshEvidenceSummary:cleanText(draft?.freshEvidenceSummary||defaultSummary).slice(0,700),classification,status,
-    confidence:!evidence.length?'LOW':(['HIGH','MEDIUM','LOW'].includes(draft?.confidence)?draft.confidence:(evidence.some(e=>e.authorityTier===1)?'HIGH':'MEDIUM')),
+    freshEvidenceSummary:cleanText(decisionEvidence.length?(draft?.freshEvidenceSummary||defaultSummary):defaultSummary).slice(0,700),classification,status,
+    confidence:!decisionEvidence.length||!decisionEvidence.some(e=>e.authorityTier<=2)?'LOW':(['HIGH','MEDIUM','LOW'].includes(draft?.confidence)?draft.confidence:(decisionEvidence.some(e=>e.authorityTier===1)?'HIGH':'MEDIUM')),
     rationale:rationale.slice(0,900),monitorPoint:cleanText(draft?.monitorPoint||(classification==='UNKNOWN'?'Check final official team news and predicted lineups.':'Re-check if later official evidence changes the current signal.')).slice(0,500),
-    evidenceIds:cited.length?cited:evidence.slice(0,4).map(e=>e.id)
+    evidenceIds:cited.length?cited:decisionEvidence.slice(0,4).map(e=>e.id)
   };
 }
 
