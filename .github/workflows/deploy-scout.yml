@@ -1,4 +1,5 @@
 name: Deploy Scout to Cloudflare
+# RC5.4.0 evidence-quality release trigger and exact-build health gate.
 
 on:
   push:
