@@ -209,7 +209,7 @@ test('official FPL roster enriches players with same-club same-position competit
 });
 
 test('competitor departure reporting becomes guarded positive hierarchy evidence',()=>{
-  const player={playerId:'101',name:'Kinsky',canonicalName:'Antonin Kinsky',searchName:'Antonin Kinsky',webName:'Kinsky',club:'TOT',identityAliases:['Antonin Kinsky','Kinsky'],competitionAliases:['Guglielmo Vicario','Vicario','Martin Dubravka','Dubravka']};
+  const player={playerId:'101',name:'Kinsky',canonicalName:'Antonin Kinsky',searchName:'Antonin Kinsky',webName:'Kinsky',club:'TOT',position:'GKP',identityAliases:['Antonin Kinsky','Kinsky'],competitionAliases:['Guglielmo Vicario','Vicario','Martin Dubravka','Dubravka']};
   const xml='<rss><channel><item><title>Juventus pursue Guglielmo Vicario transfer</title><link>https://example.test/vicario</link><description>Tottenham Hotspur goalkeeper Vicario is outside the manager plans and set to leave.</description><pubDate>Fri, 14 Aug 2026 08:00:00 GMT</pubDate><source url="https://www.skysports.com">Sky Sports</source></item></channel></rss>';
   const rows=api.freshNewsItemsFromRss(xml,player);
   assert.equal(rows.length,1);
@@ -217,6 +217,40 @@ test('competitor departure reporting becomes guarded positive hierarchy evidence
   assert.equal(rows[0].evidenceCategory,'ROLE_COMPETITION');
   assert.equal(rows[0].hierarchyInference,true);
   assert.match(rows[0].relatedPlayer,/Vicario/);
+});
+
+test('outfield FPL buckets do not create unsafe same-position competitor aliases',()=>{
+  const context={players:[{playerId:'201',name:'Senesi',club:'TOT',position:'DEF'}]},data={teams:[{id:18,short_name:'TOT',name:'Tottenham Hotspur'}],elements:[
+    {id:201,team:18,element_type:2,first_name:'Marcos',second_name:'Senesi',web_name:'Senesi'},
+    {id:202,team:18,element_type:2,first_name:'Cristian',second_name:'Romero',web_name:'Romero'}
+  ]};
+  const player=api.enrichFreshReviewIdentitiesFromBootstrap(context,data).players[0];
+  assert.equal(player.competitionAliases.length,0);
+  assert.equal(api.freshHierarchyPeerMatches({...player,competitionAliases:['Cristian Romero']},'Tottenham Hotspur: Romero inspires Argentina comeback'),null);
+});
+
+test('indirect goalkeeper competition is capped at partial monitoring evidence',()=>{
+  const ctx=validated(),player={...ctx.players.find(p=>p.name==='Kinsky'),position:'GKP'};
+  const evidence=[api.freshAnnotateEvidence({id:'peer',authorityTier:1,signal:'negative',publisher:'Tottenham Hotspur',publisherUrl:'https://www.tottenhamhotspur.com',title:'Vicario signs a new contract',summary:'Tottenham goalkeeper Vicario signs an extension',url:'https://www.tottenhamhotspur.com/news/vicario',relevantDate:new Date().toISOString(),evidenceCategory:'ROLE_COMPETITION',hierarchyInference:true,relatedPlayer:'Guglielmo Vicario'})];
+  const result=api.enforceFreshVerdict(ctx,player,evidence,{classification:'STRONG DOWNGRADE',confidence:'HIGH',rationale:'Vicario remains competition.',freshEvidenceSummary:'Contract extension.',monitorPoint:'Team news.',evidenceIds:['peer']});
+  assert.equal(result.evidenceCoverage,'PARTIAL');
+  assert.equal(result.classification,'MONITOR');
+  assert.equal(result.status,'AMBER');
+});
+
+test('marketing and charity stories cannot become decision evidence',()=>{
+  const player={playerId:'1',name:'Kelleher',canonicalName:'Caoimhin Kelleher',searchName:'Caoimhin Kelleher',webName:'Kelleher',club:'BRE',position:'GKP',identityAliases:['Caoimhin Kelleher','Kelleher'],competitionAliases:[]};
+  const xml='<rss><channel><item><title>Caoimhin Kelleher supports Irish Guide Dogs charity</title><link>https://example.test/charity</link><description>Brentford goalkeeper attends a charity event.</description><pubDate>Fri, 14 Aug 2026 08:00:00 GMT</pubDate><source url="https://example.test">Example</source></item></channel></rss>';
+  const rows=api.freshNewsItemsFromRss(xml,player);
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].decisionRelevant,false);
+  assert.equal(rows[0].decisionEligible,false);
+});
+
+test('future-dated evidence is quarantined instead of treated as current',()=>{
+  const now=Date.parse('2026-08-14T12:00:00Z'),future=new Date(now+24*3600000).toISOString(),recency=api.freshRecency(future,'LINEUP',now);
+  assert.equal(recency.band,'FUTURE DATE');
+  assert.equal(recency.decisionEligible,false);
 });
 
 test('public football names handle compound legal surnames and true mononyms',()=>{
@@ -265,12 +299,12 @@ test('public Google News HTML fallback preserves publisher, date and RotoWire pr
   assert.match(rows[0].relevantDate,/^2026-08-14/);
 });
 
-test('Google News HTML fallback recovers a date from the surrounding result card',()=>{
+test('Google News HTML fallback recovers a date while neutral presence remains non-decision evidence',()=>{
   const player={playerId:'3',name:'Calafiori'},html='<article><a class="JtKRv" href="./read/example" data-n-tid="29">Calafiori returns to Arsenal training</a><time datetime="2026-08-14T08:00:00Z">2 hours ago</time></article>';
   const rows=api.freshNewsItemsFromHtml(html,player);
   assert.equal(rows.length,1);
   assert.equal(rows[0].relevantDate,'2026-08-14T08:00:00.000Z');
-  assert.equal(rows[0].decisionEligible,true);
+  assert.equal(rows[0].decisionEligible,false);
 });
 
 test('relative Google News timestamps become source-owned ISO dates',()=>{
