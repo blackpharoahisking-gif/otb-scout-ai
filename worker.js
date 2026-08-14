@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.23.3 — RC5.3.3 evidence publisher and verdict consistency hardening
 // v2.23.2 — RC5.3.2 decision recency gate and official-publisher recovery
 // v2.23.1 — RC5.3.1 Cloudflare-safe public news search transport fallback
 // v2.23.0 — RC5.3.0 authenticated, cached, source-ranked Fresh Squad Review
@@ -31,7 +32,7 @@ const SCHEMA_VERSION = '1.34.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.23.2-rc5.3.2-fresh-squad-review-recency-gate';
+const WORKER_BUILD = 'v2.23.3-rc5.3.3-fresh-squad-review-evidence-consistency';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -3311,8 +3312,9 @@ function freshPublisherTier(publisher,url,title=''){
   const hay=normal(`${publisher} ${url} ${title}`);
   const host=hostOf(url);
   const officialHosts=new Set([...Object.values(CLUB_SOURCES).flatMap(c=>c.urls.map(hostOf)),'premierleague.com','fantasy.premierleague.com','thefa.com','uefa.com']);
-  const publisherName=normal(publisher),officialNames=Object.values(CLUB_SOURCES).map(c=>normal(c.name));
-  if(officialHosts.has(host)||[...officialHosts].some(value=>publisherName.includes(normal(value)))||officialNames.some(value=>value.length>=5&&publisherName.includes(value))||/official club|premier league|the fa|uefa/.test(hay))return 1;
+  const publisherName=normal(publisher).replace(/^www\s+/,''),officialNames=Object.values(CLUB_SOURCES).map(c=>normal(c.name));
+  const officialPublisher=[...officialHosts].some(value=>publisherName===normal(value))||officialNames.some(value=>publisherName===value||publisherName===`${value} fc`||publisherName===`${value} football club`);
+  if(officialHosts.has(host)||officialPublisher||/official club|premier league|the fa|uefa/.test(hay))return 1;
   if(/rotowire|\bbbc\b|sky sports|the athletic|guardian|telegraph|independent|reuters|associated press|espn|times|mail sport|liverpool echo|manchester evening news|evening standard|standard co uk|yorkshire evening post|chronicle live|football london|pa media|optus sport/.test(hay))return 2;
   if(/reddit|supporter|fans? network|fan site|forum|blog|arsenal vision|anfield watch|this is anfield|leeds live|geordie boot boys|roker report|we are brighton|true faith/.test(hay))return 3;
   return 4;
@@ -3504,7 +3506,8 @@ function statusForFreshPlayer(context,player,classification){
 }
 function enforceFreshVerdict(context,player,evidence,draft){
   const decisionEvidence=evidence.filter(item=>{const recency=freshRecency(item.relevantDate);return recency.ageHours!==null&&recency.ageHours<=45*24});
-  let classification=FRESH_CLASSIFICATIONS.has(draft?.classification)?draft.classification:fallbackFreshClassification(player,decisionEvidence);
+  const draftClassification=FRESH_CLASSIFICATIONS.has(draft?.classification)?draft.classification:null;
+  let classification=draftClassification||fallbackFreshClassification(player,decisionEvidence);
   const supportingPositive=decisionEvidence.some(e=>e.signal==='positive'&&e.weight>=0.2),supportingNegative=decisionEvidence.some(e=>e.signal==='negative'&&e.weight>=0.2);
   if(['STRONG UPGRADE','UPGRADE'].includes(classification)&&!supportingPositive)classification=fallbackFreshClassification(player,decisionEvidence);
   if(['STRONG DOWNGRADE','DOWNGRADE'].includes(classification)&&!supportingNegative)classification=fallbackFreshClassification(player,decisionEvidence);
@@ -3520,9 +3523,12 @@ function enforceFreshVerdict(context,player,evidence,draft){
   const strongest=decisionEvidence[0];
   const defaultSummary=strongest?`${strongest.publisher}: ${strongest.summary}`:evidence.length?'Only historical or undated evidence was found; no source cleared the 45-day decision window.':'No usable current external evidence was available.';
   let rationale=cleanText(draft?.rationale||'');
+  if(draftClassification&&classification!==draftClassification)rationale='';
   if(!decisionEvidence.length)rationale=evidence.length?'Older context was preserved for audit, but it is too stale or undated to challenge OTB for this gameweek.':'External evidence is unavailable or too weak to challenge the OTB assumption.';
   else if(!rationale){
     if(classification==='UNKNOWN')rationale='External evidence is unavailable or too weak to challenge the OTB assumption.';
+    else if(classification==='AGREE')rationale="Current source-ranked evidence does not materially contradict OTB's minutes and start assumption.";
+    else if(classification==='MONITOR')rationale="Current source-ranked evidence is mixed; monitor rather than forcing a directional change to OTB's assumption.";
     else rationale=`The source-ranked evidence supports a ${classification.toLowerCase()} relative to OTB's current minutes and start assumption.`;
   }
   if(context.activeChip==='BENCH_BOOST'&&(player.startProbability<0.5||player.expectedMinutes<45))rationale=`Bench Boost makes this player scoring-critical, while OTB itself gives only ${Math.round(player.startProbability*100)}% start and ${player.expectedMinutes} xMins. ${rationale}`;

@@ -106,6 +106,7 @@ test('Tier 1 negative evidence cannot be silently overruled by weak optimism',()
   const result=api.enforceFreshVerdict(ctx,player,evidence,{classification:'STRONG UPGRADE',status:'OPPORTUNITY',confidence:'LOW',rationale:'Weak report says he may start.',freshEvidenceSummary:'Mixed.',monitorPoint:'Team news.',evidenceIds:['rumour']});
   assert.equal(result.classification,'DOWNGRADE');
   assert.equal(result.status,'AMBER');
+  assert.doesNotMatch(result.rationale,/Weak report/);
 });
 
 test('positive disagreement can upgrade a conservative OTB assumption',()=>{
@@ -153,6 +154,9 @@ test('near-deadline cache windows are shorter than normal windows',()=>{
 
 test('RotoWire is preferred within Tier 2 but never promoted above official evidence',()=>{
   assert.equal(api.freshPublisherTier('RotoWire','https://www.rotowire.com/soccer/','Player update'),2);
+  assert.equal(api.freshPublisherTier('Liverpool FC','https://news.google.com/read/example','Club update'),1);
+  assert.equal(api.freshPublisherTier('Liverpool Echo','https://news.google.com/read/example','Player update'),2);
+  assert.equal(api.freshPublisherTier('readliverpoolfc.com','https://news.google.com/read/example','Player update'),4);
   const ordinary=api.freshSourceWeight({authorityTier:2,relevantDate:new Date().toISOString(),title:'Team update',summary:''});
   const preferred=api.freshSourceWeight({authorityTier:2,relevantDate:new Date().toISOString(),title:'Team update',summary:'',preferredSource:true});
   const official=api.freshSourceWeight({authorityTier:1,relevantDate:new Date().toISOString(),title:'Official team news',summary:''});
