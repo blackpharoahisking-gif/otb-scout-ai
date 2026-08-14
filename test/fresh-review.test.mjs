@@ -6,7 +6,7 @@ import test from 'node:test';
 
 const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
   .replace(/export default\s*\{/, 'const workerDefault = {')
-  +'\n;globalThis.__freshTest={activeChipValue,validateFreshReviewContext,freshProjectedTotal,statusForFreshPlayer,enforceFreshVerdict,fallbackFreshClassification,freshContextDiff,freshCacheMinutes,unavailableFreshPlayer,freshPublisherTier,freshSourceWeight,freshNewsItemsFromHtml,freshNewsItemsFromRss,createFreshReviewJob,finalizeFreshReview,freshJobKey,freshReviewAuthorised,verifyFreshOwnerCapability,sha256Hex};';
+  +'\n;globalThis.__freshTest={activeChipValue,validateFreshReviewContext,enrichFreshReviewIdentitiesFromBootstrap,freshProjectedTotal,statusForFreshPlayer,enforceFreshVerdict,fallbackFreshClassification,freshContextDiff,freshCacheMinutes,unavailableFreshPlayer,freshPublisherTier,freshSourceWeight,freshNewsDate,freshNewsItemsFromHtml,freshNewsItemsFromRss,freshNewsQueries,freshPlayerEvidenceMatches,freshEvidenceCategory,freshRecency,freshAnnotateEvidence,freshEvidenceCoverage,buildFreshSquadSummary,createFreshReviewJob,finalizeFreshReview,freshJobKey,freshReviewAuthorised,verifyFreshOwnerCapability,sha256Hex};';
 const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto,TextEncoder,TextDecoder,atob};
 vm.createContext(context);
 vm.runInContext(source,context,{filename:'worker.js'});
@@ -164,6 +164,55 @@ test('RotoWire is preferred within Tier 2 but never promoted above official evid
   assert.ok(preferred<official);
 });
 
+test('publisher authority comes from the source rather than headline wording',()=>{
+  assert.equal(api.freshPublisherTier('The English Football League','https://news.google.com/read/efl','Competition update'),1);
+  assert.equal(api.freshPublisherTier('The Argus','https://news.google.com/read/argus','Brighton update'),2);
+  assert.equal(api.freshPublisherTier('Fantasy Football Scout','https://news.google.com/read/ffs','Predicted lineup'),2);
+  assert.equal(api.freshPublisherTier('Unknown aggregator','https://news.google.com/read/fake','Official club update'),4);
+});
+
+test('official FPL IDs expand compact display names before research',()=>{
+  const ctx=validated(),bootstrap={
+    teams:[{id:10,name:'Manchester United',short_name:'MUN'},{id:18,name:'Sunderland',short_name:'SUN'}],
+    elements:[
+      {id:5,first_name:'Bruno',second_name:'Fernandes',web_name:'B.Fernandes',team:10},
+      {id:9,first_name:'Enzo',second_name:'Le Fée',web_name:'E.Le Fée',team:18}
+    ]
+  };
+  const enriched=api.enrichFreshReviewIdentitiesFromBootstrap(ctx,bootstrap),bruno=enriched.players.find(p=>p.playerId==='5'),leFee=enriched.players.find(p=>p.playerId==='9');
+  assert.equal(bruno.canonicalName,'Bruno Fernandes');
+  assert.equal(bruno.identitySource,'FPL_BOOTSTRAP');
+  assert.match(api.freshNewsQueries(bruno,Date.parse('2026-08-14T12:00:00Z'))[0],/^"Bruno Fernandes" "Manchester United"/);
+  assert.equal(leFee.canonicalName,'Enzo Le Fée');
+  assert.match(api.freshNewsQueries(leFee,Date.parse('2026-08-14T12:00:00Z'))[0],/^"Enzo Le Fée" "Sunderland"/);
+});
+
+test('canonical identity rejects Joe Gomez evidence for Brighton Diego Gomez',()=>{
+  const player={playerId:'99',name:'Gomez',canonicalName:'Diego Gomez',webName:'Gomez',identityAliases:['Diego Gomez','Gomez'],club:'BHA'};
+  assert.equal(api.freshPlayerEvidenceMatches(player,'Joe Gomez returns to Liverpool training'),false);
+  assert.equal(api.freshPlayerEvidenceMatches(player,'Diego Gomez returns to Brighton training'),true);
+  assert.equal(api.freshPlayerEvidenceMatches(player,'Gomez, Wieffer and Milner: Brighton team news'),true);
+});
+
+test('evidence lifetimes are category-specific rather than a blanket 45-day cutoff',()=>{
+  const now=Date.parse('2026-08-14T12:00:00Z'),sixtyDaysAgo=new Date(now-60*86400000).toISOString(),twentyDaysAgo=new Date(now-20*86400000).toISOString();
+  assert.equal(api.freshEvidenceCategory({title:'Player completes transfer and competes for first-team role'}),'ROLE_COMPETITION');
+  assert.equal(api.freshRecency(sixtyDaysAgo,'ROLE_COMPETITION',now).decisionEligible,true);
+  assert.equal(api.freshRecency(twentyDaysAgo,'PREDICTED_LINEUP',now).decisionEligible,false);
+});
+
+test('missing live evidence is UNVERIFIED coverage, not an automatic squad warning',()=>{
+  const ctx=validated(),player=ctx.players.find(p=>p.captain),result=api.enforceFreshVerdict(ctx,player,[],{classification:'AGREE',status:'GREEN',confidence:'HIGH',rationale:'Certain.',freshEvidenceSummary:'Certain.',monitorPoint:'',evidenceIds:[]});
+  assert.equal(result.classification,'UNKNOWN');
+  assert.equal(result.evidenceCoverage,'UNVERIFIED');
+  assert.equal(result.status,'GREEN');
+  const reviews=ctx.players.map(row=>api.unavailableFreshPlayer(ctx,row,'simulated search gap'));
+  const summary=api.buildFreshSquadSummary(ctx,reviews);
+  assert.match(summary.primaryIssue,/inconclusive/i);
+  assert.doesNotMatch(summary.primaryIssue,/B\.Fernandes\s+—/);
+  assert.match(summary.captainAssessment,/did not independently validate/i);
+});
+
 test('public Google News HTML fallback preserves publisher, date and RotoWire preference',()=>{
   const player={playerId:'3',name:'Calafiori'},html='<a class="JtKRv" href="./read/example?hl=en-GB&amp;gl=GB" data-n-tid="29" aria-label="Calafiori returns to Arsenal training - RotoWire - 14 Aug">Calafiori returns to Arsenal training</a>';
   const rows=api.freshNewsItemsFromHtml(html,player);
@@ -172,6 +221,20 @@ test('public Google News HTML fallback preserves publisher, date and RotoWire pr
   assert.equal(rows[0].authorityTier,2);
   assert.equal(rows[0].preferredSource,true);
   assert.match(rows[0].relevantDate,/^2026-08-14/);
+});
+
+test('Google News HTML fallback recovers a date from the surrounding result card',()=>{
+  const player={playerId:'3',name:'Calafiori'},html='<article><a class="JtKRv" href="./read/example" data-n-tid="29">Calafiori returns to Arsenal training</a><time datetime="2026-08-14T08:00:00Z">2 hours ago</time></article>';
+  const rows=api.freshNewsItemsFromHtml(html,player);
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].relevantDate,'2026-08-14T08:00:00.000Z');
+  assert.equal(rows[0].decisionEligible,true);
+});
+
+test('relative Google News timestamps become source-owned ISO dates',()=>{
+  const now=Date.parse('2026-08-14T12:00:00Z');
+  assert.equal(api.freshNewsDate('2 hours ago',now),'2026-08-14T10:00:00.000Z');
+  assert.equal(api.freshNewsDate('Yesterday 08:30',now),'2026-08-13T08:30:00.000Z');
 });
 
 test('RSS parser accepts namespaced publishers and rejects unrelated results',()=>{
@@ -201,6 +264,8 @@ test('job finalization survives every player research failure and caches the com
   assert.equal(finalized.body.review.mutatesProjection,false);
   assert.equal(finalized.body.review.activeChip,'BENCH_BOOST');
   assert.equal(finalized.body.review.scoringPlayerCount,15);
+  assert.equal(finalized.body.review.coverageCounts.UNVERIFIED,15);
+  assert.equal(finalized.body.review.research.researchedPlayers,15);
   const cached=await api.createFreshReviewJob(env,{context:gw1('BENCH_BOOST')});
   assert.equal(cached.status,200);
   assert.equal(cached.body.cache,'HIT');

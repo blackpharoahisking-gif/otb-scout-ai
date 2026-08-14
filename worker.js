@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.24.0 — RC5.4.0 canonical identity, evidence coverage and category freshness
 // v2.23.3 — RC5.3.3 evidence publisher and verdict consistency hardening
 // v2.23.2 — RC5.3.2 decision recency gate and official-publisher recovery
 // v2.23.1 — RC5.3.1 Cloudflare-safe public news search transport fallback
@@ -28,11 +29,11 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.34.0';
+const SCHEMA_VERSION = '1.35.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.23.3-rc5.3.3-fresh-squad-review-evidence-consistency';
+const WORKER_BUILD = 'v2.24.0-rc5.4.0-fresh-review-evidence-quality';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -3187,7 +3188,7 @@ async function marketProbe(env, { regions = 'uk' } = {}) {
 
 /* ----------------------------------------------------- Fresh Squad Review */
 
-const FRESH_REVIEW_VERSION='1.0.0';
+const FRESH_REVIEW_VERSION='1.1.0';
 const FRESH_CLASSIFICATIONS=new Set(['STRONG UPGRADE','UPGRADE','AGREE','MONITOR','DOWNGRADE','STRONG DOWNGRADE','UNKNOWN']);
 const FRESH_STATUSES=new Set(['GREEN','AMBER','RED','OPPORTUNITY']);
 const FRESH_CHIPS=new Set(['NONE','BENCH_BOOST','TRIPLE_CAPTAIN','FREE_HIT','WILDCARD']);
@@ -3273,6 +3274,37 @@ function validateFreshReviewContext(raw){
   return {ok:errors.length===0,errors,context};
 }
 
+function freshIdentityAliases(player,element=null){
+  const canonicalName=cleanText(element?`${element.first_name||''} ${element.second_name||''}`:player.canonicalName||'').trim();
+  const webName=cleanText(element?.web_name||player.webName||'').trim();
+  return [...new Set([canonicalName,webName,cleanText(player.name)].filter(Boolean).map(value=>value.slice(0,100)))];
+}
+/** Resolve the browser's compact display names against the authoritative FPL
+ *  element ID. The display name is preserved for OTB; only research identity
+ *  and matching use the canonical full name. */
+function enrichFreshReviewIdentitiesFromBootstrap(context,data){
+  const elements=new Map((data?.elements||[]).map(element=>[String(element.id),element]));
+  const teams=new Map((data?.teams||[]).map(team=>[team.id,teamCodeFromFplTeam(team)]));
+  return {
+    ...context,
+    players:context.players.map(player=>{
+      const element=elements.get(String(player.playerId))||null;
+      const aliases=freshIdentityAliases(player,element);
+      const canonicalName=aliases[0]||player.name;
+      const identityClub=element?teams.get(element.team)||null:null;
+      return {
+        ...player,canonicalName,webName:cleanText(element?.web_name||player.webName||player.name).slice(0,100),
+        searchName:canonicalName,identityAliases:aliases,identitySource:element?'FPL_BOOTSTRAP':'OTB_CONTEXT',
+        identityClub,identityClubMismatch:Boolean(identityClub&&identityClub!==player.club)
+      };
+    })
+  };
+}
+async function enrichFreshReviewIdentities(context){
+  try{return enrichFreshReviewIdentitiesFromBootstrap(context,await getBootstrap())}
+  catch{return enrichFreshReviewIdentitiesFromBootstrap(context,null)}
+}
+
 function stableJson(value){
   if(Array.isArray(value))return `[${value.map(stableJson).join(',')}]`;
   if(value&&typeof value==='object')return `{${Object.keys(value).sort().map(k=>`${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`;
@@ -3309,14 +3341,19 @@ function decodeXml(value){return String(value||'').replace(/^<!\[CDATA\[|\]\]>$/
 function stripXml(value){return cleanText(decodeXml(String(value||'').replace(/<[^>]*>/g,' ')))}
 function xmlTag(block,tag){const hit=String(block||'').match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,'i'));return hit?stripXml(hit[1]):''}
 function freshPublisherTier(publisher,url,title=''){
-  const hay=normal(`${publisher} ${url} ${title}`);
   const host=hostOf(url);
-  const officialHosts=new Set([...Object.values(CLUB_SOURCES).flatMap(c=>c.urls.map(hostOf)),'premierleague.com','fantasy.premierleague.com','thefa.com','uefa.com']);
-  const publisherName=normal(publisher).replace(/^www\s+/,''),officialNames=Object.values(CLUB_SOURCES).map(c=>normal(c.name));
-  const officialPublisher=[...officialHosts].some(value=>publisherName===normal(value))||officialNames.some(value=>publisherName===value||publisherName===`${value} fc`||publisherName===`${value} football club`);
-  if(officialHosts.has(host)||officialPublisher||/official club|premier league|the fa|uefa/.test(hay))return 1;
-  if(/rotowire|\bbbc\b|sky sports|the athletic|guardian|telegraph|independent|reuters|associated press|espn|times|mail sport|liverpool echo|manchester evening news|evening standard|standard co uk|yorkshire evening post|chronicle live|football london|pa media|optus sport/.test(hay))return 2;
-  if(/reddit|supporter|fans? network|fan site|forum|blog|arsenal vision|anfield watch|this is anfield|leeds live|geordie boot boys|roker report|we are brighton|true faith/.test(hay))return 3;
+  const officialHosts=new Set([...Object.values(CLUB_SOURCES).flatMap(c=>c.urls.map(hostOf)),'premierleague.com','fantasy.premierleague.com','thefa.com','efl.com','uefa.com','fifa.com']);
+  const publisherName=normal(publisher).replace(/^www\s+/,'');
+  const officialNames=new Set([
+    ...Object.values(CLUB_SOURCES).flatMap(c=>{const value=normal(c.name);return [value,`${value} fc`,`${value} football club`]}),
+    'premier league','fantasy premier league','the football association','the fa','english football league','the english football league','efl','uefa','fifa'
+  ]);
+  // Authority is source-owned. A headline containing "official club" must
+  // never promote an aggregator or supporter site to Tier 1.
+  if(officialHosts.has(host)||officialNames.has(publisherName))return 1;
+  const hay=normal(`${publisher} ${host}`);void title;
+  if(/rotowire|\bbbc\b|sky sports|the athletic|guardian|telegraph|independent|reuters|associated press|espn|new york times|the times|mail sport|liverpool echo|manchester evening news|evening standard|standard co uk|yorkshire evening post|chronicle live|football london|pa media|optus sport|the argus|sussex world|fantasy football scout/.test(hay))return 2;
+  if(/reddit|supporter|fans? network|fan site|forum|blog|arsenal vision|anfield watch|this is anfield|leeds live|geordie boot boys|roker report|we are brighton|true faith|cartilage free captain|royal blue mersey|toffeeweb/.test(hay))return 3;
   return 4;
 }
 function freshSignal(text,type=''){
@@ -3325,67 +3362,124 @@ function freshSignal(text,type=''){
   if(/ruled out|unavailable|suspension|suspended|fitness doubt|doubtful|injury doubt|set to miss|will miss|minutes restricted|confirmed bench|benched|omitted|rotation warning|competition for|selection doubt|not in (?:the )?squad/.test(t))return 'negative';
   return 'neutral';
 }
-function freshRecency(date,now=Date.now()){
-  const ms=Date.parse(date||'');if(!Number.isFinite(ms))return {band:'DATE UNKNOWN',weight:0.35,ageHours:null};
+function freshEvidenceCategory(source={}){
+  const text=normal(`${source.eventType||source.type||''} ${source.sourceType||''} ${source.title||''} ${source.summary||''}`);
+  if(/injur|fitness|available|unavailable|ruled out|doubt|suspension|suspended|illness|concussion|return date|team news/.test(text))return 'AVAILABILITY';
+  if(/predicted lineup|predicted line up|predicted xi|likely xi/.test(text))return 'PREDICTED_LINEUP';
+  if(/training|trained|recovery session/.test(text))return 'TRAINING';
+  if(/confirmed start|confirmed bench|starting xi|starting line up|starting lineup|lineup|line up|starts|started|full 90|substitut|friendly|preseason|pre season/.test(text))return 'LINEUP';
+  if(/transfer|signing|signed|joins|joined|move|loan|depart|leaves|left club|competition for|shirt competition|depth chart|hierarchy/.test(text))return 'ROLE_COMPETITION';
+  if(/penalt|corner|free kick|set piece/.test(text))return 'SET_PIECE_ROLE';
+  if(/tactical|formation|position|role|first choice|minutes pattern/.test(text))return 'TACTICAL_ROLE';
+  return 'GENERAL';
+}
+function freshEvidenceWindowDays(category){return ({AVAILABILITY:21,PREDICTED_LINEUP:7,TRAINING:14,LINEUP:30,ROLE_COMPETITION:120,SET_PIECE_ROLE:120,TACTICAL_ROLE:90,GENERAL:30})[category]||30}
+function freshRecency(date,category='GENERAL',now=Date.now()){
+  const windowDays=freshEvidenceWindowDays(category),ms=Date.parse(date||'');
+  if(!Number.isFinite(ms))return {band:'DATE UNKNOWN',weight:0.08,ageHours:null,windowDays,decisionEligible:false};
   const hours=Math.max(0,(now-ms)/3600000);
-  if(hours<=24)return {band:'TODAY',weight:1,ageHours:Math.round(hours)};
-  if(hours<=72)return {band:'1–2 DAYS',weight:0.9,ageHours:Math.round(hours)};
-  if(hours<=14*24)return {band:'RECENT',weight:0.68,ageHours:Math.round(hours)};
-  if(hours<=45*24)return {band:'LATE PRESEASON / CURRENT WINDOW',weight:0.46,ageHours:Math.round(hours)};
-  return {band:'HISTORICAL',weight:0.18,ageHours:Math.round(hours)};
+  const decisionEligible=hours<=windowDays*24;
+  if(hours<=24)return {band:'TODAY',weight:1,ageHours:Math.round(hours),windowDays,decisionEligible};
+  if(hours<=72)return {band:'1–2 DAYS',weight:0.9,ageHours:Math.round(hours),windowDays,decisionEligible};
+  if(hours<=14*24)return {band:'RECENT',weight:0.68,ageHours:Math.round(hours),windowDays,decisionEligible};
+  if(decisionEligible){const progress=hours/(windowDays*24);return {band:category==='ROLE_COMPETITION'||category==='TACTICAL_ROLE'||category==='SET_PIECE_ROLE'?'CURRENT ROLE WINDOW':'CURRENT DECISION WINDOW',weight:Number(Math.max(0.34,0.66-progress*0.28).toFixed(3)),ageHours:Math.round(hours),windowDays,decisionEligible}}
+  return {band:'HISTORICAL',weight:0.08,ageHours:Math.round(hours),windowDays,decisionEligible:false};
 }
 function freshSourceWeight(source){
   const authority=({1:1,2:0.78,3:0.52,4:0.25})[Number(source.authorityTier)]||0.2;
-  let weight=authority*freshRecency(source.relevantDate).weight;
+  const category=source.evidenceCategory||freshEvidenceCategory(source);
+  let weight=authority*freshRecency(source.relevantDate,category).weight;
   if(/final (?:pre-season|preseason)|final friendly/i.test(`${source.title} ${source.summary}`))weight*=1.12;
   else if(/pre-season|preseason|friendly/i.test(`${source.title} ${source.summary}`))weight*=0.82;
   if(source.preferredSource===true)weight*=1.08; // preference within a tier; never outranks Tier 1
   return Number(clamp(weight,0,1).toFixed(3));
 }
+function freshAnnotateEvidence(source){
+  const evidenceCategory=source.evidenceCategory||freshEvidenceCategory(source),recency=freshRecency(source.relevantDate,evidenceCategory);
+  const item={...source,evidenceCategory,recency:recency.band,decisionWindowDays:recency.windowDays,decisionEligible:recency.decisionEligible};
+  return {...item,weight:freshSourceWeight(item)};
+}
+function freshEvidenceCoverage(evidence){
+  const current=evidence.filter(item=>item.decisionEligible===true),tier1=current.filter(item=>Number(item.authorityTier)===1),tier2=current.filter(item=>Number(item.authorityTier)===2);
+  const distinctTier2=new Set(tier2.map(item=>`${normal(item.publisher)}:${hostOf(item.publisherUrl||item.url)}`));
+  if(tier1.length||distinctTier2.size>=2)return {status:'VERIFIED',decisionEvidenceCount:current.length,historicalEvidenceCount:evidence.length-current.length,note:tier1.length?'Current Tier 1 evidence independently validates this review.':'Multiple current Tier 2 sources independently support this review.'};
+  if(current.length)return {status:'PARTIAL',decisionEvidenceCount:current.length,historicalEvidenceCount:evidence.length-current.length,note:'Some current evidence was found, but source depth is not strong enough for independent verification.'};
+  return {status:'UNVERIFIED',decisionEvidenceCount:0,historicalEvidenceCount:evidence.length,note:evidence.length?'Only historical or undated context was found; it is retained for audit but cannot drive this gameweek verdict.':'No usable current external evidence was found.'};
+}
 
 function officialPlayerEvidence(report,player){
-  const target=normal(player.name);
+  const targets=new Set((player.identityAliases?.length?player.identityAliases:freshIdentityAliases(player)).map(normal));
   const events=Array.isArray(report?.events)?report.events:[];
-  return events.filter(e=>normal(e.affected)===target||normal(e.subject)===target).map((e,index)=>{
+  return events.filter(e=>targets.has(normal(e.affected))||targets.has(normal(e.subject))).map((e,index)=>{
     const source=String(e.source||'');
     const type=String(e.type||e.rawType||'official update').replace(/_/g,' ');
     let signal='neutral';
-    if(['confirmed_start','observed_role','manager_positive','departure','loan_out','injury'].includes(e.type))signal='positive';
-    if(['confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension','manager_negative','rotation_warning','signing','loan_in','return'].includes(e.type))signal='negative';
+    if(['confirmed_start','observed_role','manager_positive'].includes(e.type))signal='positive';
+    if(['confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension','manager_negative','rotation_warning','injury'].includes(e.type))signal='negative';
     const tier=freshPublisherTier(report?.club||player.club,source,e.reason||type);
     const item={
       id:`official-${hashString(`${player.playerId}:${e.id||index}:${source}`)}`,title:`${report?.club||player.club}: ${type}`,
       publisher:report?.club||hostOf(source)||'Official source',publisherUrl:source,url:source,
       relevantDate:e.evidenceDate||report?.evidenceGeneratedAt||report?.generatedAt||null,authorityTier:Math.min(2,tier),
       sourceType:'OFFICIAL / STRUCTURED',summary:cleanText(e.reason||`${player.name}: ${type}`).slice(0,500),
-      signal,communityInference:false
+      signal,communityInference:false,eventType:e.type||e.rawType||type
     };
-    return {...item,recency:freshRecency(item.relevantDate).band,weight:freshSourceWeight(item)};
+    return freshAnnotateEvidence(item);
   });
 }
 
-function freshNewsQuery(player){
-  const club=CLUB_SOURCES[player.club]?.name||player.club;
-  return `"${player.name}" "${club}" (injury OR training OR "press conference" OR "predicted lineup" OR starts OR rotation OR role OR tactical OR competition OR preseason OR penalties OR corners OR "free kicks" OR RotoWire) when:14d`;
+function freshSearchName(player){return cleanText(player.searchName||player.canonicalName||player.name)}
+function freshTextHasPhrase(text,phrase){const needle=normal(phrase);return Boolean(needle&&` ${normal(text)} `.includes(` ${needle} `))}
+function freshRegExpEscape(value){return String(value||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
+function freshPlayerEvidenceMatches(player,text){
+  const hay=cleanText(text),aliases=player.identityAliases?.length?player.identityAliases:freshIdentityAliases(player);
+  const canonical=normal(player.canonicalName||''),canonicalParts=canonical.split(' ').filter(Boolean);
+  for(const alias of aliases){const parts=normal(alias).split(' ').filter(Boolean);if(parts.length>=2&&freshTextHasPhrase(hay,alias))return true}
+  const web=normal(player.webName||player.name),surname=canonicalParts.at(-1)||normal(player.name).split(' ').filter(Boolean).at(-1)||'';
+  const clubName=CLUB_SOURCES[player.club]?.name||'',clubPresent=freshTextHasPhrase(hay,clubName)||freshTextHasPhrase(hay,player.club);
+  if(!surname||!freshTextHasPhrase(hay,surname))return false;
+  // A compact surname is only safe with club context. If the headline names a
+  // different first name (Joe Gomez vs Diego Gomez), reject it explicitly.
+  if(canonicalParts.length>=2){
+    if(!clubPresent)return false;
+    const nh=normal(hay),match=nh.match(new RegExp(`\\b([a-z][a-z0-9]+)\\s+${freshRegExpEscape(surname)}\\b`));
+    const stop=new Set(['the','for','with','from','after','before','about','and','but','not','new','latest','update','injury','on','of','to','vs']);
+    if(match&&match[1]!==canonicalParts[0]&&!stop.has(match[1]))return false;
+    return true;
+  }
+  return freshTextHasPhrase(hay,web)||freshTextHasPhrase(hay,player.name);
 }
-function freshNewsDate(value){
+function freshNewsQueries(player,now=Date.now()){
+  const club=CLUB_SOURCES[player.club]?.name||player.club;
+  const name=freshSearchName(player),date=days=>new Date(now-days*86400000).toISOString().slice(0,10);
+  return [
+    `"${name}" "${club}" (injury OR training OR fitness OR "press conference" OR "predicted lineup" OR "starting XI" OR rotation OR RotoWire) after:${date(45)}`,
+    `"${name}" "${club}" (role OR competition OR transfer OR signing OR preseason OR penalties OR corners OR "free kicks") after:${date(120)}`
+  ];
+}
+function freshNewsQuery(player,now=Date.now()){return freshNewsQueries(player,now)[0]}
+function freshNewsDate(value,now=Date.now()){
   value=stripXml(value);if(!value)return null;
-  if(!/\b\d{4}\b/.test(value))value+=` ${new Date().getUTCFullYear()}`;
-  if(!/\b\d{1,2}:\d{2}\b/.test(value))value+=' 12:00:00 UTC';
+  const relative=normal(value).match(/\b(\d+)\s+(minute|hour|day)s?\s+ago\b/);
+  if(relative){const unitMs={minute:60000,hour:3600000,day:86400000}[relative[2]];return new Date(now+0-Number(relative[1])*unitMs).toISOString()}
+  if(/^today\b/i.test(value))value=value.replace(/^today\b/i,new Date(now).toISOString().slice(0,10));
+  if(/^yesterday\b/i.test(value))value=value.replace(/^yesterday\b/i,new Date(now-86400000).toISOString().slice(0,10));
+  if(!/\b\d{4}\b/.test(value))value+=` ${new Date(now).getUTCFullYear()}`;
+  if(!/\b\d{1,2}:\d{2}(?::\d{2})?/.test(value))value+=' 12:00:00 UTC';
+  else if(/^\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?$/.test(value))value+=' UTC';
   const parsed=Date.parse(value);return Number.isFinite(parsed)?new Date(parsed).toISOString():null;
 }
 function freshNewsItem(player,{title,link,relevantDate,publisher,publisherUrl='',summary='',index=0,provider='Google News'}){
   title=stripXml(title);summary=stripXml(summary);link=decodeXml(link);publisher=stripXml(publisher)||provider;
   if(!title||!link)return null;
-  const nameParts=normal(player.name).split(' ').filter(x=>x.length>2),hay=normal(`${title} ${summary}`);
-  if(nameParts.length&&!nameParts.some(part=>hay.includes(part)))return null;
+  if(!freshPlayerEvidenceMatches(player,`${title} ${summary}`))return null;
   const authorityTier=freshPublisherTier(publisher,publisherUrl,title),preferredSource=/rotowire/i.test(`${publisher} ${publisherUrl} ${title}`);
   const item={
     id:`news-${hashString(`${player.playerId}:${link}:${index}`)}`,title:title.slice(0,240),publisher:publisher.slice(0,120),publisherUrl,
     relevantDate:freshNewsDate(relevantDate),authorityTier,sourceType:authorityTier===3?'COMMUNITY SIGNAL':'NEWS / LINEUP SIGNAL',
     summary:(summary||`Headline signal: ${title}`).slice(0,500),url:link,signal:freshSignal(`${title} ${summary}`),communityInference:authorityTier>=3,preferredSource,searchProvider:provider
   };
-  return {...item,recency:freshRecency(item.relevantDate).band,weight:freshSourceWeight(item)};
+  return freshAnnotateEvidence(item);
 }
 function freshNewsItemsFromRss(xml,player,provider='Google News'){
   const blocks=String(xml||'').match(/<item>[\s\S]*?<\/item>/gi)||[],items=[];
@@ -3398,8 +3492,9 @@ function freshNewsItemsFromRss(xml,player,provider='Google News'){
 }
 function htmlAttr(tag,name){const match=String(tag||'').match(new RegExp(`\\b${name}=["']([^"']+)["']`,'i'));return match?decodeXml(match[1]):''}
 function freshNewsItemsFromHtml(markup,player){
-  const items=[],anchors=String(markup||'').match(/<a\b[^>]*>[\s\S]*?<\/a>/gi)||[];
-  for(const [index,anchor] of anchors.entries()){
+  const html=String(markup||''),items=[],anchorRe=/<a\b[^>]*>[\s\S]*?<\/a>/gi;let hit,index=0;
+  while((hit=anchorRe.exec(html))){
+    const anchor=hit[0];
     if(!/(?:\bclass=["'][^"']*\bJtKRv\b|\bdata-n-tid=["']29["'])/i.test(anchor))continue;
     const href=htmlAttr(anchor,'href'),visible=stripXml((anchor.match(/>([\s\S]*?)<\/a>$/i)||[])[1]||''),aria=htmlAttr(anchor,'aria-label');
     if(!href||!visible)continue;
@@ -3408,9 +3503,11 @@ function freshNewsItemsFromHtml(markup,player){
       const tail=aria.slice(visible.length).replace(/^\s*-\s*/,'').split(/\s+-\s+/).filter(Boolean);
       publisher=tail[0]||publisher;relevantDate=tail[1]||'';
     }
+    const card=html.slice(Math.max(0,hit.index-1200),Math.min(html.length,hit.index+anchor.length+2600));
+    if(!relevantDate){const time=card.match(/<time\b[^>]*(?:datetime|data-time|data-date)=["']([^"']+)["'][^>]*>/i);relevantDate=time?.[1]||''}
     let link='';try{link=new URL(href,'https://news.google.com').toString()}catch{continue}
     const item=freshNewsItem(player,{title:visible,link,relevantDate,publisher,index,provider:'Google News HTML'});
-    if(item)items.push(item);if(items.length>=FRESH_NEWS_MAX_ITEMS)break;
+    if(item)items.push(item);index++;if(items.length>=FRESH_NEWS_MAX_ITEMS)break;
   }
   return items;
 }
@@ -3427,28 +3524,39 @@ async function freshBrowserSearchPermit(env){
   return {allowed:true};
 }
 async function googleNewsEvidence(env,player){
-  const query=freshNewsQuery(player);
-  const rssUrl=`https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`,htmlUrl=`https://news.google.com/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`;
-  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),8000);
-  const errors=[];
-  try{
-    const response=await fetch(rssUrl,{headers:{'User-Agent':'OTB-Fresh-Squad-Review/1.0','Accept':'application/rss+xml,application/xml;q=0.9'},signal:controller.signal});
-    if(response.ok){const items=freshNewsItemsFromRss(await response.text(),player);if(items.length)return {status:'ok',provider:'google-rss',query,items}}
-    else errors.push(`Google RSS HTTP ${response.status}`);
-  }catch(error){errors.push(error?.message||String(error))}
-  finally{clearTimeout(timer)}
-  try{
-    const response=await fetch(htmlUrl,{headers:{'User-Agent':'Mozilla/5.0 (compatible; OTB-Fresh-Squad-Review/1.0)','Accept':'text/html,application/xhtml+xml','Accept-Language':'en-GB,en;q=0.9'},redirect:'follow'});
-    if(response.ok){const items=freshNewsItemsFromHtml(await response.text(),player);if(items.length)return {status:'ok',provider:'google-html',query,items}}
-    else errors.push(`Google HTML HTTP ${response.status}`);
-  }catch(error){errors.push(error?.message||String(error))}
-  try{
-    const permit=await freshBrowserSearchPermit(env);if(!permit.allowed)throw new Error(permit.reason);
-    const rendered=await quickActionJson(env,'content',{url:htmlUrl,gotoOptions:GOTO}),markup=typeof rendered==='string'?rendered:(rendered?.content||rendered?.html||''),items=freshNewsItemsFromHtml(markup,player);
-    if(items.length)return {status:'ok',provider:'google-browser',query,items};
-    errors.push('Google Browser search returned no player-specific results');
-  }catch(error){errors.push(error?.message||String(error))}
-  return {status:'error',provider:'unavailable',query,items:[],error:errors.filter(Boolean).join(' · ').slice(0,600)};
+  const queries=freshNewsQueries(player),errors=[],providers=[],collected=[];
+  const merge=items=>{for(const item of items||[])if(!collected.some(row=>row.url===item.url&&normal(row.title)===normal(item.title)))collected.push(item)};
+  for(const query of queries){
+    const rssUrl=`https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`,htmlUrl=`https://news.google.com/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`;
+    let controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);
+    try{
+      const response=await fetch(rssUrl,{headers:{'User-Agent':'OTB-Fresh-Squad-Review/1.1','Accept':'application/rss+xml,application/xml;q=0.9'},signal:controller.signal});
+      if(response.ok){const items=freshNewsItemsFromRss(await response.text(),player);merge(items);if(items.length)providers.push('google-rss')}
+      else errors.push(`Google RSS HTTP ${response.status}`);
+    }catch(error){errors.push(error?.message||String(error))}finally{clearTimeout(timer)}
+    controller=new AbortController();timer=setTimeout(()=>controller.abort(),8000);
+    try{
+      const response=await fetch(htmlUrl,{headers:{'User-Agent':'Mozilla/5.0 (compatible; OTB-Fresh-Squad-Review/1.1)','Accept':'text/html,application/xhtml+xml','Accept-Language':'en-GB,en;q=0.9'},redirect:'follow',signal:controller.signal});
+      if(response.ok){const items=freshNewsItemsFromHtml(await response.text(),player);merge(items);if(items.length)providers.push('google-html')}
+      else errors.push(`Google HTML HTTP ${response.status}`);
+    }catch(error){errors.push(error?.message||String(error))}finally{clearTimeout(timer)}
+  }
+  // Browser Run is the expensive fallback. Use it only when direct public
+  // transport failed to produce decision-eligible evidence, and stop as soon
+  // as a query does so.
+  if(!collected.some(item=>item.decisionEligible))for(const query of queries){
+    const htmlUrl=`https://news.google.com/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`;
+    try{
+      const permit=await freshBrowserSearchPermit(env);if(!permit.allowed)throw new Error(permit.reason);
+      const rendered=await quickActionJson(env,'content',{url:htmlUrl,gotoOptions:GOTO}),markup=typeof rendered==='string'?rendered:(rendered?.content||rendered?.html||''),items=freshNewsItemsFromHtml(markup,player);
+      merge(items);if(items.length)providers.push('google-browser');
+      if(items.some(item=>item.decisionEligible))break;
+      errors.push('Google Browser search returned no current player-specific results');
+    }catch(error){errors.push(error?.message||String(error))}
+  }
+  const items=collected.sort((a,b)=>Number(b.decisionEligible)-Number(a.decisionEligible)||a.authorityTier-b.authorityTier||Number(b.preferredSource)-Number(a.preferredSource)||b.weight-a.weight).slice(0,FRESH_NEWS_MAX_ITEMS);
+  if(items.length)return {status:items.some(item=>item.decisionEligible)?'ok':'historical-only',provider:[...new Set(providers)].join('+')||'google-public',query:queries[0],queries,items,error:errors.filter(Boolean).join(' · ').slice(0,600)||null};
+  return {status:'error',provider:'unavailable',query:queries[0],queries,items:[],error:errors.filter(Boolean).join(' · ').slice(0,600)};
 }
 
 function playerReviewSchema(){return {
@@ -3462,9 +3570,9 @@ function playerReviewSchema(){return {
 }}
 async function aiFreshPlayerReview(env,context,player,evidence){
   if(!env.AI?.run)return {status:'unavailable',value:null,error:'Workers AI binding unavailable'};
-  const sources=evidence.map(e=>({id:e.id,tier:e.authorityTier,date:e.relevantDate,recency:e.recency,weight:e.weight,signal:e.signal,publisher:e.publisher,title:e.title,summary:e.summary,communityInference:e.communityInference,preferredSource:e.preferredSource===true}));
+  const sources=evidence.map(e=>({id:e.id,tier:e.authorityTier,date:e.relevantDate,recency:e.recency,evidenceCategory:e.evidenceCategory,decisionWindowDays:e.decisionWindowDays,decisionEligible:e.decisionEligible===true,weight:e.weight,signal:e.signal,publisher:e.publisher,title:e.title,summary:e.summary,communityInference:e.communityInference,preferredSource:e.preferredSource===true}));
   const chipNote=context.activeChip==='BENCH_BOOST'?'All 15 score: treat this player as decision-critical.':context.activeChip==='TRIPLE_CAPTAIN'&&player.captain?'Triple Captain: apply enhanced scrutiny to this captain.':player.scoring?'This player scores in the selected gameweek.':'Ordinary bench player: preserve risk information but weight immediate squad impact lower.';
-  const prompt=`Audit one Fantasy Premier League selection for gameweek ${context.gameweek}. Compare OTB's quantitative assumption with only the supplied current evidence.\n\nPLAYER: ${player.name} (${player.club}, ${player.position}, ${player.squadRole})\nOTB: ${Math.round(player.startProbability*100)}% start band; ${player.expectedMinutes} xMins; ${player.xPts} xPts; availability ${Math.round(player.availability*100)}%.\nCHIP: ${context.activeChip}. ${chipNote}\n\nEVIDENCE JSON:\n${JSON.stringify(sources)}\n\nRULES:\n- Keep three layers distinct: OTB assumption, external evidence, and verdict.\n- Tier 1 official/confirmed evidence outranks contradictory Tier 2, Tier 3 or Tier 4 signals. Tier 3/4 is inference, never fact. RotoWire is preferred within Tier 2 when publicly accessible, but never outranks Tier 1.\n- Recency matters: final preseason/current team evidence outranks early friendlies or last season.\n- Look for both positive and negative disagreement. Do not default to concern.\n- Never invent a source, fact, percentage, lineup, injury, rival, quote or role. Do not create a new numeric start probability.\n- UNKNOWN when evidence is absent or too weak. MONITOR when signals conflict.\n- evidenceIds must contain only IDs from EVIDENCE JSON.\n- Summarise; do not quote copyrighted passages. Return compact JSON.`;
+  const prompt=`Audit one Fantasy Premier League selection for gameweek ${context.gameweek}. Compare OTB's quantitative assumption with only the supplied current evidence.\n\nPLAYER: ${player.canonicalName||player.name} (OTB display: ${player.name}; ${player.club}, ${player.position}, ${player.squadRole})\nOTB: ${Math.round(player.startProbability*100)}% start band; ${player.expectedMinutes} xMins; ${player.xPts} xPts; availability ${Math.round(player.availability*100)}%.\nCHIP: ${context.activeChip}. ${chipNote}\n\nEVIDENCE JSON:\n${JSON.stringify(sources)}\n\nRULES:\n- Keep three layers distinct: OTB assumption, external evidence, and verdict.\n- Tier 1 official/confirmed evidence outranks contradictory Tier 2, Tier 3 or Tier 4 signals. Tier 3/4 is inference, never fact. RotoWire is preferred within Tier 2 when publicly accessible, but never outranks Tier 1.\n- Only evidence marked decisionEligible may drive the gameweek verdict. Other evidence is audit context only.\n- Category-specific recency matters: availability and predicted-lineup evidence expires quickly; transfers, shirt competition and tactical roles remain relevant longer.\n- Look for both positive and negative disagreement. Do not default to concern.\n- Never invent a source, fact, percentage, lineup, injury, rival, quote or role. Do not create a new numeric start probability.\n- UNKNOWN when evidence is absent or too weak. MONITOR when signals conflict.\n- evidenceIds must contain only IDs from EVIDENCE JSON.\n- Summarise; do not quote copyrighted passages. Return compact JSON.`;
   const run=env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast',{
     messages:[{role:'system',content:'You are a conservative FPL evidence auditor. Evidence authority and recency outrank narrative confidence.'},{role:'user',content:prompt}],
     response_format:{type:'json_schema',json_schema:{name:'otb_fresh_player_review',strict:true,schema:playerReviewSchema()}},temperature:0
@@ -3483,7 +3591,7 @@ function fallbackFreshClassification(player,evidence){
   const meaningful=evidence.filter(e=>e.signal!=='neutral'&&e.weight>=0.2);
   const positive=meaningful.filter(e=>e.signal==='positive').reduce((s,e)=>s+e.weight,0);
   const negative=meaningful.filter(e=>e.signal==='negative').reduce((s,e)=>s+e.weight,0);
-  if(!positive&&!negative)return 'AGREE';
+  if(!positive&&!negative)return 'UNKNOWN';
   if(positive>0&&negative>0&&Math.min(positive,negative)>=0.35*Math.max(positive,negative))return 'MONITOR';
   if(negative>positive){
     if(player.startProbability>=0.78&&negative>=0.75)return 'STRONG DOWNGRADE';
@@ -3500,17 +3608,17 @@ function statusForFreshPlayer(context,player,classification){
   if(classification==='STRONG DOWNGRADE')return critical?'RED':'AMBER';
   if(classification==='DOWNGRADE'||classification==='MONITOR')return 'AMBER';
   if(classification==='STRONG UPGRADE'||classification==='UPGRADE')return 'OPPORTUNITY';
-  if(classification==='UNKNOWN')return critical?'AMBER':'GREEN';
   if(critical&&(player.startProbability<0.7||player.expectedMinutes<55))return 'AMBER';
   return 'GREEN';
 }
 function enforceFreshVerdict(context,player,evidence,draft){
-  const decisionEvidence=evidence.filter(item=>{const recency=freshRecency(item.relevantDate);return recency.ageHours!==null&&recency.ageHours<=45*24});
+  const annotatedEvidence=(evidence||[]).map(item=>item.decisionEligible===undefined?freshAnnotateEvidence(item):item),decisionEvidence=annotatedEvidence.filter(item=>item.decisionEligible===true),coverage=freshEvidenceCoverage(annotatedEvidence);
   const draftClassification=FRESH_CLASSIFICATIONS.has(draft?.classification)?draft.classification:null;
   let classification=draftClassification||fallbackFreshClassification(player,decisionEvidence);
   const supportingPositive=decisionEvidence.some(e=>e.signal==='positive'&&e.weight>=0.2),supportingNegative=decisionEvidence.some(e=>e.signal==='negative'&&e.weight>=0.2);
   if(['STRONG UPGRADE','UPGRADE'].includes(classification)&&!supportingPositive)classification=fallbackFreshClassification(player,decisionEvidence);
   if(['STRONG DOWNGRADE','DOWNGRADE'].includes(classification)&&!supportingNegative)classification=fallbackFreshClassification(player,decisionEvidence);
+  if(classification==='AGREE'&&!supportingPositive&&!supportingNegative)classification=fallbackFreshClassification(player,decisionEvidence);
   const authoritative=decisionEvidence.filter(e=>e.authorityTier===1&&e.weight>=0.45&&e.signal!=='neutral');
   const positive=authoritative.some(e=>e.signal==='positive'),negative=authoritative.some(e=>e.signal==='negative');
   if(positive&&negative)classification='MONITOR';
@@ -3521,10 +3629,10 @@ function enforceFreshVerdict(context,player,evidence,draft){
   const allowedIds=new Set(decisionEvidence.map(e=>e.id));
   const cited=[...new Set(Array.isArray(draft?.evidenceIds)?draft.evidenceIds.filter(id=>allowedIds.has(id)):[])];
   const strongest=decisionEvidence[0];
-  const defaultSummary=strongest?`${strongest.publisher}: ${strongest.summary}`:evidence.length?'Only historical or undated evidence was found; no source cleared the 45-day decision window.':'No usable current external evidence was available.';
+  const defaultSummary=strongest?`${strongest.publisher}: ${strongest.summary}`:coverage.note;
   let rationale=cleanText(draft?.rationale||'');
   if(draftClassification&&classification!==draftClassification)rationale='';
-  if(!decisionEvidence.length)rationale=evidence.length?'Older context was preserved for audit, but it is too stale or undated to challenge OTB for this gameweek.':'External evidence is unavailable or too weak to challenge the OTB assumption.';
+  if(!decisionEvidence.length)rationale='The live audit did not independently verify or contradict OTB for this player; no directional conclusion was invented.';
   else if(!rationale){
     if(classification==='UNKNOWN')rationale='External evidence is unavailable or too weak to challenge the OTB assumption.';
     else if(classification==='AGREE')rationale="Current source-ranked evidence does not materially contradict OTB's minutes and start assumption.";
@@ -3533,11 +3641,13 @@ function enforceFreshVerdict(context,player,evidence,draft){
   }
   if(context.activeChip==='BENCH_BOOST'&&(player.startProbability<0.5||player.expectedMinutes<45))rationale=`Bench Boost makes this player scoring-critical, while OTB itself gives only ${Math.round(player.startProbability*100)}% start and ${player.expectedMinutes} xMins. ${rationale}`;
   if(context.activeChip==='TRIPLE_CAPTAIN'&&player.captain)rationale=`Triple Captain increases the decision weight of this evidence. ${rationale}`;
+  if(player.scoring&&context.activeChip!=='BENCH_BOOST'&&(player.startProbability<0.7||player.expectedMinutes<55))rationale=`OTB itself flags start security at ${Math.round(player.startProbability*100)}% and ${player.expectedMinutes} xMins. ${rationale}`;
   return {
     freshEvidenceSummary:cleanText(decisionEvidence.length?(draft?.freshEvidenceSummary||defaultSummary):defaultSummary).slice(0,700),classification,status,
     confidence:!decisionEvidence.length||!decisionEvidence.some(e=>e.authorityTier<=2)?'LOW':(['HIGH','MEDIUM','LOW'].includes(draft?.confidence)?draft.confidence:(decisionEvidence.some(e=>e.authorityTier===1)?'HIGH':'MEDIUM')),
     rationale:rationale.slice(0,900),monitorPoint:cleanText(draft?.monitorPoint||(classification==='UNKNOWN'?'Check final official team news and predicted lineups.':'Re-check if later official evidence changes the current signal.')).slice(0,500),
-    evidenceIds:cited.length?cited:decisionEvidence.slice(0,4).map(e=>e.id)
+    evidenceIds:cited.length?cited:decisionEvidence.slice(0,4).map(e=>e.id),evidenceCoverage:coverage.status,coverageNote:coverage.note,
+    decisionEvidenceCount:coverage.decisionEvidenceCount,historicalEvidenceCount:coverage.historicalEvidenceCount
   };
 }
 
@@ -3547,24 +3657,24 @@ async function researchFreshPlayer(env,context,player){
   ]);
   const merged=[...officialPlayerEvidence(report,player),...(news.items||[])];
   const dedup=new Map();for(const item of merged){const key=`${normal(item.title)}:${hostOf(item.url)}`;if(!dedup.has(key)||dedup.get(key).authorityTier>item.authorityTier)dedup.set(key,item)}
-  const evidence=[...dedup.values()].sort((a,b)=>a.authorityTier-b.authorityTier||Number(b.preferredSource)-Number(a.preferredSource)||b.weight-a.weight||Date.parse(b.relevantDate||0)-Date.parse(a.relevantDate||0)).slice(0,8);
+  const evidence=[...dedup.values()].map(item=>item.decisionEligible===undefined?freshAnnotateEvidence(item):item).sort((a,b)=>Number(b.decisionEligible)-Number(a.decisionEligible)||a.authorityTier-b.authorityTier||Number(b.preferredSource)-Number(a.preferredSource)||b.weight-a.weight||Date.parse(b.relevantDate||0)-Date.parse(a.relevantDate||0)).slice(0,8);
   const ai=await aiFreshPlayerReview(env,context,player,evidence);
   const verdict=enforceFreshVerdict(context,player,evidence,ai.value);
   return {
-    playerId:player.playerId,name:player.name,club:player.club,position:player.position,squadRole:player.squadRole,
+    playerId:player.playerId,name:player.name,canonicalName:player.canonicalName||player.name,club:player.club,position:player.position,squadRole:player.squadRole,
     benchOrder:player.benchOrder,scoring:player.scoring,captain:player.captain,viceCaptain:player.viceCaptain,
     otb:{startProbability:player.startProbability,expectedMinutes:player.expectedMinutes,xPts:player.xPts,availability:player.availability},
-    ...verdict,evidence,research:{status:ai.status==='ok'?'complete':'complete-with-fallback',aiStatus:ai.status,aiError:ai.error||null,newsStatus:news.status,newsError:news.error||null,query:news.query},
+    ...verdict,evidence,research:{status:ai.status==='ok'?'complete':'complete-with-fallback',aiStatus:ai.status,aiError:ai.error||null,newsStatus:news.status,newsError:news.error||null,query:news.query,queries:news.queries||[news.query],currentItems:evidence.filter(item=>item.decisionEligible).length,identitySource:player.identitySource||'OTB_CONTEXT'},
     reviewedAt:new Date().toISOString(),mutatesProjection:false
   };
 }
 function unavailableFreshPlayer(context,player,error){
   const verdict=enforceFreshVerdict(context,player,[],{classification:'UNKNOWN',confidence:'LOW',freshEvidenceSummary:'Evidence unavailable for this player.',rationale:'The player research request failed; no conclusion was invented.',monitorPoint:'Retry the player or check final official team news.',evidenceIds:[]});
-  return {playerId:player.playerId,name:player.name,club:player.club,position:player.position,squadRole:player.squadRole,benchOrder:player.benchOrder,scoring:player.scoring,captain:player.captain,viceCaptain:player.viceCaptain,otb:{startProbability:player.startProbability,expectedMinutes:player.expectedMinutes,xPts:player.xPts,availability:player.availability},...verdict,evidence:[],research:{status:'failed',aiStatus:'not-run',aiError:cleanText(error).slice(0,300),newsStatus:'failed',newsError:cleanText(error).slice(0,300),query:freshNewsQuery(player)},reviewedAt:new Date().toISOString(),mutatesProjection:false};
+  return {playerId:player.playerId,name:player.name,canonicalName:player.canonicalName||player.name,club:player.club,position:player.position,squadRole:player.squadRole,benchOrder:player.benchOrder,scoring:player.scoring,captain:player.captain,viceCaptain:player.viceCaptain,otb:{startProbability:player.startProbability,expectedMinutes:player.expectedMinutes,xPts:player.xPts,availability:player.availability},...verdict,evidence:[],research:{status:'failed',aiStatus:'not-run',aiError:cleanText(error).slice(0,300),newsStatus:'failed',newsError:cleanText(error).slice(0,300),query:freshNewsQuery(player),queries:freshNewsQueries(player),currentItems:0,identitySource:player.identitySource||'OTB_CONTEXT'},reviewedAt:new Date().toISOString(),mutatesProjection:false};
 }
 
 function freshJobKey(id){return `fresh-review:job:${id}`}
-function freshCacheKey(hash){return `fresh-review:cache:${hash}`}
+function freshCacheKey(hash){return `fresh-review:cache:v2:${hash}`}
 async function storeFreshJob(env,job){await env.ROLE_KV.put(freshJobKey(job.jobId),JSON.stringify(job),{expirationTtl:FRESH_JOB_TTL_SECONDS})}
 function publicFreshJob(job){
   const total=job.selectedPlayerIds.length,completed=job.selectedPlayerIds.filter(id=>job.playerReviews[id]).length;
@@ -3574,7 +3684,7 @@ async function createFreshReviewJob(env,payload){
   const raw=payload?.context||payload;
   const validation=validateFreshReviewContext(raw);
   if(!validation.ok)return {error:'invalid squad context',details:validation.errors,status:400};
-  const context=validation.context,contextHash=await freshContextHash(context),force=payload?.force===true;
+  const context=await enrichFreshReviewIdentities(validation.context),contextHash=await freshContextHash(context),force=payload?.force===true;
   const cacheMinutes=freshCacheMinutes(context);
   if(!force){
     const cached=await env.ROLE_KV.get(freshCacheKey(contextHash),'json');
@@ -3619,19 +3729,26 @@ function freshPriority(review){
   if(review.classification==='STRONG DOWNGRADE')score+=8;if(review.classification==='UNKNOWN')score+=2;
   return score;
 }
+function freshMaterialIssue(review){
+  if(['STRONG DOWNGRADE','DOWNGRADE','MONITOR'].includes(review.classification)||review.status==='RED')return true;
+  if(review.status!=='AMBER')return false;
+  return review.classification!=='UNKNOWN'||review.otb?.availability<0.5||review.otb?.startProbability<0.7||review.otb?.expectedMinutes<55;
+}
 function buildFreshSquadSummary(context,reviews){
-  const negative=reviews.filter(r=>['RED','AMBER'].includes(r.status)).sort((a,b)=>freshPriority(b)-freshPriority(a));
+  const negative=reviews.filter(freshMaterialIssue).sort((a,b)=>freshPriority(b)-freshPriority(a));
   const positive=reviews.filter(r=>r.status==='OPPORTUNITY').sort((a,b)=>freshPriority(b)-freshPriority(a));
-  const primary=negative[0]||null,secondary=negative.slice(1,3),captain=reviews.find(r=>r.captain);
-  const primaryIssue=primary?`${primary.name} — ${primary.rationale}`:'No material current concern emerged from the source-ranked review.';
+  const primary=negative[0]||null,secondary=negative.slice(1,3),captain=reviews.find(r=>r.captain),scoring=reviews.filter(r=>r.scoring),unverified=scoring.filter(r=>r.evidenceCoverage==='UNVERIFIED');
+  const primaryIssue=primary?`${primary.name} — ${primary.rationale}`:unverified.length?`No evidence-backed player concern was identified; the live audit was inconclusive for ${unverified.length} of ${scoring.length} scoring players.`:'No material current concern emerged from the source-ranked review.';
   const positiveDisagreement=positive[0]?`${positive[0].name} — ${positive[0].rationale}`:'No material positive disagreement emerged.';
   let captainAssessment=`${captain?.name||'Captain'}: evidence unavailable.`;
-  if(captain)captainAssessment= captain.status==='RED'?`${captain.name} requires captaincy review.`:captain.status==='AMBER'?`${captain.name} remains plausible but carries a live-evidence caveat.`:`${captain.name} remains defensible on current evidence.`;
+  if(captain)captainAssessment= captain.status==='RED'?`${captain.name} requires captaincy review.`:captain.status==='AMBER'?`${captain.name} remains plausible but carries a material risk signal.`:captain.evidenceCoverage==='UNVERIFIED'?`${captain.name} remains OTB's captain choice, but the live review did not independently validate him.`:captain.evidenceCoverage==='PARTIAL'?`${captain.name} remains OTB's captain choice with partial external support.`:`${captain.name} remains defensible on current evidence.`;
   let overall='The live evidence audit found no material reason to change the saved squad automatically.';
   if(context.activeChip==='BENCH_BOOST'&&primary)overall=`Bench Boost makes all 15 scoring decisions material. Resolve the primary start-security issue before the deadline; OTB projections remain unchanged.`;
   else if(context.activeChip==='TRIPLE_CAPTAIN')overall=`Triple Captain increases captain evidence sensitivity. Review the captain finding before committing; OTB projections remain unchanged.`;
   else if(primary)overall='The squad remains intact, but the highlighted live-evidence risk deserves a manual decision before deadline.';
-  return {primaryIssue,secondaryRisks:secondary.map(r=>`${r.name} — ${r.rationale}`),positiveDisagreement,captainAssessment,overallVerdict:overall};
+  else if(unverified.length)overall=`No projection or squad change was made. External coverage remains incomplete for ${unverified.length} scoring players, so this run should be treated as an inconclusive audit rather than a clean bill of health.`;
+  const coverageWarning=unverified.length?`${unverified.length} of ${scoring.length} scoring players were not independently verified by current external evidence.`:'Every scoring player had at least partial current external evidence.';
+  return {coverageWarning,primaryIssue,secondaryRisks:secondary.map(r=>`${r.name} — ${r.rationale}`),positiveDisagreement,captainAssessment,overallVerdict:overall};
 }
 async function finalizeFreshReview(env,jobId){
   const job=await env.ROLE_KV.get(freshJobKey(jobId),'json');
@@ -3640,14 +3757,15 @@ async function finalizeFreshReview(env,jobId){
   for(const player of job.context.players)if(!job.playerReviews[player.playerId])job.playerReviews[player.playerId]=unavailableFreshPlayer(job.context,player,'Player research did not complete before finalization.');
   const playerReviews=job.context.players.map(p=>job.playerReviews[p.playerId]);
   const counts={GREEN:0,OPPORTUNITY:0,AMBER:0,RED:0};for(const row of playerReviews)counts[row.status]=(counts[row.status]||0)+1;
+  const coverageCounts={VERIFIED:0,PARTIAL:0,UNVERIFIED:0};for(const row of playerReviews)coverageCounts[row.evidenceCoverage]=(coverageCounts[row.evidenceCoverage]||0)+1;
   const generatedAt=new Date().toISOString(),cacheMinutes=job.cacheMinutes||freshCacheMinutes(job.context),cacheExpiresAt=new Date(Date.now()+cacheMinutes*60000).toISOString();
   const review={
     reviewId:job.jobId,schemaVersion:FRESH_REVIEW_VERSION,workerBuild:WORKER_BUILD,generatedAt,cacheExpiresAt,cacheMinutes,
     season:job.context.season,gameweek:job.context.gameweek,activeChip:job.context.activeChip,formation:job.context.formation,
-    playerCount:15,scoringPlayerCount:job.context.players.filter(p=>p.scoring).length,projectedScoringPoints:freshProjectedTotal(job.context),counts,
+    playerCount:15,scoringPlayerCount:job.context.players.filter(p=>p.scoring).length,projectedScoringPoints:freshProjectedTotal(job.context),counts,coverageCounts,
     summary:buildFreshSquadSummary(job.context,playerReviews),playerReviews,otbAlerts:job.context.otbAlerts,
-    research:{freshPlayers:job.selectedPlayerIds.length,reusedPlayers:playerReviews.filter(r=>r.reusedFromReviewId).length,failedPlayers:playerReviews.filter(r=>r.research?.status==='failed').length},
-    methodology:{authority:'Tier 1 official/confirmed evidence outranks Tier 2 reporting, Tier 3 community inference and Tier 4 aggregation.',recency:'Today and final/current team evidence is weighted above early preseason and historical evidence.',preferredSources:'Publicly accessible RotoWire information is preferred within Tier 2 when relevant. Gated content and access controls are never bypassed; systematic ingestion requires the licensed official API.',precision:'Qualitative confidence and disagreement classes are used; no synthetic start percentage is created.'},
+    research:{researchedPlayers:job.selectedPlayerIds.length,freshPlayers:job.selectedPlayerIds.length,reusedPlayers:playerReviews.filter(r=>r.reusedFromReviewId).length,failedPlayers:playerReviews.filter(r=>r.research?.status==='failed').length,currentEvidencePlayers:playerReviews.filter(r=>r.decisionEvidenceCount>0).length,verifiedPlayers:coverageCounts.VERIFIED,partialPlayers:coverageCounts.PARTIAL,unverifiedPlayers:coverageCounts.UNVERIFIED,scoringPlayersVerified:playerReviews.filter(r=>r.scoring&&r.evidenceCoverage==='VERIFIED').length},
+    methodology:{authority:'Tier 1 official/confirmed evidence outranks Tier 2 reporting, Tier 3 community inference and Tier 4 aggregation. Authority is assigned from the source, never headline wording.',recency:'Evidence uses category-specific decision windows: availability and predicted lineups expire quickly; role competition, transfers, tactical roles and set pieces remain relevant longer.',identity:'The official FPL element ID resolves canonical player names before search; compact surname results require club context and conflicting full names are rejected.',preferredSources:'Publicly accessible RotoWire information is preferred within Tier 2 when relevant. Gated content and access controls are never bypassed; systematic ingestion requires the licensed official API.',precision:'Qualitative confidence and disagreement classes are used; no synthetic start percentage is created.'},
     inputSnapshot:job.context,contextHash:job.contextHash,priorReviewId:job.priorReviewId,diff:job.diff,mutatesProjection:false
   };
   job.review=review;job.status='complete';job.updatedAt=generatedAt;await storeFreshJob(env,job);
