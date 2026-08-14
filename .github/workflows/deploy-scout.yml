@@ -44,6 +44,12 @@ jobs:
           test -n "$CLOUDFLARE_API_TOKEN"
           test -n "$CLOUDFLARE_ACCOUNT_ID"
 
+      - name: Run Worker regression tests
+        shell: bash
+        run: |
+          node --check worker.js
+          node --test test/*.test.mjs
+
       - name: Deploy current Scout main
         shell: bash
         run: >-
@@ -59,9 +65,11 @@ jobs:
               if HEALTH_JSON="$health_json" node -e '
                 const health = JSON.parse(process.env.HEALTH_JSON);
                 const valid = health.status === "ok"
-                  && health.workerBuild === "v2.22.7-rc5.2.7-source-read-contract"
-                  && health.schemaVersion === "1.33.0"
+                  && health.workerBuild === "v2.23.0-rc5.3.0-fresh-squad-review"
+                  && health.schemaVersion === "1.34.0"
                   && health.structuredFeedAvailable === true
+                  && health.freshReviewAvailable === true
+                  && health.freshReviewAuthConfigured === true
                   && !("apiFootballAvailable" in health);
                 if (!valid) process.exit(1);
                 console.log(`Verified ${health.workerBuild}, schema ${health.schemaVersion}`);
@@ -74,35 +82,10 @@ jobs:
           echo "Scout health did not report the expected build after deployment." >&2
           exit 1
 
-      - name: Remove obsolete API-Football secret
+      - name: Confirm live Fresh Review endpoint is owner-protected
         shell: bash
         run: |
-          secret_json="$(npx --yes wrangler@4.120.1 secret list --name "$WORKER_NAME" --format json)"
-          if SECRET_JSON="$secret_json" node -e '
-            const secrets = JSON.parse(process.env.SECRET_JSON);
-            process.exit(secrets.some((secret) => secret.name === "API_FOOTBALL_KEY") ? 0 : 1);
-          '; then
-            printf 'y\n' | npx --yes wrangler@4.120.1 secret delete API_FOOTBALL_KEY --name "$WORKER_NAME"
-          else
-            echo "API_FOOTBALL_KEY is already absent."
-          fi
-
-      - name: Confirm secret removal and Worker health
-        shell: bash
-        run: |
-          secret_json="$(npx --yes wrangler@4.120.1 secret list --name "$WORKER_NAME" --format json)"
-          SECRET_JSON="$secret_json" node -e '
-            const secrets = JSON.parse(process.env.SECRET_JSON);
-            if (secrets.some((secret) => secret.name === "API_FOOTBALL_KEY")) {
-              throw new Error("API_FOOTBALL_KEY still exists");
-            }
-            console.log("Confirmed API_FOOTBALL_KEY is absent.");
-          '
-          health_json="$(curl --fail --silent --show-error "$HEALTH_URL")"
-          HEALTH_JSON="$health_json" node -e '
-            const health = JSON.parse(process.env.HEALTH_JSON);
-            if (health.status !== "ok" || health.workerBuild !== "v2.22.7-rc5.2.7-source-read-contract") {
-              throw new Error("Scout health check failed after secret removal");
-            }
-            console.log("Scout remains healthy after secret cleanup.");
-          '
+          status="$(curl --silent --output /tmp/fresh-review.json --write-out '%{http_code}' \
+            -X POST "https://otb-role-intelligence.blackpharoahisking.workers.dev/api/fresh-review" \
+            -H 'Content-Type: application/json' --data '{}')"
+          test "$status" = "401"

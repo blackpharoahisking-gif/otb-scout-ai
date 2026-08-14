@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "otb-role-intelligence",
   "main": "./worker.js",
-  "compatibility_date": "2026-08-04",
+  "compatibility_date": "2026-08-14",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
     // Browser Run allowance tuning (Workers Paid).
@@ -42,5 +42,6 @@
   ],
   "ai": { "binding": "AI" },
   "browser": { "binding": "BROWSER" },
+  "observability": { "enabled": true, "head_sampling_rate": 1 },
   "triggers": { "crons": ["*/30 * * * *"] }
 }

@@ -1,4 +1,5 @@
-// OTB Role Intelligence Worker
+// OTB Role Intelligence + Fresh Squad Review Worker
+// v2.23.0 — RC5.3.0 authenticated, cached, source-ranked Fresh Squad Review
 // v2.22.7 — RC5.2.7 source-read / evidence-authority contract separation
 // v2.22.6 — RC5.2.6 order-tolerant rich-text extraction
 // v2.22.5 — RC5.2.5 structured short-article acceptance
@@ -24,11 +25,15 @@
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.33.0';
+const SCHEMA_VERSION = '1.34.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.22.7-rc5.2.7-source-read-contract';
+const WORKER_BUILD = 'v2.23.0-rc5.3.0-fresh-squad-review';
+// Public verification key for Marcus's signed Fresh Review owner capability.
+// This is intentionally public: the Ed25519 private signing key and issued
+// bearer capability never enter Worker configuration, Git history or HTML.
+const FRESH_REVIEW_OWNER_PUBLIC_KEY = 'oNTbK-7hSt-KAWPoEsqzpgyNyMO1bJ5ewZlYk-Og9TM';
 
 const AI_MIN_DOC_CHARS = 250;      // doc must have this much text to reach the model
 const ARTICLE_MIN_CHARS = 900;     // below this, try the browser for a fuller body
@@ -282,7 +287,8 @@ const CLUB_TERMS = Object.freeze({
 function cors(env){return {
   'Access-Control-Allow-Origin': env.ALLOWED_ORIGIN || '*',
   'Access-Control-Allow-Methods':'GET,POST,OPTIONS',
-  'Access-Control-Allow-Headers':'Content-Type,Authorization',
+  'Access-Control-Allow-Headers':'Content-Type,Authorization,X-OTB-Token',
+  'Vary':'Origin',
   'Cache-Control':'no-store'
 }}
 function json(data,status=200,env={}){return new Response(JSON.stringify(data,null,2),{status,headers:{'Content-Type':'application/json; charset=utf-8',...cors(env)}})}
@@ -406,6 +412,55 @@ function adminAuthorised(request,env){
   let diff=0;
   for(let i=0;i<expected.length;i++)diff|=expected.charCodeAt(i)^supplied.charCodeAt(i);
   return diff===0;
+}
+
+function bearerToken(request){
+  return (request.headers.get('authorization')||'').replace(/^Bearer\s+/i,'').trim();
+}
+
+async function sha256Hex(value){
+  const bytes=new TextEncoder().encode(String(value||''));
+  const digest=await crypto.subtle.digest('SHA-256',bytes);
+  return [...new Uint8Array(digest)].map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+
+function constantTimeEqual(a,b){
+  a=String(a||'');b=String(b||'');
+  if(a.length!==b.length)return false;
+  let diff=0;for(let i=0;i<a.length;i++)diff|=a.charCodeAt(i)^b.charCodeAt(i);
+  return diff===0;
+}
+
+function base64UrlBytes(value){
+  value=String(value||'');
+  if(!/^[A-Za-z0-9_-]+$/.test(value))throw new Error('invalid base64url');
+  const binary=atob(value.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-value.length%4)%4));
+  return Uint8Array.from(binary,ch=>ch.charCodeAt(0));
+}
+
+async function verifyFreshOwnerCapability(token,publicKey=FRESH_REVIEW_OWNER_PUBLIC_KEY,now=Math.floor(Date.now()/1000)){
+  try{
+    const parts=String(token||'').split('.');if(parts.length!==3)return false;
+    const header=JSON.parse(new TextDecoder().decode(base64UrlBytes(parts[0])));
+    const payload=JSON.parse(new TextDecoder().decode(base64UrlBytes(parts[1])));
+    if(header.alg!=='EdDSA'||header.typ!=='JWT'||header.kid!=='otb-fresh-2026-01')return false;
+    if(payload.iss!=='otb-owner'||payload.aud!=='otb-fresh-review'||payload.sub!=='marcus')return false;
+    if(!Array.isArray(payload.scope)||!payload.scope.includes('fresh-review'))return false;
+    if(!Number.isFinite(payload.iat)||!Number.isFinite(payload.nbf)||!Number.isFinite(payload.exp))return false;
+    if(payload.nbf>now+30||payload.iat>now+300||payload.exp<=now||payload.exp-payload.iat>366*86400)return false;
+    const key=await crypto.subtle.importKey('raw',base64UrlBytes(publicKey),{name:'Ed25519'},false,['verify']);
+    return crypto.subtle.verify({name:'Ed25519'},key,base64UrlBytes(parts[2]),new TextEncoder().encode(parts[0]+'.'+parts[1]));
+  }catch(e){return false}
+}
+
+/** Fresh Review is owner-only. Verdict receives a signed owner capability
+ *  out-of-band, keeps it in sessionStorage and sends it only in an HTTPS
+ *  Authorization header. Git and Worker configuration contain only the public
+ *  Ed25519 verification key, never a password, shared secret or token hash. */
+async function freshReviewAuthorised(request,env){
+  const adminExpected=String(env.SCOUT_ADMIN_TOKEN||''),adminSupplied=request.headers.get('x-otb-token')||bearerToken(request);
+  if(adminExpected&&constantTimeEqual(adminSupplied,adminExpected))return true;
+  return verifyFreshOwnerCapability(bearerToken(request));
 }
 
 /** Origin is a weak filter, not authentication. Direct address-bar requests
@@ -3127,12 +3182,453 @@ async function marketProbe(env, { regions = 'uk' } = {}) {
   };
 }
 
+/* ----------------------------------------------------- Fresh Squad Review */
+
+const FRESH_REVIEW_VERSION='1.0.0';
+const FRESH_CLASSIFICATIONS=new Set(['STRONG UPGRADE','UPGRADE','AGREE','MONITOR','DOWNGRADE','STRONG DOWNGRADE','UNKNOWN']);
+const FRESH_STATUSES=new Set(['GREEN','AMBER','RED','OPPORTUNITY']);
+const FRESH_CHIPS=new Set(['NONE','BENCH_BOOST','TRIPLE_CAPTAIN','FREE_HIT','WILDCARD']);
+const FRESH_JOB_TTL_SECONDS=60*60*24*7;
+const FRESH_NEWS_MAX_ITEMS=6;
+
+function activeChipValue(value){
+  const key=String(value||'NONE').trim().toUpperCase().replace(/[\s-]+/g,'_');
+  const aliases={BB:'BENCH_BOOST',BENCHBOOST:'BENCH_BOOST',TC:'TRIPLE_CAPTAIN',TRIPLECAPTAIN:'TRIPLE_CAPTAIN',FH:'FREE_HIT',FREEHIT:'FREE_HIT',WC:'WILDCARD',NO_CHIP:'NONE'};
+  const resolved=aliases[key]||key;
+  return FRESH_CHIPS.has(resolved)?resolved:'NONE';
+}
+function freshPosition(value){
+  const key=String(value||'').trim().toUpperCase();
+  return ({GK:'GKP',GOALKEEPER:'GKP',GKP:'GKP',DEFENDER:'DEF',DEF:'DEF',MIDFIELDER:'MID',MID:'MID',FORWARD:'FWD',FWD:'FWD',STRIKER:'FWD'})[key]||key;
+}
+function freshRole(value){return /^(XI|START|STARTER|STARTING)/i.test(String(value||''))?'XI':'BENCH'}
+function normalProbability(value){
+  let n=Number(value);if(!Number.isFinite(n))return null;
+  if(n>1&&n<=100)n/=100;
+  return clamp(n,0,1);
+}
+function finiteOr(value,fallback=0){const n=Number(value);return Number.isFinite(n)?n:fallback}
+function cleanAlert(alert){
+  if(typeof alert==='string')return {message:cleanText(alert).slice(0,500)};
+  if(!alert||typeof alert!=='object')return null;
+  return {code:cleanText(alert.code||'').slice(0,80),severity:cleanText(alert.severity||alert.level||'').toUpperCase().slice(0,20),message:cleanText(alert.message||alert.text||alert.title||'').slice(0,500)};
+}
+
+/** Validate the legal FPL 15 before any external resource is spent. */
+function validateFreshReviewContext(raw){
+  const errors=[];
+  const source=raw&&typeof raw==='object'?raw:{};
+  const inputPlayers=Array.isArray(source.players)?source.players:[];
+  if(inputPlayers.length!==15)errors.push('A valid Fresh Review requires exactly 15 players.');
+  const players=inputPlayers.slice(0,15).map((p,index)=>{
+    const playerId=String(p?.playerId??p?.id??'').trim();
+    const position=freshPosition(p?.position||p?.pos);
+    const squadRole=freshRole(p?.squadRole||p?.role||(index<11?'XI':'BENCH'));
+    const benchOrder=squadRole==='BENCH'?Math.max(1,Math.min(4,Math.round(finiteOr(p?.benchOrder,p?.order??index-10)))):null;
+    return {
+      playerId,name:cleanText(p?.name||p?.webName||p?.playerName).slice(0,100),
+      club:String(p?.club||p?.team||'').trim().toUpperCase().slice(0,8),position,squadRole,benchOrder,
+      captain:Boolean(p?.captain),viceCaptain:Boolean(p?.viceCaptain),
+      xPts:Number(finiteOr(p?.xPts??p?.projectedPoints,0).toFixed(2)),
+      // xMins is a gameweek total, so doubles can legitimately exceed 90.
+      expectedMinutes:Number(clamp(p?.expectedMinutes??p?.xMins,0,240).toFixed(1)),
+      startProbability:normalProbability(p?.startProbability??p?.startProb),
+      availability:normalProbability(p?.availability??1)
+    };
+  });
+  const ids=players.map(p=>p.playerId);
+  if(ids.some(id=>!id))errors.push('Every player requires a playerId.');
+  if(new Set(ids).size!==ids.length)errors.push('Player IDs must be unique.');
+  for(const p of players){
+    if(!p.name)errors.push(`Player ${p.playerId||'?'} requires a name.`);
+    if(!CLUB_SOURCES[p.club])errors.push(`${p.name||p.playerId}: unsupported club code ${p.club||'(blank)'}.`);
+    if(!['GKP','DEF','MID','FWD'].includes(p.position))errors.push(`${p.name||p.playerId}: invalid position ${p.position||'(blank)'}.`);
+    if(p.startProbability===null)errors.push(`${p.name||p.playerId}: start probability is required.`);
+    if(p.availability===null)errors.push(`${p.name||p.playerId}: availability is required.`);
+  }
+  const counts=Object.fromEntries(['GKP','DEF','MID','FWD'].map(pos=>[pos,players.filter(p=>p.position===pos).length]));
+  if(counts.GKP!==2||counts.DEF!==5||counts.MID!==5||counts.FWD!==3)errors.push('Squad must contain 2 GKP, 5 DEF, 5 MID and 3 FWD.');
+  if(players.filter(p=>p.squadRole==='XI').length!==11||players.filter(p=>p.squadRole==='BENCH').length!==4)errors.push('Squad must contain a starting XI and four bench players.');
+  const benchOrders=players.filter(p=>p.squadRole==='BENCH').map(p=>p.benchOrder).sort();
+  if(benchOrders.join(',')!=='1,2,3,4')errors.push('Bench order must contain positions 1 through 4 exactly once.');
+  const captainId=String(source.captainId??players.find(p=>p.captain)?.playerId??'');
+  const viceCaptainId=String(source.viceCaptainId??players.find(p=>p.viceCaptain)?.playerId??'');
+  const captain=players.find(p=>p.playerId===captainId),vice=players.find(p=>p.playerId===viceCaptainId);
+  if(!captain||captain.squadRole!=='XI')errors.push('Captain must be one of the starting XI.');
+  if(!vice||vice.squadRole!=='XI'||viceCaptainId===captainId)errors.push('Vice-captain must be a different member of the starting XI.');
+  players.forEach(p=>{p.captain=p.playerId===captainId;p.viceCaptain=p.playerId===viceCaptainId});
+  const activeChip=activeChipValue(source.activeChip);
+  players.forEach(p=>{p.scoring=activeChip==='BENCH_BOOST'||p.squadRole==='XI'});
+  const gameweek=Math.round(finiteOr(source.gameweek,0));
+  if(gameweek<1||gameweek>60)errors.push('Selected gameweek must be between 1 and 60.');
+  const deadline=source.deadline&&Number.isFinite(Date.parse(source.deadline))?new Date(source.deadline).toISOString():null;
+  const context={
+    season:cleanText(source.season||'2026/27').slice(0,20),gameweek,activeChip,
+    formation:cleanText(source.formation||'').slice(0,20),captainId,viceCaptainId,deadline,
+    players,otbAlerts:(Array.isArray(source.otbAlerts)?source.otbAlerts:[]).map(cleanAlert).filter(x=>x?.message).slice(0,50)
+  };
+  return {ok:errors.length===0,errors,context};
+}
+
+function stableJson(value){
+  if(Array.isArray(value))return `[${value.map(stableJson).join(',')}]`;
+  if(value&&typeof value==='object')return `{${Object.keys(value).sort().map(k=>`${JSON.stringify(k)}:${stableJson(value[k])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+async function freshContextHash(context){return sha256Hex(stableJson(context))}
+function freshPlayerSignature(player){return stableJson({playerId:player.playerId,club:player.club,position:player.position,squadRole:player.squadRole,benchOrder:player.benchOrder,captain:player.captain,viceCaptain:player.viceCaptain,xPts:player.xPts,expectedMinutes:player.expectedMinutes,startProbability:player.startProbability,availability:player.availability})}
+function freshContextDiff(previous,current){
+  const before=new Map((previous?.players||[]).map(p=>[String(p.playerId),p]));
+  const after=new Map((current?.players||[]).map(p=>[String(p.playerId),p]));
+  const added=[...after.keys()].filter(id=>!before.has(id));
+  const removed=[...before.keys()].filter(id=>!after.has(id));
+  const changed=[...after.keys()].filter(id=>before.has(id)&&freshPlayerSignature(before.get(id))!==freshPlayerSignature(after.get(id)));
+  const chipChanged=activeChipValue(previous?.activeChip)!==activeChipValue(current?.activeChip);
+  return {added,removed,changed,chipChanged,hasChanges:Boolean(added.length||removed.length||changed.length||chipChanged)};
+}
+function freshCacheMinutes(context,now=Date.now()){
+  const deadline=Date.parse(context?.deadline||'');
+  if(!Number.isFinite(deadline))return 180;
+  const hours=(deadline-now)/3600000;
+  if(hours<=2)return 20;
+  if(hours<=6)return 45;
+  if(hours<=48)return 180;
+  return 360;
+}
+function freshProjectedTotal(context){
+  const base=context.players.filter(p=>p.scoring).reduce((sum,p)=>sum+finiteOr(p.xPts,0),0);
+  const captain=context.players.find(p=>p.captain);
+  const extra=finiteOr(captain?.xPts,0)*(context.activeChip==='TRIPLE_CAPTAIN'?2:1);
+  return Number((base+extra).toFixed(2));
+}
+
+function decodeXml(value){return String(value||'').replace(/^<!\[CDATA\[|\]\]>$/g,'').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&#39;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&').trim()}
+function stripXml(value){return cleanText(decodeXml(String(value||'').replace(/<[^>]*>/g,' ')))}
+function xmlTag(block,tag){const hit=String(block||'').match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,'i'));return hit?stripXml(hit[1]):''}
+function freshPublisherTier(publisher,url,title=''){
+  const hay=normal(`${publisher} ${url} ${title}`);
+  const host=hostOf(url);
+  const officialHosts=new Set([...Object.values(CLUB_SOURCES).flatMap(c=>c.urls.map(hostOf)),'premierleague.com','fantasy.premierleague.com','thefa.com','uefa.com']);
+  if(officialHosts.has(host)||/official club|premier league|the fa|uefa/.test(hay))return 1;
+  if(/rotowire|bbc sport|sky sports|the athletic|guardian|telegraph|independent|reuters|associated press|espn|times|mail sport|liverpool echo|manchester evening news|evening standard|yorkshire evening post|chronicle live|football london|pa media|optus sport/.test(hay))return 2;
+  if(/reddit|supporter|fans? network|fan site|forum|blog|arsenal vision|anfield watch|this is anfield|leeds live|geordie boot boys|roker report|we are brighton|true faith/.test(hay))return 3;
+  return 4;
+}
+function freshSignal(text,type=''){
+  const t=normal(`${type} ${text}`);
+  if(/back in training|returned to training|returns? from injury|fit to (?:play|face)|available for|confirmed start|starting xi|starts|first choice|kept (?:his|her) place|played (?:the )?full 90|competitor (?:injured|leaves|departed)/.test(t))return 'positive';
+  if(/ruled out|unavailable|suspension|suspended|fitness doubt|doubtful|injury doubt|set to miss|will miss|minutes restricted|confirmed bench|benched|omitted|rotation warning|competition for|selection doubt|not in (?:the )?squad/.test(t))return 'negative';
+  return 'neutral';
+}
+function freshRecency(date,now=Date.now()){
+  const ms=Date.parse(date||'');if(!Number.isFinite(ms))return {band:'DATE UNKNOWN',weight:0.35,ageHours:null};
+  const hours=Math.max(0,(now-ms)/3600000);
+  if(hours<=24)return {band:'TODAY',weight:1,ageHours:Math.round(hours)};
+  if(hours<=72)return {band:'1–2 DAYS',weight:0.9,ageHours:Math.round(hours)};
+  if(hours<=14*24)return {band:'RECENT',weight:0.68,ageHours:Math.round(hours)};
+  if(hours<=45*24)return {band:'LATE PRESEASON / CURRENT WINDOW',weight:0.46,ageHours:Math.round(hours)};
+  return {band:'HISTORICAL',weight:0.18,ageHours:Math.round(hours)};
+}
+function freshSourceWeight(source){
+  const authority=({1:1,2:0.78,3:0.52,4:0.25})[Number(source.authorityTier)]||0.2;
+  let weight=authority*freshRecency(source.relevantDate).weight;
+  if(/final (?:pre-season|preseason)|final friendly/i.test(`${source.title} ${source.summary}`))weight*=1.12;
+  else if(/pre-season|preseason|friendly/i.test(`${source.title} ${source.summary}`))weight*=0.82;
+  if(source.preferredSource===true)weight*=1.08; // preference within a tier; never outranks Tier 1
+  return Number(clamp(weight,0,1).toFixed(3));
+}
+
+function officialPlayerEvidence(report,player){
+  const target=normal(player.name);
+  const events=Array.isArray(report?.events)?report.events:[];
+  return events.filter(e=>normal(e.affected)===target||normal(e.subject)===target).map((e,index)=>{
+    const source=String(e.source||'');
+    const type=String(e.type||e.rawType||'official update').replace(/_/g,' ');
+    let signal='neutral';
+    if(['confirmed_start','observed_role','manager_positive','departure','loan_out','injury'].includes(e.type))signal='positive';
+    if(['confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension','manager_negative','rotation_warning','signing','loan_in','return'].includes(e.type))signal='negative';
+    const tier=freshPublisherTier(report?.club||player.club,source,e.reason||type);
+    const item={
+      id:`official-${hashString(`${player.playerId}:${e.id||index}:${source}`)}`,title:`${report?.club||player.club}: ${type}`,
+      publisher:report?.club||hostOf(source)||'Official source',publisherUrl:source,url:source,
+      relevantDate:e.evidenceDate||report?.evidenceGeneratedAt||report?.generatedAt||null,authorityTier:Math.min(2,tier),
+      sourceType:'OFFICIAL / STRUCTURED',summary:cleanText(e.reason||`${player.name}: ${type}`).slice(0,500),
+      signal,communityInference:false
+    };
+    return {...item,recency:freshRecency(item.relevantDate).band,weight:freshSourceWeight(item)};
+  });
+}
+
+function freshNewsQuery(player){
+  const club=CLUB_SOURCES[player.club]?.name||player.club;
+  return `"${player.name}" "${club}" (injury OR training OR "press conference" OR "predicted lineup" OR starts OR rotation OR role OR tactical OR competition OR preseason OR penalties OR corners OR "free kicks" OR RotoWire) when:14d`;
+}
+async function googleNewsEvidence(player){
+  const query=freshNewsQuery(player);
+  const url=`https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`;
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),8000);
+  try{
+    const response=await fetch(url,{headers:{'User-Agent':'OTB-Fresh-Squad-Review/1.0'},signal:controller.signal});
+    if(!response.ok)throw new Error(`news search HTTP ${response.status}`);
+    const xml=await response.text();
+    const blocks=xml.match(/<item>[\s\S]*?<\/item>/gi)||[];
+    const nameParts=normal(player.name).split(' ').filter(x=>x.length>2);
+    const items=[];
+    for(const [index,block] of blocks.entries()){
+      const title=xmlTag(block,'title'),link=xmlTag(block,'link'),relevantDate=xmlTag(block,'pubDate');
+      const sourceHit=block.match(/<source(?:\s+url="([^"]+)")?[^>]*>([\s\S]*?)<\/source>/i);
+      const publisher=sourceHit?stripXml(sourceHit[2]):'News source';
+      const publisherUrl=sourceHit?decodeXml(sourceHit[1]||''):'';
+      if(!title||!link)continue;
+      const nt=normal(title);if(nameParts.length&&!nameParts.some(part=>nt.includes(part)))continue;
+      const authorityTier=freshPublisherTier(publisher,publisherUrl,title),preferredSource=/rotowire/i.test(`${publisher} ${publisherUrl}`);
+      const item={
+        id:`news-${hashString(`${player.playerId}:${link}:${index}`)}`,title:title.slice(0,240),publisher:publisher.slice(0,120),publisherUrl,
+        relevantDate:Number.isFinite(Date.parse(relevantDate))?new Date(relevantDate).toISOString():null,authorityTier,
+        sourceType:authorityTier===3?'COMMUNITY SIGNAL':'NEWS / LINEUP SIGNAL',
+        summary:`Headline signal: ${title}`.slice(0,500),url:link,signal:freshSignal(title),communityInference:authorityTier>=3,preferredSource
+      };
+      items.push({...item,recency:freshRecency(item.relevantDate).band,weight:freshSourceWeight(item)});
+      if(items.length>=FRESH_NEWS_MAX_ITEMS)break;
+    }
+    return {status:'ok',query,items};
+  }catch(error){return {status:'error',query,items:[],error:error?.message||String(error)}}
+  finally{clearTimeout(timer)}
+}
+
+function playerReviewSchema(){return {
+  type:'object',additionalProperties:false,
+  required:['freshEvidenceSummary','classification','status','confidence','rationale','monitorPoint','evidenceIds'],
+  properties:{
+    freshEvidenceSummary:{type:'string'},classification:{type:'string',enum:[...FRESH_CLASSIFICATIONS]},
+    status:{type:'string',enum:[...FRESH_STATUSES]},confidence:{type:'string',enum:['HIGH','MEDIUM','LOW']},
+    rationale:{type:'string'},monitorPoint:{type:'string'},evidenceIds:{type:'array',items:{type:'string'},maxItems:8}
+  }
+}}
+async function aiFreshPlayerReview(env,context,player,evidence){
+  if(!env.AI?.run)return {status:'unavailable',value:null,error:'Workers AI binding unavailable'};
+  const sources=evidence.map(e=>({id:e.id,tier:e.authorityTier,date:e.relevantDate,recency:e.recency,weight:e.weight,signal:e.signal,publisher:e.publisher,title:e.title,summary:e.summary,communityInference:e.communityInference,preferredSource:e.preferredSource===true}));
+  const chipNote=context.activeChip==='BENCH_BOOST'?'All 15 score: treat this player as decision-critical.':context.activeChip==='TRIPLE_CAPTAIN'&&player.captain?'Triple Captain: apply enhanced scrutiny to this captain.':player.scoring?'This player scores in the selected gameweek.':'Ordinary bench player: preserve risk information but weight immediate squad impact lower.';
+  const prompt=`Audit one Fantasy Premier League selection for gameweek ${context.gameweek}. Compare OTB's quantitative assumption with only the supplied current evidence.\n\nPLAYER: ${player.name} (${player.club}, ${player.position}, ${player.squadRole})\nOTB: ${Math.round(player.startProbability*100)}% start band; ${player.expectedMinutes} xMins; ${player.xPts} xPts; availability ${Math.round(player.availability*100)}%.\nCHIP: ${context.activeChip}. ${chipNote}\n\nEVIDENCE JSON:\n${JSON.stringify(sources)}\n\nRULES:\n- Keep three layers distinct: OTB assumption, external evidence, and verdict.\n- Tier 1 official/confirmed evidence outranks contradictory Tier 2, Tier 3 or Tier 4 signals. Tier 3/4 is inference, never fact. RotoWire is preferred within Tier 2 when publicly accessible, but never outranks Tier 1.\n- Recency matters: final preseason/current team evidence outranks early friendlies or last season.\n- Look for both positive and negative disagreement. Do not default to concern.\n- Never invent a source, fact, percentage, lineup, injury, rival, quote or role. Do not create a new numeric start probability.\n- UNKNOWN when evidence is absent or too weak. MONITOR when signals conflict.\n- evidenceIds must contain only IDs from EVIDENCE JSON.\n- Summarise; do not quote copyrighted passages. Return compact JSON.`;
+  const run=env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast',{
+    messages:[{role:'system',content:'You are a conservative FPL evidence auditor. Evidence authority and recency outrank narrative confidence.'},{role:'user',content:prompt}],
+    response_format:{type:'json_schema',json_schema:{name:'otb_fresh_player_review',strict:true,schema:playerReviewSchema()}},temperature:0
+  });
+  let timer;const settled=await Promise.race([
+    run.then(value=>({value}),error=>({error})),new Promise(resolve=>{timer=setTimeout(()=>resolve({timedOut:true}),25000)})
+  ]);if(timer)clearTimeout(timer);
+  if(settled.timedOut)return {status:'timeout',value:null,error:'Workers AI exceeded 25000ms'};
+  if(settled.error)return {status:'error',value:null,error:settled.error?.message||String(settled.error)};
+  let value=settled.value?.response??settled.value;if(typeof value==='string'){try{value=JSON.parse(value)}catch{return {status:'parse-error',value:null,error:'Workers AI returned invalid JSON'}}}
+  return {status:'ok',value,error:null};
+}
+
+function fallbackFreshClassification(player,evidence){
+  if(!evidence.length)return 'UNKNOWN';
+  const meaningful=evidence.filter(e=>e.signal!=='neutral'&&e.weight>=0.2);
+  const positive=meaningful.filter(e=>e.signal==='positive').reduce((s,e)=>s+e.weight,0);
+  const negative=meaningful.filter(e=>e.signal==='negative').reduce((s,e)=>s+e.weight,0);
+  if(!positive&&!negative)return 'AGREE';
+  if(positive>0&&negative>0&&Math.min(positive,negative)>=0.35*Math.max(positive,negative))return 'MONITOR';
+  if(negative>positive){
+    if(player.startProbability>=0.78&&negative>=0.75)return 'STRONG DOWNGRADE';
+    return player.startProbability<=0.45?'AGREE':'DOWNGRADE';
+  }
+  if(player.startProbability<=0.55&&positive>=0.7)return 'STRONG UPGRADE';
+  return player.startProbability>=0.86?'AGREE':'UPGRADE';
+}
+function statusForFreshPlayer(context,player,classification){
+  const critical=player.scoring||context.activeChip==='BENCH_BOOST';
+  if(player.availability<0.5)return critical?'RED':'AMBER';
+  if(context.activeChip==='BENCH_BOOST'&&(player.startProbability<0.5||player.expectedMinutes<45))return 'RED';
+  if(context.activeChip==='TRIPLE_CAPTAIN'&&player.captain&&(player.startProbability<0.78||player.expectedMinutes<65))return 'RED';
+  if(classification==='STRONG DOWNGRADE')return critical?'RED':'AMBER';
+  if(classification==='DOWNGRADE'||classification==='MONITOR')return 'AMBER';
+  if(classification==='STRONG UPGRADE'||classification==='UPGRADE')return 'OPPORTUNITY';
+  if(classification==='UNKNOWN')return critical?'AMBER':'GREEN';
+  if(critical&&(player.startProbability<0.7||player.expectedMinutes<55))return 'AMBER';
+  return 'GREEN';
+}
+function enforceFreshVerdict(context,player,evidence,draft){
+  let classification=FRESH_CLASSIFICATIONS.has(draft?.classification)?draft.classification:fallbackFreshClassification(player,evidence);
+  const authoritative=evidence.filter(e=>e.authorityTier===1&&e.weight>=0.45&&e.signal!=='neutral');
+  const positive=authoritative.some(e=>e.signal==='positive'),negative=authoritative.some(e=>e.signal==='negative');
+  if(positive&&negative)classification='MONITOR';
+  else if(negative&&['STRONG UPGRADE','UPGRADE'].includes(classification))classification=player.startProbability>0.55?'DOWNGRADE':'MONITOR';
+  else if(positive&&['STRONG DOWNGRADE','DOWNGRADE'].includes(classification))classification=player.startProbability<0.8?'UPGRADE':'MONITOR';
+  if(!evidence.length)classification='UNKNOWN';
+  const status=statusForFreshPlayer(context,player,classification);
+  const allowedIds=new Set(evidence.map(e=>e.id));
+  const cited=[...new Set(Array.isArray(draft?.evidenceIds)?draft.evidenceIds.filter(id=>allowedIds.has(id)):[])];
+  const strongest=evidence[0];
+  const defaultSummary=strongest?`${strongest.publisher}: ${strongest.summary}`:'No usable current external evidence was available.';
+  let rationale=cleanText(draft?.rationale||'');
+  if(!rationale){
+    if(classification==='UNKNOWN')rationale='External evidence is unavailable or too weak to challenge the OTB assumption.';
+    else rationale=`The source-ranked evidence supports a ${classification.toLowerCase()} relative to OTB's current minutes and start assumption.`;
+  }
+  if(context.activeChip==='BENCH_BOOST'&&(player.startProbability<0.5||player.expectedMinutes<45))rationale=`Bench Boost makes this player scoring-critical, while OTB itself gives only ${Math.round(player.startProbability*100)}% start and ${player.expectedMinutes} xMins. ${rationale}`;
+  if(context.activeChip==='TRIPLE_CAPTAIN'&&player.captain)rationale=`Triple Captain increases the decision weight of this evidence. ${rationale}`;
+  return {
+    freshEvidenceSummary:cleanText(draft?.freshEvidenceSummary||defaultSummary).slice(0,700),classification,status,
+    confidence:!evidence.length?'LOW':(['HIGH','MEDIUM','LOW'].includes(draft?.confidence)?draft.confidence:(evidence.some(e=>e.authorityTier===1)?'HIGH':'MEDIUM')),
+    rationale:rationale.slice(0,900),monitorPoint:cleanText(draft?.monitorPoint||(classification==='UNKNOWN'?'Check final official team news and predicted lineups.':'Re-check if later official evidence changes the current signal.')).slice(0,500),
+    evidenceIds:cited.length?cited:evidence.slice(0,4).map(e=>e.id)
+  };
+}
+
+async function researchFreshPlayer(env,context,player){
+  const [report,news]=await Promise.all([
+    env.ROLE_KV.get(`latest:${player.club}`,'json').catch(()=>null),googleNewsEvidence(player)
+  ]);
+  const merged=[...officialPlayerEvidence(report,player),...(news.items||[])];
+  const dedup=new Map();for(const item of merged){const key=`${normal(item.title)}:${hostOf(item.url)}`;if(!dedup.has(key)||dedup.get(key).authorityTier>item.authorityTier)dedup.set(key,item)}
+  const evidence=[...dedup.values()].sort((a,b)=>a.authorityTier-b.authorityTier||Number(b.preferredSource)-Number(a.preferredSource)||b.weight-a.weight||Date.parse(b.relevantDate||0)-Date.parse(a.relevantDate||0)).slice(0,8);
+  const ai=await aiFreshPlayerReview(env,context,player,evidence);
+  const verdict=enforceFreshVerdict(context,player,evidence,ai.value);
+  return {
+    playerId:player.playerId,name:player.name,club:player.club,position:player.position,squadRole:player.squadRole,
+    benchOrder:player.benchOrder,scoring:player.scoring,captain:player.captain,viceCaptain:player.viceCaptain,
+    otb:{startProbability:player.startProbability,expectedMinutes:player.expectedMinutes,xPts:player.xPts,availability:player.availability},
+    ...verdict,evidence,research:{status:ai.status==='ok'?'complete':'complete-with-fallback',aiStatus:ai.status,aiError:ai.error||null,newsStatus:news.status,newsError:news.error||null,query:news.query},
+    reviewedAt:new Date().toISOString(),mutatesProjection:false
+  };
+}
+function unavailableFreshPlayer(context,player,error){
+  const verdict=enforceFreshVerdict(context,player,[],{classification:'UNKNOWN',confidence:'LOW',freshEvidenceSummary:'Evidence unavailable for this player.',rationale:'The player research request failed; no conclusion was invented.',monitorPoint:'Retry the player or check final official team news.',evidenceIds:[]});
+  return {playerId:player.playerId,name:player.name,club:player.club,position:player.position,squadRole:player.squadRole,benchOrder:player.benchOrder,scoring:player.scoring,captain:player.captain,viceCaptain:player.viceCaptain,otb:{startProbability:player.startProbability,expectedMinutes:player.expectedMinutes,xPts:player.xPts,availability:player.availability},...verdict,evidence:[],research:{status:'failed',aiStatus:'not-run',aiError:cleanText(error).slice(0,300),newsStatus:'failed',newsError:cleanText(error).slice(0,300),query:freshNewsQuery(player)},reviewedAt:new Date().toISOString(),mutatesProjection:false};
+}
+
+function freshJobKey(id){return `fresh-review:job:${id}`}
+function freshCacheKey(hash){return `fresh-review:cache:${hash}`}
+async function storeFreshJob(env,job){await env.ROLE_KV.put(freshJobKey(job.jobId),JSON.stringify(job),{expirationTtl:FRESH_JOB_TTL_SECONDS})}
+function publicFreshJob(job){
+  const total=job.selectedPlayerIds.length,completed=job.selectedPlayerIds.filter(id=>job.playerReviews[id]).length;
+  return {jobId:job.jobId,status:job.status,createdAt:job.createdAt,updatedAt:job.updatedAt,force:job.force,contextHash:job.contextHash,totalPlayers:15,targetPlayers:total,completedPlayers:completed,reusedPlayers:Object.keys(job.playerReviews).length-completed,failedPlayers:Object.values(job.playerReviews).filter(r=>r?.research?.status==='failed').length,pendingPlayerIds:job.selectedPlayerIds.filter(id=>!job.playerReviews[id]),selectedPlayerIds:job.selectedPlayerIds,diff:job.diff||null,review:job.review||null};
+}
+async function createFreshReviewJob(env,payload){
+  const raw=payload?.context||payload;
+  const validation=validateFreshReviewContext(raw);
+  if(!validation.ok)return {error:'invalid squad context',details:validation.errors,status:400};
+  const context=validation.context,contextHash=await freshContextHash(context),force=payload?.force===true;
+  const cacheMinutes=freshCacheMinutes(context);
+  if(!force){
+    const cached=await env.ROLE_KV.get(freshCacheKey(contextHash),'json');
+    if(cached?.review&&Date.parse(cached.review.cacheExpiresAt||0)>Date.now())return {status:200,body:{status:'ok',cache:'HIT',cacheMinutes,review:cached.review}};
+  }
+  let priorJob=null;
+  if(payload?.priorReviewId)priorJob=await env.ROLE_KV.get(freshJobKey(String(payload.priorReviewId)),'json');
+  const priorContext=priorJob?.context||priorJob?.review?.inputSnapshot||null;
+  const diff=priorContext?freshContextDiff(priorContext,context):null;
+  const validIds=new Set(context.players.map(p=>p.playerId));
+  let selected=Array.isArray(payload?.selectedPlayerIds)?[...new Set(payload.selectedPlayerIds.map(String).filter(id=>validIds.has(id)))]:context.players.map(p=>p.playerId);
+  if(!selected.length)selected=context.players.map(p=>p.playerId);
+  const priorReviews=priorJob?.review?.playerReviews||Object.values(priorJob?.playerReviews||{});
+  const priorById=new Map((Array.isArray(priorReviews)?priorReviews:[]).map(r=>[String(r.playerId),r]));
+  const playerReviews={};
+  for(const player of context.players)if(!selected.includes(player.playerId)&&priorById.has(player.playerId))playerReviews[player.playerId]={...priorById.get(player.playerId),reusedFromReviewId:priorJob.jobId};
+  // A requested partial refresh is only safe when every unselected player can
+  // be carried from the immediately supplied prior review.
+  const missingCarry=context.players.filter(p=>!selected.includes(p.playerId)&&!playerReviews[p.playerId]).map(p=>p.playerId);
+  selected=[...new Set([...selected,...missingCarry])];
+  const now=new Date().toISOString();
+  const job={jobId:crypto.randomUUID(),status:'researching',createdAt:now,updatedAt:now,force,cacheMinutes,contextHash,context,selectedPlayerIds:selected,playerReviews,diff,priorReviewId:priorJob?.jobId||null,review:null};
+  await storeFreshJob(env,job);
+  return {status:202,body:{status:'ok',cache:'MISS',...publicFreshJob(job)}};
+}
+async function processFreshReviewPlayer(env,jobId,playerId){
+  const job=await env.ROLE_KV.get(freshJobKey(jobId),'json');
+  if(!job)return {status:404,body:{status:'error',error:'review job not found or expired'}};
+  if(job.review)return {status:200,body:{status:'ok',...publicFreshJob(job)}};
+  const player=job.context.players.find(p=>p.playerId===String(playerId));
+  if(!player)return {status:400,body:{status:'error',error:'player is not in this review context'}};
+  if(job.playerReviews[player.playerId])return {status:200,body:{status:'ok',playerReview:job.playerReviews[player.playerId],...publicFreshJob(job)}};
+  let result;try{result=await researchFreshPlayer(env,job.context,player)}catch(error){result=unavailableFreshPlayer(job.context,player,error?.message||String(error))}
+  job.playerReviews[player.playerId]=result;job.updatedAt=new Date().toISOString();
+  if(job.selectedPlayerIds.every(id=>job.playerReviews[id]))job.status='ready_to_finalize';
+  await storeFreshJob(env,job);
+  return {status:200,body:{status:'ok',playerReview:result,...publicFreshJob(job)}};
+}
+function freshPriority(review){
+  let score=({RED:40,AMBER:20,OPPORTUNITY:10,GREEN:0})[review.status]||0;
+  if(review.scoring)score+=8;if(review.captain)score+=5;
+  if(review.classification==='STRONG DOWNGRADE')score+=8;if(review.classification==='UNKNOWN')score+=2;
+  return score;
+}
+function buildFreshSquadSummary(context,reviews){
+  const negative=reviews.filter(r=>['RED','AMBER'].includes(r.status)).sort((a,b)=>freshPriority(b)-freshPriority(a));
+  const positive=reviews.filter(r=>r.status==='OPPORTUNITY').sort((a,b)=>freshPriority(b)-freshPriority(a));
+  const primary=negative[0]||null,secondary=negative.slice(1,3),captain=reviews.find(r=>r.captain);
+  const primaryIssue=primary?`${primary.name} — ${primary.rationale}`:'No material current concern emerged from the source-ranked review.';
+  const positiveDisagreement=positive[0]?`${positive[0].name} — ${positive[0].rationale}`:'No material positive disagreement emerged.';
+  let captainAssessment=`${captain?.name||'Captain'}: evidence unavailable.`;
+  if(captain)captainAssessment= captain.status==='RED'?`${captain.name} requires captaincy review.`:captain.status==='AMBER'?`${captain.name} remains plausible but carries a live-evidence caveat.`:`${captain.name} remains defensible on current evidence.`;
+  let overall='The live evidence audit found no material reason to change the saved squad automatically.';
+  if(context.activeChip==='BENCH_BOOST'&&primary)overall=`Bench Boost makes all 15 scoring decisions material. Resolve the primary start-security issue before the deadline; OTB projections remain unchanged.`;
+  else if(context.activeChip==='TRIPLE_CAPTAIN')overall=`Triple Captain increases captain evidence sensitivity. Review the captain finding before committing; OTB projections remain unchanged.`;
+  else if(primary)overall='The squad remains intact, but the highlighted live-evidence risk deserves a manual decision before deadline.';
+  return {primaryIssue,secondaryRisks:secondary.map(r=>`${r.name} — ${r.rationale}`),positiveDisagreement,captainAssessment,overallVerdict:overall};
+}
+async function finalizeFreshReview(env,jobId){
+  const job=await env.ROLE_KV.get(freshJobKey(jobId),'json');
+  if(!job)return {status:404,body:{status:'error',error:'review job not found or expired'}};
+  if(job.review)return {status:200,body:{status:'ok',cache:'HIT',review:job.review}};
+  for(const player of job.context.players)if(!job.playerReviews[player.playerId])job.playerReviews[player.playerId]=unavailableFreshPlayer(job.context,player,'Player research did not complete before finalization.');
+  const playerReviews=job.context.players.map(p=>job.playerReviews[p.playerId]);
+  const counts={GREEN:0,OPPORTUNITY:0,AMBER:0,RED:0};for(const row of playerReviews)counts[row.status]=(counts[row.status]||0)+1;
+  const generatedAt=new Date().toISOString(),cacheMinutes=job.cacheMinutes||freshCacheMinutes(job.context),cacheExpiresAt=new Date(Date.now()+cacheMinutes*60000).toISOString();
+  const review={
+    reviewId:job.jobId,schemaVersion:FRESH_REVIEW_VERSION,workerBuild:WORKER_BUILD,generatedAt,cacheExpiresAt,cacheMinutes,
+    season:job.context.season,gameweek:job.context.gameweek,activeChip:job.context.activeChip,formation:job.context.formation,
+    playerCount:15,scoringPlayerCount:job.context.players.filter(p=>p.scoring).length,projectedScoringPoints:freshProjectedTotal(job.context),counts,
+    summary:buildFreshSquadSummary(job.context,playerReviews),playerReviews,otbAlerts:job.context.otbAlerts,
+    research:{freshPlayers:job.selectedPlayerIds.length,reusedPlayers:playerReviews.filter(r=>r.reusedFromReviewId).length,failedPlayers:playerReviews.filter(r=>r.research?.status==='failed').length},
+    methodology:{authority:'Tier 1 official/confirmed evidence outranks Tier 2 reporting, Tier 3 community inference and Tier 4 aggregation.',recency:'Today and final/current team evidence is weighted above early preseason and historical evidence.',preferredSources:'Publicly accessible RotoWire information is preferred within Tier 2 when relevant. Gated content and access controls are never bypassed; systematic ingestion requires the licensed official API.',precision:'Qualitative confidence and disagreement classes are used; no synthetic start percentage is created.'},
+    inputSnapshot:job.context,contextHash:job.contextHash,priorReviewId:job.priorReviewId,diff:job.diff,mutatesProjection:false
+  };
+  job.review=review;job.status='complete';job.updatedAt=generatedAt;await storeFreshJob(env,job);
+  await Promise.all([
+    env.ROLE_KV.put(freshCacheKey(job.contextHash),JSON.stringify({review}),{expirationTtl:cacheMinutes*60}),
+    env.ROLE_KV.put(`fresh-review:latest:${hashString(`${job.context.season}:${job.context.gameweek}`)}`,JSON.stringify({jobId:job.jobId,review}),{expirationTtl:FRESH_JOB_TTL_SECONDS})
+  ]);
+  return {status:200,body:{status:'ok',cache:'MISS',review}};
+}
+async function handleFreshReviewRequest(request,env,u){
+  if(!await freshReviewAuthorised(request,env))return json({status:'error',error:'owner authorisation required'},401,env);
+  if(u.pathname==='/api/fresh-review/latest'){
+    if(request.method!=='GET')return json({status:'error',error:'use GET'},405,env);
+    const season=cleanText(u.searchParams.get('season')||env.SEASON||'2026/27'),gameweek=Math.round(finiteOr(u.searchParams.get('gameweek'),0));
+    if(gameweek<1)return json({status:'error',error:'gameweek is required'},400,env);
+    const latest=await env.ROLE_KV.get(`fresh-review:latest:${hashString(`${season}:${gameweek}`)}`,'json');
+    return json({status:'ok',review:latest?.review||null},200,env);
+  }
+  if(u.pathname==='/api/fresh-review'){
+    if(request.method!=='POST')return json({status:'error',error:'use POST'},405,env);
+    const payload=await request.json().catch(()=>null);if(!payload)return json({status:'error',error:'valid JSON body required'},400,env);
+    const result=await createFreshReviewJob(env,payload);return json(result.body||{status:'error',error:result.error,details:result.details},result.status||500,env);
+  }
+  const match=u.pathname.match(/^\/api\/fresh-review\/([a-f0-9-]+)(?:\/(player|finalize))?$/i);
+  if(!match)return json({status:'error',error:'fresh review route not found'},404,env);
+  const jobId=match[1],action=match[2]||'';
+  if(!action&&request.method==='GET'){
+    const job=await env.ROLE_KV.get(freshJobKey(jobId),'json');
+    return job?json({status:'ok',...publicFreshJob(job)},200,env):json({status:'error',error:'review job not found or expired'},404,env);
+  }
+  if(action==='player'&&request.method==='POST'){
+    const body=await request.json().catch(()=>({}));const result=await processFreshReviewPlayer(env,jobId,String(body.playerId||''));return json(result.body,result.status,env);
+  }
+  if(action==='finalize'&&request.method==='POST'){
+    const result=await finalizeFreshReview(env,jobId);return json(result.body,result.status,env);
+  }
+  return json({status:'error',error:'method not allowed'},405,env);
+}
+
 export default {
   async fetch(request,env,ctx){
     env = await withD1(env);
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
-      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:WORKER_BUILD,schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,structuredFeedAvailable:String(env.STRUCTURED_FEED_DISABLED||'')!=='1',structuredFeedVersion:STRUCTURED_FEED_VERSION,structuredFeedProviders:STRUCTURED_PROVIDER_CATALOG,generatedAt:new Date().toISOString()},200,env);
+      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:WORKER_BUILD,schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,structuredFeedAvailable:String(env.STRUCTURED_FEED_DISABLED||'')!=='1',structuredFeedVersion:STRUCTURED_FEED_VERSION,structuredFeedProviders:STRUCTURED_PROVIDER_CATALOG,freshReviewAvailable:true,freshReviewVersion:FRESH_REVIEW_VERSION,freshReviewAuthConfigured:/^[A-Za-z0-9_-]{43}$/.test(FRESH_REVIEW_OWNER_PUBLIC_KEY)||Boolean(env.SCOUT_ADMIN_TOKEN),freshReviewAuthMode:'signed-owner-capability',generatedAt:new Date().toISOString()},200,env);
       // Derived team numbers for the projection engine. Public and
       // read-only: it never triggers a fetch, so it cannot burn credits.
       if(u.pathname==='/api/market/teams'){
@@ -3142,6 +3638,8 @@ export default {
         return json({status:'ok',available:true,ageMinutes:ageMin,...d},200,env);
       }
       if(!originAllowed(request,env))return json({status:'error',error:'origin not allowed'},403,env);
+
+      if(u.pathname==='/api/fresh-review'||u.pathname.startsWith('/api/fresh-review/'))return handleFreshReviewRequest(request,env,u);
 
       // Cache-only by default so an Engine read can never trigger an external
       // request. An admin may add ?fresh=1 (or ?force=1) to rebuild the feed.

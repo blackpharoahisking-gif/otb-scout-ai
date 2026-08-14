@@ -155,3 +155,4 @@ test('valid first-team news remains selectable after hardening',()=>{
   const selected=selectArticleLinks(base,links,8,new Map(),0);
   assert.deepEqual([...selected.candidates],['https://club.example/news/2026/august/10/player-returns-to-training']);
 });
+
