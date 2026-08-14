@@ -31,7 +31,11 @@
     // How long a cached report is served before a background refresh fires.
     "STALE_AFTER_MINUTES": "360",
     // Carry-forward window for evidence when a scan cannot read its sources.
-    "MAX_CARRY_DAYS": "7"
+    "MAX_CARRY_DAYS": "7",
+    // Owner-triggered Browser fallback for Google News when direct RSS/HTML
+    // egress is unavailable. The cap is global and resets daily.
+    "FRESH_REVIEW_BROWSER_DAILY_CAP": "75",
+    "FRESH_REVIEW_BROWSER_SPACING_MS": "6500"
   },
   "d1_databases": [
     {

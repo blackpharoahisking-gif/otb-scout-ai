@@ -6,7 +6,7 @@ import test from 'node:test';
 
 const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
   .replace(/export default\s*\{/, 'const workerDefault = {')
-  +'\n;globalThis.__freshTest={activeChipValue,validateFreshReviewContext,freshProjectedTotal,statusForFreshPlayer,enforceFreshVerdict,fallbackFreshClassification,freshContextDiff,freshCacheMinutes,unavailableFreshPlayer,freshPublisherTier,freshSourceWeight,createFreshReviewJob,finalizeFreshReview,freshJobKey,freshReviewAuthorised,verifyFreshOwnerCapability,sha256Hex};';
+  +'\n;globalThis.__freshTest={activeChipValue,validateFreshReviewContext,freshProjectedTotal,statusForFreshPlayer,enforceFreshVerdict,fallbackFreshClassification,freshContextDiff,freshCacheMinutes,unavailableFreshPlayer,freshPublisherTier,freshSourceWeight,freshNewsItemsFromHtml,freshNewsItemsFromRss,createFreshReviewJob,finalizeFreshReview,freshJobKey,freshReviewAuthorised,verifyFreshOwnerCapability,sha256Hex};';
 const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto,TextEncoder,TextDecoder,atob};
 vm.createContext(context);
 vm.runInContext(source,context,{filename:'worker.js'});
@@ -149,6 +149,24 @@ test('RotoWire is preferred within Tier 2 but never promoted above official evid
   const official=api.freshSourceWeight({authorityTier:1,relevantDate:new Date().toISOString(),title:'Official team news',summary:''});
   assert.ok(preferred>ordinary);
   assert.ok(preferred<official);
+});
+
+test('public Google News HTML fallback preserves publisher, date and RotoWire preference',()=>{
+  const player={playerId:'3',name:'Calafiori'},html='<a class="JtKRv" href="./read/example?hl=en-GB&amp;gl=GB" data-n-tid="29" aria-label="Calafiori returns to Arsenal training - RotoWire - 14 Aug">Calafiori returns to Arsenal training</a>';
+  const rows=api.freshNewsItemsFromHtml(html,player);
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].publisher,'RotoWire');
+  assert.equal(rows[0].authorityTier,2);
+  assert.equal(rows[0].preferredSource,true);
+  assert.match(rows[0].relevantDate,/^2026-08-14/);
+});
+
+test('RSS parser accepts namespaced publishers and rejects unrelated results',()=>{
+  const player={playerId:'8',name:'Wirtz'},xml='<rss><channel><item><title>Wirtz starts Liverpool final friendly</title><link>https://example.test/wirtz</link><description>Confirmed current role</description><pubDate>Fri, 14 Aug 2026 08:00:00 GMT</pubDate><News:Source>Premier League</News:Source></item><item><title>Unrelated club story</title><link>https://example.test/other</link><pubDate>Fri, 14 Aug 2026 08:00:00 GMT</pubDate><News:Source>Example</News:Source></item></channel></rss>';
+  const rows=api.freshNewsItemsFromRss(xml,player,'Fixture RSS');
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].publisher,'Premier League');
+  assert.equal(rows[0].authorityTier,1);
 });
 
 test('owner authentication verifies a signed capability and preserves the admin fallback',async()=>{

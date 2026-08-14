@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.23.1 — RC5.3.1 Cloudflare-safe public news search transport fallback
 // v2.23.0 — RC5.3.0 authenticated, cached, source-ranked Fresh Squad Review
 // v2.22.7 — RC5.2.7 source-read / evidence-authority contract separation
 // v2.22.6 — RC5.2.6 order-tolerant rich-text extraction
@@ -29,7 +30,7 @@ const SCHEMA_VERSION = '1.34.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.23.0-rc5.3.0-fresh-squad-review';
+const WORKER_BUILD = 'v2.23.1-rc5.3.1-fresh-squad-review-search-fallback';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -3363,37 +3364,87 @@ function freshNewsQuery(player){
   const club=CLUB_SOURCES[player.club]?.name||player.club;
   return `"${player.name}" "${club}" (injury OR training OR "press conference" OR "predicted lineup" OR starts OR rotation OR role OR tactical OR competition OR preseason OR penalties OR corners OR "free kicks" OR RotoWire) when:14d`;
 }
-async function googleNewsEvidence(player){
-  const query=freshNewsQuery(player);
-  const url=`https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`;
-  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),8000);
-  try{
-    const response=await fetch(url,{headers:{'User-Agent':'OTB-Fresh-Squad-Review/1.0'},signal:controller.signal});
-    if(!response.ok)throw new Error(`news search HTTP ${response.status}`);
-    const xml=await response.text();
-    const blocks=xml.match(/<item>[\s\S]*?<\/item>/gi)||[];
-    const nameParts=normal(player.name).split(' ').filter(x=>x.length>2);
-    const items=[];
-    for(const [index,block] of blocks.entries()){
-      const title=xmlTag(block,'title'),link=xmlTag(block,'link'),relevantDate=xmlTag(block,'pubDate');
-      const sourceHit=block.match(/<source(?:\s+url="([^"]+)")?[^>]*>([\s\S]*?)<\/source>/i);
-      const publisher=sourceHit?stripXml(sourceHit[2]):'News source';
-      const publisherUrl=sourceHit?decodeXml(sourceHit[1]||''):'';
-      if(!title||!link)continue;
-      const nt=normal(title);if(nameParts.length&&!nameParts.some(part=>nt.includes(part)))continue;
-      const authorityTier=freshPublisherTier(publisher,publisherUrl,title),preferredSource=/rotowire/i.test(`${publisher} ${publisherUrl}`);
-      const item={
-        id:`news-${hashString(`${player.playerId}:${link}:${index}`)}`,title:title.slice(0,240),publisher:publisher.slice(0,120),publisherUrl,
-        relevantDate:Number.isFinite(Date.parse(relevantDate))?new Date(relevantDate).toISOString():null,authorityTier,
-        sourceType:authorityTier===3?'COMMUNITY SIGNAL':'NEWS / LINEUP SIGNAL',
-        summary:`Headline signal: ${title}`.slice(0,500),url:link,signal:freshSignal(title),communityInference:authorityTier>=3,preferredSource
-      };
-      items.push({...item,recency:freshRecency(item.relevantDate).band,weight:freshSourceWeight(item)});
-      if(items.length>=FRESH_NEWS_MAX_ITEMS)break;
+function freshNewsDate(value){
+  value=stripXml(value);if(!value)return null;
+  if(!/\b\d{4}\b/.test(value))value+=` ${new Date().getUTCFullYear()}`;
+  if(!/\b\d{1,2}:\d{2}\b/.test(value))value+=' 12:00:00 UTC';
+  const parsed=Date.parse(value);return Number.isFinite(parsed)?new Date(parsed).toISOString():null;
+}
+function freshNewsItem(player,{title,link,relevantDate,publisher,publisherUrl='',summary='',index=0,provider='Google News'}){
+  title=stripXml(title);summary=stripXml(summary);link=decodeXml(link);publisher=stripXml(publisher)||provider;
+  if(!title||!link)return null;
+  const nameParts=normal(player.name).split(' ').filter(x=>x.length>2),hay=normal(`${title} ${summary}`);
+  if(nameParts.length&&!nameParts.some(part=>hay.includes(part)))return null;
+  const authorityTier=freshPublisherTier(publisher,publisherUrl,title),preferredSource=/rotowire/i.test(`${publisher} ${publisherUrl} ${title}`);
+  const item={
+    id:`news-${hashString(`${player.playerId}:${link}:${index}`)}`,title:title.slice(0,240),publisher:publisher.slice(0,120),publisherUrl,
+    relevantDate:freshNewsDate(relevantDate),authorityTier,sourceType:authorityTier===3?'COMMUNITY SIGNAL':'NEWS / LINEUP SIGNAL',
+    summary:(summary||`Headline signal: ${title}`).slice(0,500),url:link,signal:freshSignal(`${title} ${summary}`),communityInference:authorityTier>=3,preferredSource,searchProvider:provider
+  };
+  return {...item,recency:freshRecency(item.relevantDate).band,weight:freshSourceWeight(item)};
+}
+function freshNewsItemsFromRss(xml,player,provider='Google News'){
+  const blocks=String(xml||'').match(/<item>[\s\S]*?<\/item>/gi)||[],items=[];
+  for(const [index,block] of blocks.entries()){
+    const sourceHit=block.match(/<(?:source|News:Source)(?:\s+url="([^"]+)")?[^>]*>([\s\S]*?)<\/(?:source|News:Source)>/i);
+    const item=freshNewsItem(player,{title:xmlTag(block,'title'),link:xmlTag(block,'link'),summary:xmlTag(block,'description'),relevantDate:xmlTag(block,'pubDate'),publisher:sourceHit?stripXml(sourceHit[2]):provider,publisherUrl:sourceHit?decodeXml(sourceHit[1]||''):'',index,provider});
+    if(item)items.push(item);if(items.length>=FRESH_NEWS_MAX_ITEMS)break;
+  }
+  return items;
+}
+function htmlAttr(tag,name){const match=String(tag||'').match(new RegExp(`\\b${name}=["']([^"']+)["']`,'i'));return match?decodeXml(match[1]):''}
+function freshNewsItemsFromHtml(markup,player){
+  const items=[],anchors=String(markup||'').match(/<a\b[^>]*>[\s\S]*?<\/a>/gi)||[];
+  for(const [index,anchor] of anchors.entries()){
+    if(!/(?:\bclass=["'][^"']*\bJtKRv\b|\bdata-n-tid=["']29["'])/i.test(anchor))continue;
+    const href=htmlAttr(anchor,'href'),visible=stripXml((anchor.match(/>([\s\S]*?)<\/a>$/i)||[])[1]||''),aria=htmlAttr(anchor,'aria-label');
+    if(!href||!visible)continue;
+    let publisher='Google News result',relevantDate='';
+    if(aria.startsWith(visible)){
+      const tail=aria.slice(visible.length).replace(/^\s*-\s*/,'').split(/\s+-\s+/).filter(Boolean);
+      publisher=tail[0]||publisher;relevantDate=tail[1]||'';
     }
-    return {status:'ok',query,items};
-  }catch(error){return {status:'error',query,items:[],error:error?.message||String(error)}}
+    let link='';try{link=new URL(href,'https://news.google.com').toString()}catch{continue}
+    const item=freshNewsItem(player,{title:visible,link,relevantDate,publisher,index,provider:'Google News HTML'});
+    if(item)items.push(item);if(items.length>=FRESH_NEWS_MAX_ITEMS)break;
+  }
+  return items;
+}
+async function freshBrowserSearchPermit(env){
+  if(!env.BROWSER?.quickAction)return {allowed:false,reason:'Browser binding unavailable'};
+  const cap=Math.max(0,Number(env.FRESH_REVIEW_BROWSER_DAILY_CAP??75)),day=new Date().toISOString().slice(0,10),countKey=`fresh-review:browser-count:${day}`;
+  const used=Number(await env.ROLE_KV.get(countKey))||0;if(cap&&used>=cap)return {allowed:false,reason:`daily Fresh Review browser cap of ${cap} reached`};
+  const spacing=Math.max(0,Number(env.FRESH_REVIEW_BROWSER_SPACING_MS??6500)),last=Number(await env.ROLE_KV.get('fresh-review:browser-last'))||0,wait=spacing-(Date.now()-last);
+  if(wait>0)await new Promise(resolve=>setTimeout(resolve,wait));
+  await Promise.all([
+    env.ROLE_KV.put(countKey,String(used+1),{expirationTtl:172800}),
+    env.ROLE_KV.put('fresh-review:browser-last',String(Date.now()),{expirationTtl:3600})
+  ]);
+  return {allowed:true};
+}
+async function googleNewsEvidence(env,player){
+  const query=freshNewsQuery(player);
+  const rssUrl=`https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`,htmlUrl=`https://news.google.com/search?q=${encodeURIComponent(query)}&hl=en-GB&gl=GB&ceid=GB:en`;
+  const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),8000);
+  const errors=[];
+  try{
+    const response=await fetch(rssUrl,{headers:{'User-Agent':'OTB-Fresh-Squad-Review/1.0','Accept':'application/rss+xml,application/xml;q=0.9'},signal:controller.signal});
+    if(response.ok){const items=freshNewsItemsFromRss(await response.text(),player);if(items.length)return {status:'ok',provider:'google-rss',query,items}}
+    else errors.push(`Google RSS HTTP ${response.status}`);
+  }catch(error){errors.push(error?.message||String(error))}
   finally{clearTimeout(timer)}
+  try{
+    const response=await fetch(htmlUrl,{headers:{'User-Agent':'Mozilla/5.0 (compatible; OTB-Fresh-Squad-Review/1.0)','Accept':'text/html,application/xhtml+xml','Accept-Language':'en-GB,en;q=0.9'},redirect:'follow'});
+    if(response.ok){const items=freshNewsItemsFromHtml(await response.text(),player);if(items.length)return {status:'ok',provider:'google-html',query,items}}
+    else errors.push(`Google HTML HTTP ${response.status}`);
+  }catch(error){errors.push(error?.message||String(error))}
+  try{
+    const permit=await freshBrowserSearchPermit(env);if(!permit.allowed)throw new Error(permit.reason);
+    const rendered=await quickActionJson(env,'content',{url:htmlUrl,gotoOptions:GOTO}),markup=typeof rendered==='string'?rendered:(rendered?.content||rendered?.html||''),items=freshNewsItemsFromHtml(markup,player);
+    if(items.length)return {status:'ok',provider:'google-browser',query,items};
+    errors.push('Google Browser search returned no player-specific results');
+  }catch(error){errors.push(error?.message||String(error))}
+  return {status:'error',provider:'unavailable',query,items:[],error:errors.filter(Boolean).join(' · ').slice(0,600)};
 }
 
 function playerReviewSchema(){return {
@@ -3479,7 +3530,7 @@ function enforceFreshVerdict(context,player,evidence,draft){
 
 async function researchFreshPlayer(env,context,player){
   const [report,news]=await Promise.all([
-    env.ROLE_KV.get(`latest:${player.club}`,'json').catch(()=>null),googleNewsEvidence(player)
+    env.ROLE_KV.get(`latest:${player.club}`,'json').catch(()=>null),googleNewsEvidence(env,player)
   ]);
   const merged=[...officialPlayerEvidence(report,player),...(news.items||[])];
   const dedup=new Map();for(const item of merged){const key=`${normal(item.title)}:${hostOf(item.url)}`;if(!dedup.has(key)||dedup.get(key).authorityTier>item.authorityTier)dedup.set(key,item)}
