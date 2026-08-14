@@ -66,7 +66,7 @@ jobs:
               if HEALTH_JSON="$health_json" node -e '
                 const health = JSON.parse(process.env.HEALTH_JSON);
                 const valid = health.status === "ok"
-                  && health.workerBuild === "v2.25.1-rc5.0.24-key-auth"
+                  && health.workerBuild === "v2.25.2-rc5.0.25-hierarchy-discovery"
                   && health.schemaVersion === "1.36.0"
                   && health.structuredFeedAvailable === true
                   && health.freshReviewAvailable === true

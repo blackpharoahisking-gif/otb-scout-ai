@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.25.2 — RC5.0.25 cross-player hierarchy discovery
 // v2.25.1 — RC5.0.24 key-only Fresh Review authentication
 // v2.25.0 — RC5.5.0 durable background review + per-user Access identity
 // v2.24.1 — RC5.4.1 public football-name derivation from canonical FPL identity
@@ -38,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.25.1-rc5.0.24-key-auth';
+const WORKER_BUILD = 'v2.25.2-rc5.0.25-hierarchy-discovery';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -3352,10 +3353,11 @@ function enrichFreshReviewIdentitiesFromBootstrap(context,data){
       const aliases=freshIdentityAliases(player,element),searchName=freshCommonIdentityName(element)||player.searchName||aliases[0]||player.name;
       const canonicalName=aliases[0]||player.name;
       const identityClub=element?teams.get(element.team)||null:null;
+      const competitionAliases=element?(data?.elements||[]).filter(peer=>peer.id!==element.id&&peer.team===element.team&&peer.element_type===element.element_type).flatMap(peer=>freshIdentityAliases({},peer)).filter(Boolean):[];
       return {
         ...player,canonicalName,webName:cleanText(element?.web_name||player.webName||player.name).slice(0,100),
         searchName:cleanText(searchName).slice(0,100),identityAliases:aliases,identitySource:element?'FPL_BOOTSTRAP':'OTB_CONTEXT',
-        identityClub,identityClubMismatch:Boolean(identityClub&&identityClub!==player.club)
+        identityClub,identityClubMismatch:Boolean(identityClub&&identityClub!==player.club),competitionAliases:[...new Set(competitionAliases)].slice(0,16)
       };
     })
   };
@@ -3509,13 +3511,32 @@ function freshPlayerEvidenceMatches(player,text){
   }
   return freshTextHasPhrase(hay,web)||freshTextHasPhrase(hay,player.name);
 }
+function freshHierarchyPeerMatches(player,text){
+  const hay=cleanText(text),club=CLUB_SOURCES[player.club]?.name||player.club,clubPresent=freshTextHasPhrase(hay,club)||freshTextHasPhrase(hay,player.club);
+  if(!clubPresent)return null;
+  for(const alias of player.competitionAliases||[]){
+    const parts=normal(alias).split(' ').filter(Boolean),surname=parts.at(-1)||'';
+    if(parts.length>=2&&freshTextHasPhrase(hay,alias))return alias;
+    if(surname&&freshTextHasPhrase(hay,surname))return alias;
+  }
+  return null;
+}
+function freshHierarchySignal(player,text,peerName=''){
+  if(freshPlayerEvidenceMatches(player,text))return freshSignal(text);
+  const t=normal(text);void peerName;
+  if(/(?:not in|outside|out of) (?:the )?(?:manager'?s )?plans|set to (?:leave|join)|ready to (?:leave|join)|close to (?:leaving|joining)|loan-to-buy|loan to buy|transfer|depart|leaves|left club|sold|released/.test(t))return 'positive';
+  if(/first choice|number 1|no 1|preferred starter|preferred as (?:the )?starter|starts|starting xi|new contract|contract extension/.test(t))return 'negative';
+  return 'neutral';
+}
 function freshNewsQueries(player,now=Date.now()){
   const club=CLUB_SOURCES[player.club]?.name||player.club;
   const name=freshSearchName(player),date=days=>new Date(now-days*86400000).toISOString().slice(0,10);
-  return [
+  const peers=[...new Set((player.competitionAliases||[]).map(cleanText).filter(Boolean))].slice(0,6),queries=[
     `"${name}" "${club}" (injury OR training OR fitness OR "press conference" OR "predicted lineup" OR "starting XI" OR rotation OR RotoWire) after:${date(45)}`,
     `"${name}" "${club}" (role OR competition OR transfer OR signing OR preseason OR penalties OR corners OR "free kicks") after:${date(120)}`
   ];
+  if(peers.length)queries.push(`"${club}" (${[name,...peers].map(value=>`"${value}"`).join(' OR ')}) ("first choice" OR "number one" OR goalkeeper OR hierarchy OR transfer OR leaving OR backup OR competition) after:${date(120)}`);
+  return queries;
 }
 function freshNewsQuery(player,now=Date.now()){return freshNewsQueries(player,now)[0]}
 function freshNewsDate(value,now=Date.now()){
@@ -3532,12 +3553,14 @@ function freshNewsDate(value,now=Date.now()){
 function freshNewsItem(player,{title,link,relevantDate,publisher,publisherUrl='',summary='',index=0,provider='Google News'}){
   title=stripXml(title);summary=stripXml(summary);link=decodeXml(link);publisher=stripXml(publisher)||provider;
   if(!title||!link)return null;
-  if(!freshPlayerEvidenceMatches(player,`${title} ${summary}`))return null;
+  const evidenceText=`${title} ${summary}`,direct=freshPlayerEvidenceMatches(player,evidenceText),hierarchyPeer=direct?'':freshHierarchyPeerMatches(player,evidenceText);
+  if(!direct&&!hierarchyPeer)return null;
   const authorityTier=freshPublisherTier(publisher,publisherUrl,title),preferredSource=/rotowire/i.test(`${publisher} ${publisherUrl} ${title}`);
   const item={
     id:`news-${hashString(`${player.playerId}:${link}:${index}`)}`,title:title.slice(0,240),publisher:publisher.slice(0,120),publisherUrl,
     relevantDate:freshNewsDate(relevantDate),authorityTier,sourceType:authorityTier===3?'COMMUNITY SIGNAL':'NEWS / LINEUP SIGNAL',
-    summary:(summary||`Headline signal: ${title}`).slice(0,500),url:link,signal:freshSignal(`${title} ${summary}`),communityInference:authorityTier>=3,preferredSource,searchProvider:provider
+    summary:(summary||`Headline signal: ${title}`).slice(0,500),url:link,signal:direct?freshSignal(evidenceText):freshHierarchySignal(player,evidenceText,hierarchyPeer),communityInference:authorityTier>=3||!direct,preferredSource,searchProvider:provider,
+    evidenceCategory:direct?undefined:'ROLE_COMPETITION',hierarchyInference:!direct,relatedPlayer:hierarchyPeer||null
   };
   return freshAnnotateEvidence(item);
 }

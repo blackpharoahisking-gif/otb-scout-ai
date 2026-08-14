@@ -8,7 +8,7 @@ const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
   .replace(/^import\s+\{\s*WorkflowEntrypoint\s*\}\s+from\s+'cloudflare:workers';\s*/m,'')
   .replace(/export class FreshReviewWorkflow/, 'class FreshReviewWorkflow')
   .replace(/export default\s*\{/, 'const workerDefault = {')
-  +'\n;globalThis.__freshTest={activeChipValue,validateFreshReviewContext,enrichFreshReviewIdentitiesFromBootstrap,freshProjectedTotal,statusForFreshPlayer,enforceFreshVerdict,fallbackFreshClassification,freshContextDiff,freshCacheMinutes,unavailableFreshPlayer,freshPublisherTier,freshSourceWeight,freshNewsDate,freshNewsItemsFromHtml,freshNewsItemsFromRss,freshNewsQueries,freshPlayerEvidenceMatches,freshEvidenceCategory,freshRecency,freshAnnotateEvidence,freshEvidenceCoverage,buildFreshSquadSummary,createFreshReviewJob,processFreshReviewPlayer,finalizeFreshReview,freshJobKey,freshCacheKey,freshLatestKey,publicFreshJob,freshReviewAuthorised,freshReviewIdentity,verifyFreshOwnerCapability,verifyAccessJwt,sha256Hex,FreshReviewWorkflow};';
+  +'\n;globalThis.__freshTest={activeChipValue,validateFreshReviewContext,enrichFreshReviewIdentitiesFromBootstrap,freshProjectedTotal,statusForFreshPlayer,enforceFreshVerdict,fallbackFreshClassification,freshContextDiff,freshCacheMinutes,unavailableFreshPlayer,freshPublisherTier,freshSourceWeight,freshNewsDate,freshNewsItemsFromHtml,freshNewsItemsFromRss,freshNewsQueries,freshPlayerEvidenceMatches,freshHierarchyPeerMatches,freshHierarchySignal,freshEvidenceCategory,freshRecency,freshAnnotateEvidence,freshEvidenceCoverage,buildFreshSquadSummary,createFreshReviewJob,processFreshReviewPlayer,finalizeFreshReview,freshJobKey,freshCacheKey,freshLatestKey,publicFreshJob,freshReviewAuthorised,freshReviewIdentity,verifyFreshOwnerCapability,verifyAccessJwt,sha256Hex,FreshReviewWorkflow};';
 class WorkflowEntrypoint{constructor(ctx,env){this.ctx=ctx;this.env=env}}
 const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto,TextEncoder,TextDecoder,atob,WorkflowEntrypoint,fetch:globalThis.fetch,Response};
 vm.createContext(context);
@@ -189,6 +189,34 @@ test('official FPL IDs expand compact display names before research',()=>{
   assert.match(api.freshNewsQueries(bruno,Date.parse('2026-08-14T12:00:00Z'))[0],/^"Bruno Fernandes" "Manchester United"/);
   assert.equal(leFee.canonicalName,'Enzo Le Fée');
   assert.match(api.freshNewsQueries(leFee,Date.parse('2026-08-14T12:00:00Z'))[0],/^"Enzo Le Fée" "Sunderland"/);
+});
+
+test('official FPL roster enriches players with same-club same-position competitors',()=>{
+  const context={players:[{playerId:'101',name:'Kinsky',club:'TOT',position:'GKP'}]},data={
+    teams:[{id:18,short_name:'TOT',name:'Tottenham Hotspur'}],
+    elements:[
+      {id:101,team:18,element_type:1,first_name:'Antonin',second_name:'Kinsky',web_name:'Kinsky'},
+      {id:102,team:18,element_type:1,first_name:'Guglielmo',second_name:'Vicario',web_name:'Vicario'},
+      {id:103,team:18,element_type:1,first_name:'Martin',second_name:'Dubravka',web_name:'Dubravka'},
+      {id:104,team:18,element_type:2,first_name:'Pedro',second_name:'Porro',web_name:'Porro'}
+    ]
+  };
+  const player=api.enrichFreshReviewIdentitiesFromBootstrap(context,data).players[0];
+  assert.ok(player.competitionAliases.includes('Guglielmo Vicario'));
+  assert.ok(player.competitionAliases.includes('Martin Dubravka'));
+  assert.ok(!player.competitionAliases.includes('Pedro Porro'));
+  assert.match(api.freshNewsQueries(player).at(-1),/Vicario/);
+});
+
+test('competitor departure reporting becomes guarded positive hierarchy evidence',()=>{
+  const player={playerId:'101',name:'Kinsky',canonicalName:'Antonin Kinsky',searchName:'Antonin Kinsky',webName:'Kinsky',club:'TOT',identityAliases:['Antonin Kinsky','Kinsky'],competitionAliases:['Guglielmo Vicario','Vicario','Martin Dubravka','Dubravka']};
+  const xml='<rss><channel><item><title>Juventus pursue Guglielmo Vicario transfer</title><link>https://example.test/vicario</link><description>Tottenham Hotspur goalkeeper Vicario is outside the manager plans and set to leave.</description><pubDate>Fri, 14 Aug 2026 08:00:00 GMT</pubDate><source url="https://www.skysports.com">Sky Sports</source></item></channel></rss>';
+  const rows=api.freshNewsItemsFromRss(xml,player);
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].signal,'positive');
+  assert.equal(rows[0].evidenceCategory,'ROLE_COMPETITION');
+  assert.equal(rows[0].hierarchyInference,true);
+  assert.match(rows[0].relatedPlayer,/Vicario/);
 });
 
 test('public football names handle compound legal surnames and true mononyms',()=>{
