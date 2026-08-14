@@ -175,16 +175,27 @@ test('official FPL IDs expand compact display names before research',()=>{
   const ctx=validated(),bootstrap={
     teams:[{id:10,name:'Manchester United',short_name:'MUN'},{id:18,name:'Sunderland',short_name:'SUN'}],
     elements:[
-      {id:5,first_name:'Bruno',second_name:'Fernandes',web_name:'B.Fernandes',team:10},
+      {id:5,first_name:'Bruno',second_name:'Borges Fernandes',web_name:'B.Fernandes',team:10},
       {id:9,first_name:'Enzo',second_name:'Le Fée',web_name:'E.Le Fée',team:18}
     ]
   };
   const enriched=api.enrichFreshReviewIdentitiesFromBootstrap(ctx,bootstrap),bruno=enriched.players.find(p=>p.playerId==='5'),leFee=enriched.players.find(p=>p.playerId==='9');
-  assert.equal(bruno.canonicalName,'Bruno Fernandes');
+  assert.equal(bruno.canonicalName,'Bruno Borges Fernandes');
+  assert.equal(bruno.searchName,'Bruno Fernandes');
   assert.equal(bruno.identitySource,'FPL_BOOTSTRAP');
   assert.match(api.freshNewsQueries(bruno,Date.parse('2026-08-14T12:00:00Z'))[0],/^"Bruno Fernandes" "Manchester United"/);
   assert.equal(leFee.canonicalName,'Enzo Le Fée');
   assert.match(api.freshNewsQueries(leFee,Date.parse('2026-08-14T12:00:00Z'))[0],/^"Enzo Le Fée" "Sunderland"/);
+});
+
+test('public football names handle compound legal surnames and true mononyms',()=>{
+  const context={players:[{playerId:'127',name:'Gomez',club:'BHA'},{playerId:'248',name:'Beto',club:'EVE'}]},bootstrap={teams:[{id:5,name:'Brighton and Hove Albion',short_name:'BHA'},{id:9,name:'Everton',short_name:'EVE'}],elements:[{id:127,first_name:'Diego',second_name:'Gómez Amarilla',web_name:'Gomez',team:5},{id:248,first_name:'Norberto',second_name:'Bercique Gomes Betuncal',web_name:'Beto',team:9}]};
+  const enriched=api.enrichFreshReviewIdentitiesFromBootstrap(context,bootstrap),gomez=enriched.players[0],beto=enriched.players[1];
+  assert.equal(gomez.searchName,'Diego Gomez');
+  assert.equal(api.freshPlayerEvidenceMatches(gomez,'Diego Gomez returns to Brighton training'),true);
+  assert.equal(api.freshPlayerEvidenceMatches(gomez,'Joe Gomez returns to Liverpool training'),false);
+  assert.equal(beto.searchName,'Beto');
+  assert.match(api.freshNewsQueries(beto,Date.parse('2026-08-14T12:00:00Z'))[0],/^"Beto" "Everton"/);
 });
 
 test('canonical identity rejects Joe Gomez evidence for Brighton Diego Gomez',()=>{

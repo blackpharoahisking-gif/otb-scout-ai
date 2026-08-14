@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.24.1 — RC5.4.1 public football-name derivation from canonical FPL identity
 // v2.24.0 — RC5.4.0 canonical identity, evidence coverage and category freshness
 // v2.23.3 — RC5.3.3 evidence publisher and verdict consistency hardening
 // v2.23.2 — RC5.3.2 decision recency gate and official-publisher recovery
@@ -33,7 +34,7 @@ const SCHEMA_VERSION = '1.35.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.24.0-rc5.4.0-fresh-review-evidence-quality';
+const WORKER_BUILD = 'v2.24.1-rc5.4.1-canonical-search-names';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -3274,10 +3275,23 @@ function validateFreshReviewContext(raw){
   return {ok:errors.length===0,errors,context};
 }
 
+function freshCommonIdentityName(element){
+  if(!element)return '';
+  const first=cleanText(element.first_name).split(' ')[0]||'',second=cleanText(element.second_name),web=cleanText(element.web_name),full=cleanText(`${element.first_name||''} ${element.second_name||''}`);
+  if(!web)return full;
+  const dot=web.indexOf('.');if(dot>=0){const suffix=cleanText(web.slice(dot+1));return cleanText(`${first} ${suffix}`)||full}
+  const secondWords=normal(second).split(' ').filter(Boolean),webNormal=normal(web),firstNormal=normal(first);
+  if(webNormal===firstNormal)return full;
+  if(secondWords.includes(webNormal)||secondWords.join(' ')===webNormal)return cleanText(`${first} ${web}`);
+  // Nicknames/mononyms that are not a token of the legal surname are the name
+  // supporters and publishers actually use (for example Beto).
+  return web;
+}
 function freshIdentityAliases(player,element=null){
   const canonicalName=cleanText(element?`${element.first_name||''} ${element.second_name||''}`:player.canonicalName||'').trim();
+  const commonName=cleanText(element?freshCommonIdentityName(element):player.searchName||'').trim();
   const webName=cleanText(element?.web_name||player.webName||'').trim();
-  return [...new Set([canonicalName,webName,cleanText(player.name)].filter(Boolean).map(value=>value.slice(0,100)))];
+  return [...new Set([canonicalName,commonName,webName,cleanText(player.name)].filter(Boolean).map(value=>value.slice(0,100)))];
 }
 /** Resolve the browser's compact display names against the authoritative FPL
  *  element ID. The display name is preserved for OTB; only research identity
@@ -3289,12 +3303,12 @@ function enrichFreshReviewIdentitiesFromBootstrap(context,data){
     ...context,
     players:context.players.map(player=>{
       const element=elements.get(String(player.playerId))||null;
-      const aliases=freshIdentityAliases(player,element);
+      const aliases=freshIdentityAliases(player,element),searchName=freshCommonIdentityName(element)||player.searchName||aliases[0]||player.name;
       const canonicalName=aliases[0]||player.name;
       const identityClub=element?teams.get(element.team)||null:null;
       return {
         ...player,canonicalName,webName:cleanText(element?.web_name||player.webName||player.name).slice(0,100),
-        searchName:canonicalName,identityAliases:aliases,identitySource:element?'FPL_BOOTSTRAP':'OTB_CONTEXT',
+        searchName:cleanText(searchName).slice(0,100),identityAliases:aliases,identitySource:element?'FPL_BOOTSTRAP':'OTB_CONTEXT',
         identityClub,identityClubMismatch:Boolean(identityClub&&identityClub!==player.club)
       };
     })
@@ -3433,18 +3447,18 @@ function freshTextHasPhrase(text,phrase){const needle=normal(phrase);return Bool
 function freshRegExpEscape(value){return String(value||'').replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}
 function freshPlayerEvidenceMatches(player,text){
   const hay=cleanText(text),aliases=player.identityAliases?.length?player.identityAliases:freshIdentityAliases(player);
-  const canonical=normal(player.canonicalName||''),canonicalParts=canonical.split(' ').filter(Boolean);
+  const primary=normal(player.searchName||player.canonicalName||player.name),primaryParts=primary.split(' ').filter(Boolean);
   for(const alias of aliases){const parts=normal(alias).split(' ').filter(Boolean);if(parts.length>=2&&freshTextHasPhrase(hay,alias))return true}
-  const web=normal(player.webName||player.name),surname=canonicalParts.at(-1)||normal(player.name).split(' ').filter(Boolean).at(-1)||'';
+  const web=normal(player.webName||player.name),surname=primaryParts.at(-1)||normal(player.name).split(' ').filter(Boolean).at(-1)||'';
   const clubName=CLUB_SOURCES[player.club]?.name||'',clubPresent=freshTextHasPhrase(hay,clubName)||freshTextHasPhrase(hay,player.club);
   if(!surname||!freshTextHasPhrase(hay,surname))return false;
   // A compact surname is only safe with club context. If the headline names a
   // different first name (Joe Gomez vs Diego Gomez), reject it explicitly.
-  if(canonicalParts.length>=2){
+  if(primaryParts.length>=2){
     if(!clubPresent)return false;
     const nh=normal(hay),match=nh.match(new RegExp(`\\b([a-z][a-z0-9]+)\\s+${freshRegExpEscape(surname)}\\b`));
     const stop=new Set(['the','for','with','from','after','before','about','and','but','not','new','latest','update','injury','on','of','to','vs']);
-    if(match&&match[1]!==canonicalParts[0]&&!stop.has(match[1]))return false;
+    if(match&&match[1]!==primaryParts[0]&&!stop.has(match[1]))return false;
     return true;
   }
   return freshTextHasPhrase(hay,web)||freshTextHasPhrase(hay,player.name);
