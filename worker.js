@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.25.1 — RC5.0.24 key-only Fresh Review authentication
 // v2.25.0 — RC5.5.0 durable background review + per-user Access identity
 // v2.24.1 — RC5.4.1 public football-name derivation from canonical FPL identity
 // v2.24.0 — RC5.4.0 canonical identity, evidence coverage and category freshness
@@ -37,7 +38,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.25.0-rc5.5.0-durable-fresh-review';
+const WORKER_BUILD = 'v2.25.1-rc5.0.24-key-auth';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -506,8 +507,6 @@ async function verifyAccessJwt(token,env,now=Math.floor(Date.now()/1000)){
  * capability remains temporarily accepted so the private app cannot lock its
  * existing user out before the exact-email Access policy is activated. */
 async function freshReviewIdentity(request,env){
-  const accessToken=request.headers.get('cf-access-jwt-assertion')||'';
-  const access=await verifyAccessJwt(accessToken,env);if(access)return access;
   const adminExpected=String(env.SCOUT_ADMIN_TOKEN||''),adminSupplied=request.headers.get('x-otb-token')||bearerToken(request);
   if(adminExpected&&constantTimeEqual(adminSupplied,adminExpected))return{id:'worker-admin',email:null,role:'admin',mode:'worker-admin-token'};
   if(await verifyFreshOwnerCapability(bearerToken(request)))return{id:'legacy:marcus',email:null,role:'admin',mode:'signed-owner-transition'};
@@ -3893,7 +3892,7 @@ export class FreshReviewWorkflow extends WorkflowEntrypoint{
   }
 }
 async function handleFreshReviewRequest(request,env,u){
-  const identity=await freshReviewIdentity(request,env);if(!identity)return json({status:'error',error:'Cloudflare Access sign-in required'},401,env);
+  const identity=await freshReviewIdentity(request,env);if(!identity)return json({status:'error',error:'Fresh Review key required or invalid'},401,env);
   if(u.pathname==='/api/fresh-review/session'){
     if(request.method!=='GET')return json({status:'error',error:'use GET'},405,env);
     return json({status:'ok',authenticated:true,identity:{email:identity.email,role:identity.role,mode:identity.mode},backgroundMode:'cloudflare-workflow',safeToClose:true},200,env);
@@ -3932,8 +3931,8 @@ export default {
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
       if(u.pathname==='/'||u.pathname==='/api/health'){
-        const accessConfigured=Boolean(accessIssuer(env)&&String(env.CF_ACCESS_AUD||'').trim()),legacyConfigured=/^[A-Za-z0-9_-]{43}$/.test(FRESH_REVIEW_OWNER_PUBLIC_KEY)||Boolean(env.SCOUT_ADMIN_TOKEN);
-        return json({status:'ok',service:'OTB Role Intelligence',workerBuild:WORKER_BUILD,schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,structuredFeedAvailable:String(env.STRUCTURED_FEED_DISABLED||'')!=='1',structuredFeedVersion:STRUCTURED_FEED_VERSION,structuredFeedProviders:STRUCTURED_PROVIDER_CATALOG,freshReviewAvailable:true,freshReviewVersion:FRESH_REVIEW_VERSION,freshReviewAuthConfigured:accessConfigured||legacyConfigured,freshReviewAuthMode:accessConfigured?(legacyConfigured?'cloudflare-access-with-transition-fallback':'cloudflare-access'):'signed-owner-transition',freshReviewAccessConfigured:accessConfigured,freshReviewWorkflowConfigured:Boolean(env.FRESH_REVIEW_WORKFLOW?.create),freshReviewBackgroundMode:'cloudflare-workflow',generatedAt:new Date().toISOString()},200,env);
+        const keyConfigured=/^[A-Za-z0-9_-]{43}$/.test(FRESH_REVIEW_OWNER_PUBLIC_KEY)||Boolean(env.SCOUT_ADMIN_TOKEN);
+        return json({status:'ok',service:'OTB Role Intelligence',workerBuild:WORKER_BUILD,schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,structuredFeedAvailable:String(env.STRUCTURED_FEED_DISABLED||'')!=='1',structuredFeedVersion:STRUCTURED_FEED_VERSION,structuredFeedProviders:STRUCTURED_PROVIDER_CATALOG,freshReviewAvailable:true,freshReviewVersion:FRESH_REVIEW_VERSION,freshReviewAuthConfigured:keyConfigured,freshReviewAuthMode:'key-only',freshReviewAccessConfigured:false,freshReviewWorkflowConfigured:Boolean(env.FRESH_REVIEW_WORKFLOW?.create),freshReviewBackgroundMode:'cloudflare-workflow',generatedAt:new Date().toISOString()},200,env);
       }
       // Derived team numbers for the projection engine. Public and
       // read-only: it never triggers a fetch, so it cannot burn credits.
