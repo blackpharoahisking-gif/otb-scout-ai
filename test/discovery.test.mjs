@@ -4,9 +4,12 @@ import vm from 'node:vm';
 import test from 'node:test';
 
 const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
+  .replace(/^import\s+\{\s*WorkflowEntrypoint\s*\}\s+from\s+'cloudflare:workers';\s*/m,'')
+  .replace(/export class FreshReviewWorkflow/, 'class FreshReviewWorkflow')
   .replace(/export default\s*\{/, 'const workerDefault = {')
   +'\n;globalThis.__discoveryTest={CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks,fetchedArticleUsable,sourceReadState};';
-const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto};
+class WorkflowEntrypoint{constructor(ctx,env){this.ctx=ctx;this.env=env}}
+const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto,WorkflowEntrypoint};
 vm.createContext(context);
 vm.runInContext(source,context,{filename:'worker.js'});
 const {CLUB_SOURCES,extractEmbeddedArticleCards,extractEmbeddedArticleBody,parseSitemapXml,scoreLink,selectArticleLinks,fetchedArticleUsable,sourceReadState}=context.__discoveryTest;
@@ -155,4 +158,3 @@ test('valid first-team news remains selectable after hardening',()=>{
   const selected=selectArticleLinks(base,links,8,new Map(),0);
   assert.deepEqual([...selected.candidates],['https://club.example/news/2026/august/10/player-returns-to-training']);
 });
-

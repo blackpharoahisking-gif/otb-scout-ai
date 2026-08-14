@@ -35,7 +35,11 @@
     // Owner-triggered Browser fallback for Google News when direct RSS/HTML
     // egress is unavailable. The cap is global and resets daily.
     "FRESH_REVIEW_BROWSER_DAILY_CAP": "75",
-    "FRESH_REVIEW_BROWSER_SPACING_MS": "6500"
+    "FRESH_REVIEW_BROWSER_SPACING_MS": "6500",
+    // Access JWTs are also checked against this application-level allowlist.
+    // Cloudflare Access remains the outer identity boundary.
+    "FRESH_REVIEW_ALLOWED_EMAILS": "drazikxx@hotmail.com",
+    "FRESH_REVIEW_ADMIN_EMAILS": "drazikxx@hotmail.com"
   },
   "d1_databases": [
     {
@@ -46,6 +50,13 @@
   ],
   "ai": { "binding": "AI" },
   "browser": { "binding": "BROWSER" },
+  "workflows": [
+    {
+      "name": "otb-fresh-review",
+      "binding": "FRESH_REVIEW_WORKFLOW",
+      "class_name": "FreshReviewWorkflow"
+    }
+  ],
   "observability": { "enabled": true, "head_sampling_rate": 1 },
   "triggers": { "crons": ["*/30 * * * *"] }
 }

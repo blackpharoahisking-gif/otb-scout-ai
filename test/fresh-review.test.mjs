@@ -5,9 +5,12 @@ import vm from 'node:vm';
 import test from 'node:test';
 
 const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
+  .replace(/^import\s+\{\s*WorkflowEntrypoint\s*\}\s+from\s+'cloudflare:workers';\s*/m,'')
+  .replace(/export class FreshReviewWorkflow/, 'class FreshReviewWorkflow')
   .replace(/export default\s*\{/, 'const workerDefault = {')
-  +'\n;globalThis.__freshTest={activeChipValue,validateFreshReviewContext,enrichFreshReviewIdentitiesFromBootstrap,freshProjectedTotal,statusForFreshPlayer,enforceFreshVerdict,fallbackFreshClassification,freshContextDiff,freshCacheMinutes,unavailableFreshPlayer,freshPublisherTier,freshSourceWeight,freshNewsDate,freshNewsItemsFromHtml,freshNewsItemsFromRss,freshNewsQueries,freshPlayerEvidenceMatches,freshEvidenceCategory,freshRecency,freshAnnotateEvidence,freshEvidenceCoverage,buildFreshSquadSummary,createFreshReviewJob,finalizeFreshReview,freshJobKey,freshReviewAuthorised,verifyFreshOwnerCapability,sha256Hex};';
-const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto,TextEncoder,TextDecoder,atob};
+  +'\n;globalThis.__freshTest={activeChipValue,validateFreshReviewContext,enrichFreshReviewIdentitiesFromBootstrap,freshProjectedTotal,statusForFreshPlayer,enforceFreshVerdict,fallbackFreshClassification,freshContextDiff,freshCacheMinutes,unavailableFreshPlayer,freshPublisherTier,freshSourceWeight,freshNewsDate,freshNewsItemsFromHtml,freshNewsItemsFromRss,freshNewsQueries,freshPlayerEvidenceMatches,freshEvidenceCategory,freshRecency,freshAnnotateEvidence,freshEvidenceCoverage,buildFreshSquadSummary,createFreshReviewJob,processFreshReviewPlayer,finalizeFreshReview,freshJobKey,freshCacheKey,freshLatestKey,publicFreshJob,freshReviewAuthorised,freshReviewIdentity,verifyFreshOwnerCapability,verifyAccessJwt,sha256Hex,FreshReviewWorkflow};';
+class WorkflowEntrypoint{constructor(ctx,env){this.ctx=ctx;this.env=env}}
+const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto,TextEncoder,TextDecoder,atob,WorkflowEntrypoint,fetch:globalThis.fetch,Response};
 vm.createContext(context);
 vm.runInContext(source,context,{filename:'worker.js'});
 const api=context.__freshTest;
@@ -46,8 +49,8 @@ function validated(chip='NONE'){
 }
 
 function memoryEnv(){
-  const rows=new Map();
-  return{rows,ROLE_KV:{
+  const rows=new Map(),workflowStarts=[];
+  return{rows,workflowStarts,FRESH_REVIEW_WORKFLOW:{async create(options){workflowStarts.push(options);return{id:options.id}}},ROLE_KV:{
     async get(key,type){const value=rows.get(String(key));if(value==null)return null;return type==='json'?JSON.parse(value):value},
     async put(key,value){rows.set(String(key),String(value))}
   }};
@@ -295,4 +298,65 @@ test('force refresh creates a new job while a changed-squad review can target on
   assert.equal(partial.body.targetPlayers,1);
   assert.equal(partial.body.reusedPlayers,14);
   assert.equal(partial.body.diff.added.join(','),'99');
+});
+
+test('creating a review starts one durable Workflow and reports that the browser may close',async()=>{
+  const env=memoryEnv(),identity={id:'access:marcus',role:'admin',mode:'cloudflare-access'};
+  const created=await api.createFreshReviewJob(env,{context:gw1('NONE')},identity);
+  assert.equal(created.status,202);
+  assert.equal(created.body.executionMode,'cloudflare-workflow');
+  assert.equal(created.body.safeToClose,true);
+  assert.equal(created.body.status,'queued');
+  assert.equal(env.workflowStarts.length,1);
+  assert.equal(env.workflowStarts[0].id,created.body.jobId);
+  assert.equal(env.workflowStarts[0].params.actorId,identity.id);
+});
+
+test('an active identical review is reused instead of starting a second scan',async()=>{
+  const env=memoryEnv(),identity={id:'access:marcus',role:'admin',mode:'cloudflare-access'};
+  const first=await api.createFreshReviewJob(env,{context:gw1('NONE')},identity);
+  const second=await api.createFreshReviewJob(env,{context:gw1('NONE')},identity);
+  assert.equal(second.status,202);
+  assert.equal(second.body.cache,'ACTIVE');
+  assert.equal(second.body.jobId,first.body.jobId);
+  assert.equal(env.workflowStarts.length,1);
+});
+
+test('Workflow finishes all 15 after the initiating browser has done no player requests',async()=>{
+  const env=memoryEnv(),identity={id:'access:marcus',role:'admin',mode:'cloudflare-access'};
+  const created=await api.createFreshReviewJob(env,{context:gw1('BENCH_BOOST')},identity),job=await env.ROLE_KV.get(api.freshJobKey(created.body.jobId),'json');
+  for(const player of job.context.players)job.playerReviews[player.playerId]=api.unavailableFreshPlayer(job.context,player,'isolated workflow fixture');
+  await env.ROLE_KV.put(api.freshJobKey(job.jobId),JSON.stringify(job));
+  const stepNames=[],step={async do(name,options,callback){if(typeof options==='function'){callback=options}stepNames.push(name);return callback()}};
+  const workflow=new api.FreshReviewWorkflow(null,env),result=await workflow.run({payload:{jobId:job.jobId,actorId:identity.id}},step);
+  const completed=await env.ROLE_KV.get(api.freshJobKey(job.jobId),'json');
+  assert.equal(result.reviewId,job.jobId);
+  assert.equal(completed.status,'complete');
+  assert.equal(completed.review.playerReviews.length,15);
+  assert.equal(completed.review.scoringPlayerCount,15);
+  assert.equal(stepNames.filter(name=>name.startsWith('research player ')).length,15);
+});
+
+test('review jobs and caches are isolated by authenticated user identity',async()=>{
+  const env=memoryEnv(),alice={id:'access:alice',role:'reviewer',mode:'cloudflare-access'},bob={id:'access:bob',role:'reviewer',mode:'cloudflare-access'};
+  const first=await api.createFreshReviewJob(env,{context:gw1('NONE')},alice);await api.finalizeFreshReview(env,first.body.jobId,alice.id);
+  const bobJob=await api.createFreshReviewJob(env,{context:gw1('NONE')},bob);
+  assert.equal(bobJob.status,202);
+  assert.notEqual(bobJob.body.jobId,first.body.jobId);
+  assert.notEqual(api.freshCacheKey(alice.id,first.body.contextHash),api.freshCacheKey(bob.id,bobJob.body.contextHash));
+  assert.equal((await api.processFreshReviewPlayer(env,first.body.jobId,'1',bob.id)).status,404);
+});
+
+test('Cloudflare Access JWT validation checks signature, audience and exact email allowlist',async()=>{
+  const {publicKey,privateKey}=generateKeyPairSync('rsa',{modulusLength:2048}),jwk=publicKey.export({format:'jwk'}),now=Math.floor(Date.now()/1000),encode=value=>Buffer.from(JSON.stringify(value)).toString('base64url');
+  jwk.kid='access-test-key';jwk.alg='RS256';jwk.use='sig';
+  const header=encode({alg:'RS256',typ:'JWT',kid:jwk.kid}),payload=encode({iss:'https://otb.cloudflareaccess.com',aud:['fresh-aud'],email:'marcus@example.com',iat:now,nbf:now-10,exp:now+3600}),input=header+'.'+payload,token=input+'.'+signBytes('RSA-SHA256',Buffer.from(input),privateKey).toString('base64url'),previousFetch=context.fetch;
+  context.fetch=async()=>new Response(JSON.stringify({keys:[jwk]}),{status:200,headers:{'Content-Type':'application/json'}});
+  try{
+    const identity=await api.verifyAccessJwt(token,{CF_ACCESS_TEAM_DOMAIN:'otb.cloudflareaccess.com',CF_ACCESS_AUD:'fresh-aud',FRESH_REVIEW_ALLOWED_EMAILS:'marcus@example.com'} ,now);
+    assert.equal(identity.email,'marcus@example.com');
+    assert.equal(identity.mode,'cloudflare-access');
+    assert.equal(await api.verifyAccessJwt(token,{CF_ACCESS_TEAM_DOMAIN:'otb.cloudflareaccess.com',CF_ACCESS_AUD:'wrong-aud',FRESH_REVIEW_ALLOWED_EMAILS:'marcus@example.com'},now),null);
+    assert.equal(await api.verifyAccessJwt(token,{CF_ACCESS_TEAM_DOMAIN:'otb.cloudflareaccess.com',CF_ACCESS_AUD:'fresh-aud',FRESH_REVIEW_ALLOWED_EMAILS:'someone@example.com'},now),null);
+  }finally{context.fetch=previousFetch}
 });

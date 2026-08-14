@@ -1,5 +1,5 @@
 name: Deploy Scout to Cloudflare
-# RC5.4.1 evidence-quality release trigger and exact-build health gate.
+# RC5.5.0 durable Fresh Review Workflow and exact-build health gate.
 
 on:
   push:
@@ -66,12 +66,14 @@ jobs:
               if HEALTH_JSON="$health_json" node -e '
                 const health = JSON.parse(process.env.HEALTH_JSON);
                 const valid = health.status === "ok"
-                  && health.workerBuild === "v2.24.1-rc5.4.1-canonical-search-names"
-                  && health.schemaVersion === "1.35.0"
+                  && health.workerBuild === "v2.25.0-rc5.5.0-durable-fresh-review"
+                  && health.schemaVersion === "1.36.0"
                   && health.structuredFeedAvailable === true
                   && health.freshReviewAvailable === true
-                  && health.freshReviewVersion === "1.1.0"
+                  && health.freshReviewVersion === "1.2.0"
                   && health.freshReviewAuthConfigured === true
+                  && health.freshReviewWorkflowConfigured === true
+                  && health.freshReviewBackgroundMode === "cloudflare-workflow"
                   && !("apiFootballAvailable" in health);
                 if (!valid) process.exit(1);
                 console.log(`Verified ${health.workerBuild}, schema ${health.schemaVersion}`);

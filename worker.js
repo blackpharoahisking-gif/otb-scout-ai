@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.25.0 — RC5.5.0 durable background review + per-user Access identity
 // v2.24.1 — RC5.4.1 public football-name derivation from canonical FPL identity
 // v2.24.0 — RC5.4.0 canonical identity, evidence coverage and category freshness
 // v2.23.3 — RC5.3.3 evidence publisher and verdict consistency hardening
@@ -29,12 +30,14 @@
 //      objects rather than bare URL strings).
 //   6. Browser calls and total scan time are budgeted so force=1 cannot hang.
 
+import { WorkflowEntrypoint } from 'cloudflare:workers';
+
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.35.0';
+const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.24.1-rc5.4.1-canonical-search-names';
+const WORKER_BUILD = 'v2.25.0-rc5.5.0-durable-fresh-review';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -88,6 +91,9 @@ const SITEMAP_MAX_LINKS = 240;
 let TABLE_READY = false;
 
 async function withD1(env) {
+  // Unit and local integration harnesses may provide the storage adapter
+  // directly. Production always reaches the D1 branch below.
+  if(env?.ROLE_KV)return env;
   if (!env.DB) throw new Error('D1 binding DB is missing.');
 
   // Ran on EVERY request before; once per isolate is enough.
@@ -293,6 +299,7 @@ function cors(env){return {
   'Access-Control-Allow-Origin': env.ALLOWED_ORIGIN || '*',
   'Access-Control-Allow-Methods':'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers':'Content-Type,Authorization,X-OTB-Token',
+  'Access-Control-Allow-Credentials':'true',
   'Vary':'Origin',
   'Cache-Control':'no-store'
 }}
@@ -458,15 +465,55 @@ async function verifyFreshOwnerCapability(token,publicKey=FRESH_REVIEW_OWNER_PUB
   }catch(e){return false}
 }
 
-/** Fresh Review is owner-only. Verdict receives a signed owner capability
- *  out-of-band, keeps it in sessionStorage and sends it only in an HTTPS
- *  Authorization header. Git and Worker configuration contain only the public
- *  Ed25519 verification key, never a password, shared secret or token hash. */
-async function freshReviewAuthorised(request,env){
-  const adminExpected=String(env.SCOUT_ADMIN_TOKEN||''),adminSupplied=request.headers.get('x-otb-token')||bearerToken(request);
-  if(adminExpected&&constantTimeEqual(adminSupplied,adminExpected))return true;
-  return verifyFreshOwnerCapability(bearerToken(request));
+let ACCESS_CERT_CACHE={issuer:'',expiresAt:0,keys:[]};
+function accessIssuer(env){
+  const raw=String(env.CF_ACCESS_TEAM_DOMAIN||'').trim().replace(/\/$/,'');
+  if(!raw)return'';
+  return /^https:\/\//i.test(raw)?raw:`https://${raw}`;
 }
+function csvSet(value){return new Set(String(value||'').split(/[\s,;]+/).map(x=>x.trim().toLowerCase()).filter(Boolean))}
+function accessAudienceAllowed(payload,env){
+  const expected=csvSet(env.CF_ACCESS_AUD),aud=Array.isArray(payload?.aud)?payload.aud:[payload?.aud];
+  return expected.size>0&&aud.some(value=>expected.has(String(value||'').toLowerCase()));
+}
+async function accessJwks(env,issuer){
+  if(ACCESS_CERT_CACHE.issuer===issuer&&ACCESS_CERT_CACHE.expiresAt>Date.now()&&ACCESS_CERT_CACHE.keys.length)return ACCESS_CERT_CACHE.keys;
+  const response=await fetch(`${issuer}/cdn-cgi/access/certs`,{headers:{Accept:'application/json'},cf:{cacheTtl:600,cacheEverything:true}});
+  if(!response.ok)throw new Error(`Cloudflare Access certs returned HTTP ${response.status}`);
+  const body=await response.json(),keys=Array.isArray(body?.keys)?body.keys:[];
+  if(!keys.length)throw new Error('Cloudflare Access certs did not contain keys');
+  ACCESS_CERT_CACHE={issuer,expiresAt:Date.now()+10*60*1000,keys};return keys;
+}
+async function verifyAccessJwt(token,env,now=Math.floor(Date.now()/1000)){
+  try{
+    const issuer=accessIssuer(env);if(!issuer||!String(env.CF_ACCESS_AUD||'').trim())return null;
+    const parts=String(token||'').split('.');if(parts.length!==3)return null;
+    const header=JSON.parse(new TextDecoder().decode(base64UrlBytes(parts[0]))),payload=JSON.parse(new TextDecoder().decode(base64UrlBytes(parts[1])));
+    if(header.alg!=='RS256'||!header.kid||payload.iss!==issuer||!accessAudienceAllowed(payload,env))return null;
+    if(!Number.isFinite(payload.exp)||payload.exp<=now||Number(payload.nbf||0)>now+30)return null;
+    const email=String(payload.email||'').trim().toLowerCase();if(!email)return null;
+    const allowed=csvSet(env.FRESH_REVIEW_ALLOWED_EMAILS);if(allowed.size&&!allowed.has(email))return null;
+    const jwk=(await accessJwks(env,issuer)).find(item=>item.kid===header.kid);if(!jwk)return null;
+    const key=await crypto.subtle.importKey('jwk',jwk,{name:'RSASSA-PKCS1-v1_5',hash:'SHA-256'},false,['verify']);
+    const valid=await crypto.subtle.verify({name:'RSASSA-PKCS1-v1_5'},key,base64UrlBytes(parts[2]),new TextEncoder().encode(parts[0]+'.'+parts[1]));
+    if(!valid)return null;
+    const admins=csvSet(env.FRESH_REVIEW_ADMIN_EMAILS),actorHash=await sha256Hex(`access:${email}`);
+    return{id:`access:${actorHash.slice(0,32)}`,email,role:admins.has(email)?'admin':'reviewer',mode:'cloudflare-access'};
+  }catch{return null}
+}
+
+/** Access is the production identity boundary. The original signed owner
+ * capability remains temporarily accepted so the private app cannot lock its
+ * existing user out before the exact-email Access policy is activated. */
+async function freshReviewIdentity(request,env){
+  const accessToken=request.headers.get('cf-access-jwt-assertion')||'';
+  const access=await verifyAccessJwt(accessToken,env);if(access)return access;
+  const adminExpected=String(env.SCOUT_ADMIN_TOKEN||''),adminSupplied=request.headers.get('x-otb-token')||bearerToken(request);
+  if(adminExpected&&constantTimeEqual(adminSupplied,adminExpected))return{id:'worker-admin',email:null,role:'admin',mode:'worker-admin-token'};
+  if(await verifyFreshOwnerCapability(bearerToken(request)))return{id:'legacy:marcus',email:null,role:'admin',mode:'signed-owner-transition'};
+  return null;
+}
+async function freshReviewAuthorised(request,env){return Boolean(await freshReviewIdentity(request,env))}
 
 /** Origin is a weak filter, not authentication. Direct address-bar requests
  *  send no Origin header, so those are allowed through for debugging. */
@@ -3189,7 +3236,7 @@ async function marketProbe(env, { regions = 'uk' } = {}) {
 
 /* ----------------------------------------------------- Fresh Squad Review */
 
-const FRESH_REVIEW_VERSION='1.1.0';
+const FRESH_REVIEW_VERSION='1.2.0';
 const FRESH_CLASSIFICATIONS=new Set(['STRONG UPGRADE','UPGRADE','AGREE','MONITOR','DOWNGRADE','STRONG DOWNGRADE','UNKNOWN']);
 const FRESH_STATUSES=new Set(['GREEN','AMBER','RED','OPPORTUNITY']);
 const FRESH_CHIPS=new Set(['NONE','BENCH_BOOST','TRIPLE_CAPTAIN','FREE_HIT','WILDCARD']);
@@ -3688,24 +3735,36 @@ function unavailableFreshPlayer(context,player,error){
 }
 
 function freshJobKey(id){return `fresh-review:job:${id}`}
-function freshCacheKey(hash){return `fresh-review:cache:v2:${hash}`}
+function freshActor(identity){return String(identity?.id||'legacy:local-test')}
+function freshActorHash(actorId){return hashString(`fresh-actor:${actorId}`)}
+function freshCacheKey(actorId,hash){return `fresh-review:cache:v3:${freshActorHash(actorId)}:${hash}`}
+function freshLatestKey(actorId,season,gameweek){return `fresh-review:latest:v2:${freshActorHash(actorId)}:${hashString(`${season}:${gameweek}`)}`}
+function freshActiveKey(actorId,contextHash){return `fresh-review:active:v1:${freshActorHash(actorId)}:${contextHash}`}
 async function storeFreshJob(env,job){await env.ROLE_KV.put(freshJobKey(job.jobId),JSON.stringify(job),{expirationTtl:FRESH_JOB_TTL_SECONDS})}
 function publicFreshJob(job){
   const total=job.selectedPlayerIds.length,completed=job.selectedPlayerIds.filter(id=>job.playerReviews[id]).length;
-  return {jobId:job.jobId,status:job.status,createdAt:job.createdAt,updatedAt:job.updatedAt,force:job.force,contextHash:job.contextHash,totalPlayers:15,targetPlayers:total,completedPlayers:completed,reusedPlayers:Object.keys(job.playerReviews).length-completed,failedPlayers:Object.values(job.playerReviews).filter(r=>r?.research?.status==='failed').length,pendingPlayerIds:job.selectedPlayerIds.filter(id=>!job.playerReviews[id]),selectedPlayerIds:job.selectedPlayerIds,diff:job.diff||null,review:job.review||null};
+  return {jobId:job.jobId,status:job.status,createdAt:job.createdAt,updatedAt:job.updatedAt,force:job.force,contextHash:job.contextHash,totalPlayers:15,targetPlayers:total,completedPlayers:completed,reusedPlayers:Object.keys(job.playerReviews).length-completed,failedPlayers:Object.values(job.playerReviews).filter(r=>r?.research?.status==='failed').length,pendingPlayerIds:job.selectedPlayerIds.filter(id=>!job.playerReviews[id]),selectedPlayerIds:job.selectedPlayerIds,diff:job.diff||null,review:job.review||null,executionMode:job.executionMode||'cloudflare-workflow',workflowInstanceId:job.workflowInstanceId||job.jobId,safeToClose:true,error:job.error||null};
 }
-async function createFreshReviewJob(env,payload){
+async function createFreshReviewJob(env,payload,identity=null){
   const raw=payload?.context||payload;
   const validation=validateFreshReviewContext(raw);
   if(!validation.ok)return {error:'invalid squad context',details:validation.errors,status:400};
-  const context=await enrichFreshReviewIdentities(validation.context),contextHash=await freshContextHash(context),force=payload?.force===true;
+  const actorId=freshActor(identity),context=await enrichFreshReviewIdentities(validation.context),contextHash=await freshContextHash(context),force=payload?.force===true;
   const cacheMinutes=freshCacheMinutes(context);
   if(!force){
-    const cached=await env.ROLE_KV.get(freshCacheKey(contextHash),'json');
+    const cached=await env.ROLE_KV.get(freshCacheKey(actorId,contextHash),'json');
     if(cached?.review&&Date.parse(cached.review.cacheExpiresAt||0)>Date.now())return {status:200,body:{status:'ok',cache:'HIT',cacheMinutes,review:cached.review}};
+    const active=await env.ROLE_KV.get(freshActiveKey(actorId,contextHash),'json');
+    if(active?.jobId){
+      const running=await env.ROLE_KV.get(freshJobKey(active.jobId),'json');
+      if(running?.actorId===actorId&&running.contextHash===contextHash&&['queued','researching','ready_to_finalize'].includes(running.status))return {status:202,body:{status:'ok',cache:'ACTIVE',...publicFreshJob(running)}};
+    }
   }
   let priorJob=null;
-  if(payload?.priorReviewId)priorJob=await env.ROLE_KV.get(freshJobKey(String(payload.priorReviewId)),'json');
+  if(payload?.priorReviewId){
+    const candidate=await env.ROLE_KV.get(freshJobKey(String(payload.priorReviewId)),'json');
+    if(candidate?.actorId===actorId)priorJob=candidate;
+  }
   const priorContext=priorJob?.context||priorJob?.review?.inputSnapshot||null;
   const diff=priorContext?freshContextDiff(priorContext,context):null;
   const validIds=new Set(context.players.map(p=>p.playerId));
@@ -3720,19 +3779,24 @@ async function createFreshReviewJob(env,payload){
   const missingCarry=context.players.filter(p=>!selected.includes(p.playerId)&&!playerReviews[p.playerId]).map(p=>p.playerId);
   selected=[...new Set([...selected,...missingCarry])];
   const now=new Date().toISOString();
-  const job={jobId:crypto.randomUUID(),status:'researching',createdAt:now,updatedAt:now,force,cacheMinutes,contextHash,context,selectedPlayerIds:selected,playerReviews,diff,priorReviewId:priorJob?.jobId||null,review:null};
+  const jobId=crypto.randomUUID(),job={jobId,status:'queued',createdAt:now,updatedAt:now,force,cacheMinutes,contextHash,context,selectedPlayerIds:selected,playerReviews,diff,priorReviewId:priorJob?.jobId||null,review:null,actorId,actorRole:identity?.role||'reviewer',authMode:identity?.mode||'test',executionMode:'cloudflare-workflow',workflowInstanceId:jobId,error:null};
   await storeFreshJob(env,job);
+  await env.ROLE_KV.put(freshActiveKey(actorId,contextHash),JSON.stringify({jobId,createdAt:now}),{expirationTtl:FRESH_JOB_TTL_SECONDS});
+  if(!env.FRESH_REVIEW_WORKFLOW?.create){job.status='start_failed';job.error='Fresh Review Workflow binding is unavailable.';job.updatedAt=new Date().toISOString();await storeFreshJob(env,job);return {status:503,body:{status:'error',error:job.error,...publicFreshJob(job)}}}
+  try{
+    await env.FRESH_REVIEW_WORKFLOW.create({id:jobId,params:{jobId,actorId},retention:{successRetention:'3 days',errorRetention:'7 days'}});
+  }catch(error){job.status='start_failed';job.error=cleanText(error?.message||error).slice(0,300);job.updatedAt=new Date().toISOString();await storeFreshJob(env,job);return {status:503,body:{status:'error',error:`Fresh Review could not start: ${job.error}`,...publicFreshJob(job)}}}
   return {status:202,body:{status:'ok',cache:'MISS',...publicFreshJob(job)}};
 }
-async function processFreshReviewPlayer(env,jobId,playerId){
+async function processFreshReviewPlayer(env,jobId,playerId,actorId=null){
   const job=await env.ROLE_KV.get(freshJobKey(jobId),'json');
-  if(!job)return {status:404,body:{status:'error',error:'review job not found or expired'}};
+  if(!job||(actorId&&job.actorId!==actorId))return {status:404,body:{status:'error',error:'review job not found or expired'}};
   if(job.review)return {status:200,body:{status:'ok',...publicFreshJob(job)}};
   const player=job.context.players.find(p=>p.playerId===String(playerId));
   if(!player)return {status:400,body:{status:'error',error:'player is not in this review context'}};
   if(job.playerReviews[player.playerId])return {status:200,body:{status:'ok',playerReview:job.playerReviews[player.playerId],...publicFreshJob(job)}};
   let result;try{result=await researchFreshPlayer(env,job.context,player)}catch(error){result=unavailableFreshPlayer(job.context,player,error?.message||String(error))}
-  job.playerReviews[player.playerId]=result;job.updatedAt=new Date().toISOString();
+  job.playerReviews[player.playerId]=result;job.status='researching';job.updatedAt=new Date().toISOString();
   if(job.selectedPlayerIds.every(id=>job.playerReviews[id]))job.status='ready_to_finalize';
   await storeFreshJob(env,job);
   return {status:200,body:{status:'ok',playerReview:result,...publicFreshJob(job)}};
@@ -3764,9 +3828,9 @@ function buildFreshSquadSummary(context,reviews){
   const coverageWarning=unverified.length?`${unverified.length} of ${scoring.length} scoring players were not independently verified by current external evidence.`:'Every scoring player had at least partial current external evidence.';
   return {coverageWarning,primaryIssue,secondaryRisks:secondary.map(r=>`${r.name} — ${r.rationale}`),positiveDisagreement,captainAssessment,overallVerdict:overall};
 }
-async function finalizeFreshReview(env,jobId){
+async function finalizeFreshReview(env,jobId,actorId=null){
   const job=await env.ROLE_KV.get(freshJobKey(jobId),'json');
-  if(!job)return {status:404,body:{status:'error',error:'review job not found or expired'}};
+  if(!job||(actorId&&job.actorId!==actorId))return {status:404,body:{status:'error',error:'review job not found or expired'}};
   if(job.review)return {status:200,body:{status:'ok',cache:'HIT',review:job.review}};
   for(const player of job.context.players)if(!job.playerReviews[player.playerId])job.playerReviews[player.playerId]=unavailableFreshPlayer(job.context,player,'Player research did not complete before finalization.');
   const playerReviews=job.context.players.map(p=>job.playerReviews[p.playerId]);
@@ -3780,41 +3844,84 @@ async function finalizeFreshReview(env,jobId){
     summary:buildFreshSquadSummary(job.context,playerReviews),playerReviews,otbAlerts:job.context.otbAlerts,
     research:{researchedPlayers:job.selectedPlayerIds.length,freshPlayers:job.selectedPlayerIds.length,reusedPlayers:playerReviews.filter(r=>r.reusedFromReviewId).length,failedPlayers:playerReviews.filter(r=>r.research?.status==='failed').length,currentEvidencePlayers:playerReviews.filter(r=>r.decisionEvidenceCount>0).length,verifiedPlayers:coverageCounts.VERIFIED,partialPlayers:coverageCounts.PARTIAL,unverifiedPlayers:coverageCounts.UNVERIFIED,scoringPlayersVerified:playerReviews.filter(r=>r.scoring&&r.evidenceCoverage==='VERIFIED').length},
     methodology:{authority:'Tier 1 official/confirmed evidence outranks Tier 2 reporting, Tier 3 community inference and Tier 4 aggregation. Authority is assigned from the source, never headline wording.',recency:'Evidence uses category-specific decision windows: availability and predicted lineups expire quickly; role competition, transfers, tactical roles and set pieces remain relevant longer.',identity:'The official FPL element ID resolves canonical player names before search; compact surname results require club context and conflicting full names are rejected.',preferredSources:'Publicly accessible RotoWire information is preferred within Tier 2 when relevant. Gated content and access controls are never bypassed; systematic ingestion requires the licensed official API.',precision:'Qualitative confidence and disagreement classes are used; no synthetic start percentage is created.'},
-    inputSnapshot:job.context,contextHash:job.contextHash,priorReviewId:job.priorReviewId,diff:job.diff,mutatesProjection:false
+    inputSnapshot:job.context,contextHash:job.contextHash,priorReviewId:job.priorReviewId,diff:job.diff,executionMode:'cloudflare-workflow',mutatesProjection:false
   };
   job.review=review;job.status='complete';job.updatedAt=generatedAt;await storeFreshJob(env,job);
   await Promise.all([
-    env.ROLE_KV.put(freshCacheKey(job.contextHash),JSON.stringify({review}),{expirationTtl:cacheMinutes*60}),
-    env.ROLE_KV.put(`fresh-review:latest:${hashString(`${job.context.season}:${job.context.gameweek}`)}`,JSON.stringify({jobId:job.jobId,review}),{expirationTtl:FRESH_JOB_TTL_SECONDS})
+    env.ROLE_KV.put(freshCacheKey(job.actorId,job.contextHash),JSON.stringify({review}),{expirationTtl:cacheMinutes*60}),
+    env.ROLE_KV.put(freshLatestKey(job.actorId,job.context.season,job.context.gameweek),JSON.stringify({jobId:job.jobId,review}),{expirationTtl:FRESH_JOB_TTL_SECONDS})
   ]);
   return {status:200,body:{status:'ok',cache:'MISS',review}};
 }
+
+/** A review runs independently of the initiating browser. Each player is a
+ * durable step, so mobile suspension, tab closure and transient Worker restarts
+ * do not discard completed research. One failed player becomes UNKNOWN and the
+ * remaining squad continues. */
+export class FreshReviewWorkflow extends WorkflowEntrypoint{
+  async run(event,step){
+    const payload=event?.payload||event?.params||{},jobId=String(payload.jobId||''),actorId=String(payload.actorId||'');
+    if(!jobId||!actorId)throw new Error('Fresh Review Workflow payload is incomplete.');
+    try{
+      const playerIds=await step.do('load review context',{retries:{limit:3,delay:'2 seconds',backoff:'exponential'},timeout:'1 minute'},async()=>{
+        const env=await withD1(this.env),job=await env.ROLE_KV.get(freshJobKey(jobId),'json');
+        if(!job||job.actorId!==actorId)throw new Error('Fresh Review job is missing or belongs to another actor.');
+        if(job.review)return[];
+        job.status='researching';job.updatedAt=new Date().toISOString();await storeFreshJob(env,job);return job.selectedPlayerIds;
+      });
+      for(let index=0;index<playerIds.length;index++){
+        const playerId=String(playerIds[index]);
+        await step.do(`research player ${index+1} ${playerId}`,{retries:{limit:2,delay:'5 seconds',backoff:'exponential'},timeout:'5 minutes'},async()=>{
+          const env=await withD1(this.env),result=await processFreshReviewPlayer(env,jobId,playerId,actorId);
+          if(result.status>=500)throw new Error(result.body?.error||`Player ${playerId} research failed`);
+          return{playerId,status:result.body?.playerReview?.research?.status||result.body?.status||'complete'};
+        });
+      }
+      return step.do('finalize squad review',{retries:{limit:3,delay:'3 seconds',backoff:'exponential'},timeout:'2 minutes'},async()=>{
+        const env=await withD1(this.env),result=await finalizeFreshReview(env,jobId,actorId);
+        if(result.status>=400)throw new Error(result.body?.error||'Fresh Review finalization failed');
+        return{jobId,reviewId:result.body.review?.reviewId||jobId,generatedAt:result.body.review?.generatedAt||new Date().toISOString()};
+      });
+    }catch(error){
+      await step.do('record workflow failure',{retries:{limit:2,delay:'2 seconds',backoff:'constant'},timeout:'1 minute'},async()=>{
+        const env=await withD1(this.env),job=await env.ROLE_KV.get(freshJobKey(jobId),'json');
+        if(job&&job.actorId===actorId&&!job.review){job.status='failed';job.error=cleanText(error?.message||error).slice(0,500);job.updatedAt=new Date().toISOString();await storeFreshJob(env,job)}
+        return{recorded:true};
+      });
+      throw error;
+    }
+  }
+}
 async function handleFreshReviewRequest(request,env,u){
-  if(!await freshReviewAuthorised(request,env))return json({status:'error',error:'owner authorisation required'},401,env);
+  const identity=await freshReviewIdentity(request,env);if(!identity)return json({status:'error',error:'Cloudflare Access sign-in required'},401,env);
+  if(u.pathname==='/api/fresh-review/session'){
+    if(request.method!=='GET')return json({status:'error',error:'use GET'},405,env);
+    return json({status:'ok',authenticated:true,identity:{email:identity.email,role:identity.role,mode:identity.mode},backgroundMode:'cloudflare-workflow',safeToClose:true},200,env);
+  }
   if(u.pathname==='/api/fresh-review/latest'){
     if(request.method!=='GET')return json({status:'error',error:'use GET'},405,env);
     const season=cleanText(u.searchParams.get('season')||env.SEASON||'2026/27'),gameweek=Math.round(finiteOr(u.searchParams.get('gameweek'),0));
     if(gameweek<1)return json({status:'error',error:'gameweek is required'},400,env);
-    const latest=await env.ROLE_KV.get(`fresh-review:latest:${hashString(`${season}:${gameweek}`)}`,'json');
+    const latest=await env.ROLE_KV.get(freshLatestKey(identity.id,season,gameweek),'json');
     return json({status:'ok',review:latest?.review||null},200,env);
   }
   if(u.pathname==='/api/fresh-review'){
     if(request.method!=='POST')return json({status:'error',error:'use POST'},405,env);
     const payload=await request.json().catch(()=>null);if(!payload)return json({status:'error',error:'valid JSON body required'},400,env);
-    const result=await createFreshReviewJob(env,payload);return json(result.body||{status:'error',error:result.error,details:result.details},result.status||500,env);
+    const result=await createFreshReviewJob(env,payload,identity);return json(result.body||{status:'error',error:result.error,details:result.details},result.status||500,env);
   }
   const match=u.pathname.match(/^\/api\/fresh-review\/([a-f0-9-]+)(?:\/(player|finalize))?$/i);
   if(!match)return json({status:'error',error:'fresh review route not found'},404,env);
   const jobId=match[1],action=match[2]||'';
   if(!action&&request.method==='GET'){
     const job=await env.ROLE_KV.get(freshJobKey(jobId),'json');
-    return job?json({status:'ok',...publicFreshJob(job)},200,env):json({status:'error',error:'review job not found or expired'},404,env);
+    return job?.actorId===identity.id?json({status:'ok',...publicFreshJob(job)},200,env):json({status:'error',error:'review job not found or expired'},404,env);
   }
   if(action==='player'&&request.method==='POST'){
-    const body=await request.json().catch(()=>({}));const result=await processFreshReviewPlayer(env,jobId,String(body.playerId||''));return json(result.body,result.status,env);
+    const body=await request.json().catch(()=>({}));const result=await processFreshReviewPlayer(env,jobId,String(body.playerId||''),identity.id);return json(result.body,result.status,env);
   }
   if(action==='finalize'&&request.method==='POST'){
-    const result=await finalizeFreshReview(env,jobId);return json(result.body,result.status,env);
+    const result=await finalizeFreshReview(env,jobId,identity.id);return json(result.body,result.status,env);
   }
   return json({status:'error',error:'method not allowed'},405,env);
 }
@@ -3824,7 +3931,10 @@ export default {
     env = await withD1(env);
     if(request.method==='OPTIONS')return new Response(null,{status:204,headers:cors(env)});
     const u=new URL(request.url);try{
-      if(u.pathname==='/'||u.pathname==='/api/health')return json({status:'ok',service:'OTB Role Intelligence',workerBuild:WORKER_BUILD,schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,structuredFeedAvailable:String(env.STRUCTURED_FEED_DISABLED||'')!=='1',structuredFeedVersion:STRUCTURED_FEED_VERSION,structuredFeedProviders:STRUCTURED_PROVIDER_CATALOG,freshReviewAvailable:true,freshReviewVersion:FRESH_REVIEW_VERSION,freshReviewAuthConfigured:/^[A-Za-z0-9_-]{43}$/.test(FRESH_REVIEW_OWNER_PUBLIC_KEY)||Boolean(env.SCOUT_ADMIN_TOKEN),freshReviewAuthMode:'signed-owner-capability',generatedAt:new Date().toISOString()},200,env);
+      if(u.pathname==='/'||u.pathname==='/api/health'){
+        const accessConfigured=Boolean(accessIssuer(env)&&String(env.CF_ACCESS_AUD||'').trim()),legacyConfigured=/^[A-Za-z0-9_-]{43}$/.test(FRESH_REVIEW_OWNER_PUBLIC_KEY)||Boolean(env.SCOUT_ADMIN_TOKEN);
+        return json({status:'ok',service:'OTB Role Intelligence',workerBuild:WORKER_BUILD,schemaVersion:SCHEMA_VERSION,season:env.SEASON||'2026/27',teams:Object.keys(CLUB_SOURCES).length,browserAvailable:!!env.BROWSER?.quickAction,structuredFeedAvailable:String(env.STRUCTURED_FEED_DISABLED||'')!=='1',structuredFeedVersion:STRUCTURED_FEED_VERSION,structuredFeedProviders:STRUCTURED_PROVIDER_CATALOG,freshReviewAvailable:true,freshReviewVersion:FRESH_REVIEW_VERSION,freshReviewAuthConfigured:accessConfigured||legacyConfigured,freshReviewAuthMode:accessConfigured?(legacyConfigured?'cloudflare-access-with-transition-fallback':'cloudflare-access'):'signed-owner-transition',freshReviewAccessConfigured:accessConfigured,freshReviewWorkflowConfigured:Boolean(env.FRESH_REVIEW_WORKFLOW?.create),freshReviewBackgroundMode:'cloudflare-workflow',generatedAt:new Date().toISOString()},200,env);
+      }
       // Derived team numbers for the projection engine. Public and
       // read-only: it never triggers a fetch, so it cannot burn credits.
       if(u.pathname==='/api/market/teams'){
