@@ -85,7 +85,17 @@ jobs:
       - name: Confirm live Fresh Review endpoint is owner-protected
         shell: bash
         run: |
-          status="$(curl --silent --output /tmp/fresh-review.json --write-out '%{http_code}' \
-            -X POST "https://otb-role-intelligence.blackpharoahisking.workers.dev/api/fresh-review" \
-            -H 'Content-Type: application/json' --data '{}')"
-          test "$status" = "401"
+          # Workers deploy globally; a request immediately after the health
+          # probe can briefly land on an older isolate. Retry the negative auth
+          # assertion so propagation does not turn a healthy release red.
+          for attempt in $(seq 1 8); do
+            status="$(curl --silent --output /tmp/fresh-review.json --write-out '%{http_code}' \
+              -X POST "https://otb-role-intelligence.blackpharoahisking.workers.dev/api/fresh-review" \
+              -H 'Content-Type: application/json' --data '{}')"
+            if [ "$status" = "401" ]; then
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Fresh Review endpoint did not settle on owner-protected 401; last status: $status" >&2
+          exit 1
