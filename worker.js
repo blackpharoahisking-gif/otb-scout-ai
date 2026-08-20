@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.25.3-rc5.0.26-evidence-quality';
+const WORKER_BUILD = 'v2.26.0-rc5.0.27-discovery-editorial-gate';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
