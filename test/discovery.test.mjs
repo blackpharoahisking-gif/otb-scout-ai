@@ -233,3 +233,45 @@ test('a mix of structurally-plausible junk and one genuine article yields only t
   const selected=selectArticleLinks(base,links,8,new Map(),0);
   assert.deepEqual([...selected.candidates],['https://club.example/news/2026/august/10/manager-confirms-team-news-ahead-of-weekend-fixture']);
 });
+
+// Task #16: widened editorial vocabulary for recovery/fitness-boost and
+// squad-hierarchy phrasing that genuine current news commonly uses but the
+// original transfer/injury-onset-focused list missed.
+test('recovery, fitness-boost and hierarchy phrasing now carry an editorial signal',()=>{
+  const host='club.example',year=2026;
+  for(const path of [
+    '/news/2026/august/10/striker-given-the-green-light-to-return-this-weekend',
+    '/news/2026/august/10/midfielder-is-fully-recovered-and-in-contention',
+    '/news/2026/august/10/defender-handed-injury-boost-ahead-of-derby',
+    '/news/2026/august/10/manager-names-new-captain-for-the-season',
+  ]){
+    const scored=scoreLink(`https://${host}${path}`,host,year);
+    assert.equal(scored.editorial,true,`${path} must carry an editorial signal`);
+    assert.equal(scored.reason,'candidate',path);
+  }
+});
+
+// Task #16: when strict pass finds nothing anywhere in the discovered set
+// (a real gap, not a bug -- e.g. the genuine team-news article is on a
+// pagination page this scan did not reach), the relaxed-pass fallback must
+// still prefer a lightly-penalised genuine article over pure structural
+// junk, rather than being purely score-driven.
+test('relaxed pass prefers a real article over structurally-plausible junk when nothing clears the strict bar',()=>{
+  const base='https://club.example/news';
+  const links=[
+    // Genuine recovery news, but posted under an old-year "/video/" section
+    // path that trips enough soft penalties to miss the strict score>1 bar
+    // (score 0, editorial:true) -- still must be picked first in relaxed
+    // pass because it is the only link carrying a real editorial signal.
+    'https://club.example/news/video/2025/striker-fully-recovered-and-back-in-contention',
+    'https://club.example/news/2026/august/10/2026-27-squad-photocall-headshots',
+    'https://club.example/news/2026/august/10/sync-matchday-dates-to-your-phone-calendar',
+  ];
+  const selected=selectArticleLinks(base,links,8,new Map(),0);
+  assert.equal(selected.pass.startsWith('relaxed'),true,'expected the relaxed-pass fallback to trigger');
+  assert.equal(selected.candidates[0],'https://club.example/news/video/2025/striker-fully-recovered-and-back-in-contention','the editorial link must be ranked first');
+  // With the article budget forced to exactly 1, only the editorial link
+  // must survive -- proving the preference is load-bearing, not cosmetic.
+  const constrained=selectArticleLinks(base,links,1,new Map(),0);
+  assert.deepEqual([...constrained.candidates],['https://club.example/news/video/2025/striker-fully-recovered-and-back-in-contention']);
+});

@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.26.0-rc5.0.27-discovery-editorial-gate';
+const WORKER_BUILD = 'v2.26.1-rc5.0.28-relaxed-pass-hardening';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -1121,7 +1121,15 @@ function scoreLink(url,host,currentYear){
   // let it through the new candidate gate. Confirmed live: a forced Arsenal
   // rescan against this exact regex (pre-boundary) selected a stadium
   // opening-day retrospective solely because "opening" contains "pen".
-  const editorialKeywordMatch=/\b(?:article|story|interview|press-conference|team-news|fitness-update|injury-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|pre-season|preseason|friendly|match-report|injury|contract)\b/.test(p);
+  // RC-fix Aug 2026 (task #16): the relaxed-pass fallback can only ever be as
+  // good as this vocabulary. Widened to cover recovery/fitness-boost and
+  // squad-hierarchy phrasing (medical-update, fully-recovered, green-light,
+  // contention, captain, ...) that genuine current news commonly uses but
+  // which the original list -- built mostly around transfer/injury-onset
+  // language -- missed, so a real "back in contention"-type article could
+  // lose out to structurally-plausible junk in relaxed pass even after the
+  // editorial gate landed.
+  const editorialKeywordMatch=/\b(?:article|story|interview|press-conference|team-news|fitness-update|injury-update|medical-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|pre-season|preseason|friendly|match-report|injury|contract|fully-fit|fully-recovered|recovered|recovery|green-light|return-timeline|step-closer|closer-to-return|contention|captain|vice-captain|fitness-boost|boost)\b/.test(p);
   if(editorialKeywordMatch)score+=6;
   if(new RegExp(`/${currentYear}/`).test(p))score+=1;
   if(new RegExp(`/${currentYear-1}/`).test(p))score-=2;
@@ -1174,15 +1182,26 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
   const eligible=pass==='relaxed'?selected:selected.filter(x=>x.score>1&&x.editorial);
   const coverage=Number(timestampCoverage)||0,useTimestamp=coverage>=RECENCY_COVERAGE_MIN;
   const unseenFirst=(a,b)=>(a.seen===b.seen?0:(a.seen?1:-1));
+  // RC-fix Aug 2026 (task #16): in strict pass every item in `eligible`
+  // already has editorial===true, so this is a no-op there. In RELAXED pass
+  // (triggered only when strict pass finds zero editorial candidates in the
+  // whole discovered set) `eligible` can mix genuine-but-lightly-penalised
+  // editorial links with pure structural junk (calendar tools, merchandise
+  // pages) that only cleared the relaxed floor on /news/ shape. Putting
+  // editorial first here means a real "back in contention"/"medical update"
+  // article that just missed the strict score bar still outranks junk,
+  // instead of the fallback being purely structural-score-driven.
+  const editorialFirst=(a,b)=>(b.editorial?1:0)-(a.editorial?1:0);
 
   // Freshness lane:
-  //   1) timestamps, when enough are actually available;
-  //   2) otherwise the publisher's rendered DOM order;
+  //   1) editorial signal, when the pool is mixed (see above);
+  //   2) timestamps, when enough are actually available;
+  //   3) otherwise the publisher's rendered DOM order;
   // with never-processed URLs ahead of URLs already analysed.
   const freshLane=useTimestamp
-    ? eligible.filter(x=>Number.isFinite(x.time)).sort((a,b)=>unseenFirst(a,b)||b.time-a.time||b.score-a.score||a.index-b.index)
-    : eligible.slice().sort((a,b)=>unseenFirst(a,b)||a.index-b.index||b.score-a.score);
-  const keywordLane=eligible.slice().sort((a,b)=>unseenFirst(a,b)||(useTimestamp?(Number(b.time)||0)-(Number(a.time)||0):0)||b.score-a.score||a.index-b.index);
+    ? eligible.filter(x=>Number.isFinite(x.time)).sort((a,b)=>editorialFirst(a,b)||unseenFirst(a,b)||b.time-a.time||b.score-a.score||a.index-b.index)
+    : eligible.slice().sort((a,b)=>editorialFirst(a,b)||unseenFirst(a,b)||a.index-b.index||b.score-a.score);
+  const keywordLane=eligible.slice().sort((a,b)=>editorialFirst(a,b)||unseenFirst(a,b)||(useTimestamp?(Number(b.time)||0)-(Number(a.time)||0):0)||b.score-a.score||a.index-b.index);
 
   const seen=new Set(),chosen=[],add=x=>{if(!x||seen.has(x.url)||chosen.length>=limit)return;seen.add(x.url);chosen.push(x.url)};
 
