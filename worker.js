@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.26.1-rc5.0.28-relaxed-pass-hardening';
+const WORKER_BUILD = 'v2.27.0-rc5.0.29-lineup-selection-feeds';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -1862,7 +1862,9 @@ async function loadDepartureEvidence(env,team){
 const STRUCTURED_FEED_VERSION='provider-neutral-v1';
 const STRUCTURED_FEED_CACHE_TTL=60*60*24*14;
 const STRUCTURED_PROVIDER_CATALOG=Object.freeze([
-  Object.freeze({id:'fpl-bootstrap',version:'bootstrap-static-v1',capabilities:['availability'],authority:'official-current-state'})
+  Object.freeze({id:'fpl-bootstrap',version:'bootstrap-static-v1',capabilities:['availability'],authority:'official-current-state'}),
+  Object.freeze({id:'fpl-live-starts',version:'event-live-v1',capabilities:['selection'],authority:'official-match-record'}),
+  Object.freeze({id:'pl-announced-xi',version:'pulse-teamlists-v1',capabilities:['lineup'],authority:'official-team-sheet'})
 ]);
 
 function structuredFeedCacheKey(team){return 'structured-feed:v2:'+team}
@@ -1908,6 +1910,164 @@ function fplStructuredAvailabilityEvents(team,players,fetchedAt=new Date().toISO
   return mergeRoleEvidence(events);
 }
 
+/* ---------------------------------------------- lineup + selection feeds */
+/* Until now every structured event came from bootstrap availability, so the
+   two highest-weighted evidence types in the whole policy table --
+   confirmed_start and confirmed_bench (k=+/-4) -- had nothing feeding them,
+   and a club could play a match without producing one selection signal.
+   Two providers close that: the official post-match record (who actually
+   started) and the official pre-kickoff team sheet (who is about to). */
+
+const FPL_EVENT_LIVE=round=>`https://fantasy.premierleague.com/api/event/${round}/live/`;
+const FPL_EVENT_FIXTURES=round=>`https://fantasy.premierleague.com/api/fixtures/?event=${round}`;
+const PULSE_FIXTURE=pulseId=>`https://footballapi.pulselive.com/football/fixtures/${pulseId}`;
+const PULSE_ORIGIN='https://www.premierleague.com';
+const SELECTION_ROUNDS=3; // resolveRoleIntelEvents keeps at most 3 selection events per player
+/* These feeds run inside the scan budget, so a provider that hangs would eat
+   the whole allowance and starve article reading. Every request is bounded. */
+const FEED_TIMEOUT_MS=6000;
+function feedSignal(){try{return AbortSignal.timeout(FEED_TIMEOUT_MS)}catch{return undefined}}
+
+const LIVE_MEMO=new Map();
+const LIVE_MEMO_MS=90000;
+const LIVE_MEMO_MAX=6;
+
+/* A cron sweep scans clubs one at a time but every club reads the SAME live
+   round payload. Without memoisation that is one ~300KB fetch and parse per
+   club per round -- sixty requests a tick for identical bytes. */
+async function getEventLive(round,fetchFn=fetch){
+  const key=String(round),now=Date.now(),hit=LIVE_MEMO.get(key);
+  if(hit&&now-hit.at<LIVE_MEMO_MS)return hit.data;
+  const r=await fetchFn(FPL_EVENT_LIVE(round),{headers:{Accept:'application/json'},signal:feedSignal()});
+  if(!r.ok)throw new Error(`FPL live HTTP ${r.status} for round ${round}`);
+  const data=await r.json();
+  if(LIVE_MEMO.size>=LIVE_MEMO_MAX)LIVE_MEMO.delete(LIVE_MEMO.keys().next().value);
+  LIVE_MEMO.set(key,{at:now,data});
+  return data;
+}
+
+function recentFinishedEvents(bootstrap,limit=SELECTION_ROUNDS){
+  return (bootstrap?.events||[])
+    .filter(e=>e?.finished===true&&Number.isFinite(Number(e?.id)))
+    .sort((a,b)=>Number(b.id)-Number(a.id))
+    .slice(0,limit);
+}
+
+function selectionEvent({team,player,round,type,confidence,reason,at,source}){
+  const policy=EVIDENCE_POLICY[type]||EVIDENCE_POLICY.observed_role;
+  return {
+    // Round is part of the identity so consecutive gameweeks accumulate as
+    // separate observations instead of overwriting one another.
+    id:'structured-'+hashString([team,'fpl-live-starts',type,round,player.id].join('|')),
+    createdAt:at,team,type,rawType:type,originType:'structured_fpl_selection',
+    subject:player.name,role:null,affected:player.name,affectedApiId:player.id,structuredPlayerId:null,
+    overlap:1,hierarchy:1,confidence,source,reason,
+    evidenceDate:new Date(at).toISOString(),evidenceDateSource:'fpl-event-live',
+    evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.9,
+    effectiveFrom:new Date(at).toISOString(),
+    expiresAt:new Date(at+policy.ttlHours*3600000).toISOString(),
+    halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,
+    directImpact:false,preseasonCalibrated:false,verificationStatus:'structured-feed',
+    minutesCap:null,directAvailability:null,selectionCertainty:null,productionImpact:0,
+    fixtureId:null,competition:'Premier League',kickoff:null,gameweek:round,
+    auto:true,worker:true,structuredFeed:true,provider:'fpl-live-starts',oop:false
+  };
+}
+
+/** Pure: turns one round of official live stats into selection evidence. */
+function fplLiveSelectionEvents(team,players,round,liveElements,{deadlineTime=null}={}){
+  const stats=new Map();
+  for(const el of liveElements||[]){
+    const id=Number(el?.id);
+    if(Number.isFinite(id))stats.set(id,el?.stats||{});
+  }
+  const roster=(players||[]).filter(p=>Number.isFinite(Number(p.id)));
+  /* Blank-gameweek guard. event/live lists EVERY player in the game with zero
+     minutes, so a club that did not play this round is indistinguishable from
+     a club whose entire squad was benched. If nobody on this roster recorded a
+     single minute, treat it as no data rather than inventing fifteen benchings
+     out of an absence. */
+  if(!roster.some(p=>Number(stats.get(Number(p.id))?.minutes)>0))return {events:[],skipped:'no-minutes-recorded'};
+  const at=Date.parse(deadlineTime||'')||Date.now();
+  const events=[];
+  for(const player of roster){
+    const row=stats.get(Number(player.id));
+    if(!row)continue;
+    const minutes=Number(row.minutes)||0,starts=Number(row.starts)||0;
+    if(starts>=1){
+      const confidence=minutes>=85?.95:minutes>=60?.9:.82;
+      events.push(selectionEvent({team,player,round,type:'observed_role',confidence,at,source:FPL_EVENT_LIVE(round),
+        reason:`Official Premier League match record: ${player.name} started gameweek ${round} and played ${minutes} minutes.`}));
+      continue;
+    }
+    if(minutes>0){
+      events.push(selectionEvent({team,player,round,type:'rotation_warning',confidence:.85,at,source:FPL_EVENT_LIVE(round),
+        reason:`Official Premier League match record: ${player.name} did not start gameweek ${round} and came off the bench for ${minutes} minutes.`}));
+      continue;
+    }
+    /* Zero minutes is ambiguous -- unused substitute, omitted from the squad,
+       or simply injured. An already-unavailable player is fully described by
+       the availability provider, so adding a rotation signal on top would
+       double-count one injury as a separate selection decision. */
+    if(String(player.status||'a').toLowerCase()!=='a')continue;
+    events.push(selectionEvent({team,player,round,type:'rotation_warning',confidence:.7,at,source:FPL_EVENT_LIVE(round),
+      reason:`Official Premier League match record: ${player.name} was available but did not play in gameweek ${round}.`}));
+  }
+  return {events,skipped:null};
+}
+
+function pulsePlayerName(entry){
+  const name=entry?.name||{};
+  return cleanText(name.display||[name.first,name.last].filter(Boolean).join(' ')||entry?.matchName||'');
+}
+
+/** Pure: picks the team list belonging to our roster by counting name matches. */
+function pulseTeamListForRoster(teamLists,players){
+  let best=null,bestScore=0;
+  for(const list of Array.isArray(teamLists)?teamLists:[]){
+    const named=[...(list?.lineup||[]),...(list?.substitutes||[])].map(pulsePlayerName).filter(Boolean);
+    const score=named.filter(name=>rosterPlayerForSubject(players,name)).length;
+    if(score>bestScore){bestScore=score;best=list}
+  }
+  /* Identify our side by roster overlap rather than by mapping Pulselive team
+     ids to FPL ones: the id spaces are unrelated and the name formats differ,
+     but a starting eleven that matches our roster can only be ours. */
+  return bestScore>=6?{list:best,matched:bestScore}:{list:null,matched:bestScore};
+}
+
+/** Pure: turns an official pre-kickoff team sheet into lineup evidence. */
+function announcedXiEvents(team,players,teamList,{fixtureId=null,kickoff=null,round=null,at=Date.now(),source=''}={}){
+  const events=[],seen=new Set();
+  const push=(entry,type)=>{
+    const name=pulsePlayerName(entry);
+    const player=name?rosterPlayerForSubject(players,name):null;
+    if(!player||seen.has(player.id))return;
+    seen.add(player.id);
+    const policy=EVIDENCE_POLICY[type];
+    const started=type==='confirmed_start';
+    events.push({
+      id:'structured-'+hashString([team,'pl-announced-xi',fixtureId||round||'',player.id].join('|')),
+      createdAt:at,team,type,rawType:type,originType:'structured_announced_xi',
+      subject:player.name,role:null,affected:player.name,affectedApiId:player.id,structuredPlayerId:null,
+      overlap:1,hierarchy:1,confidence:.99,source,
+      reason:`Official Premier League team sheet: ${player.name} was named ${started?'in the starting eleven':'among the substitutes'}.`,
+      evidenceDate:new Date(at).toISOString(),evidenceDateSource:'pulse-teamlists',
+      evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:1,
+      effectiveFrom:new Date(at).toISOString(),
+      expiresAt:new Date(at+policy.ttlHours*3600000).toISOString(),
+      halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,
+      directImpact:true,preseasonCalibrated:false,verificationStatus:'structured-feed',
+      minutesCap:null,directAvailability:started?1:null,selectionCertainty:.99,productionImpact:0,
+      fixtureId:fixtureId?String(fixtureId):null,competition:'Premier League',
+      kickoff:kickoff||null,gameweek:round,
+      auto:true,worker:true,structuredFeed:true,provider:'pl-announced-xi',oop:false
+    });
+  };
+  for(const entry of teamList?.lineup||[])push(entry,'confirmed_start');
+  for(const entry of teamList?.substitutes||[])push(entry,'confirmed_bench');
+  return events;
+}
+
 const STRUCTURED_PROVIDER_ADAPTERS=Object.freeze([
   Object.freeze({
     id:'fpl-bootstrap',version:'bootstrap-static-v1',capabilities:['availability'],
@@ -1917,6 +2077,89 @@ const STRUCTURED_PROVIDER_ADAPTERS=Object.freeze([
       return {
         status:'ok',events,sources:[FPL_BOOTSTRAP],errors:[],unmatched:[],
         diagnostics:{availabilityEvents:events.length,lineupEvents:0,requestCount:0}
+      };
+    }
+  }),
+  Object.freeze({
+    id:'fpl-live-starts',version:'event-live-v1',capabilities:['selection'],
+    enabled:env=>String(env.STRUCTURED_FEED_DISABLED||'')!=='1'&&String(env.LIVE_STARTS_DISABLED||'')!=='1',
+    async collect({team,players}){
+      const bootstrap=await getBootstrap();
+      const rounds=recentFinishedEvents(bootstrap);
+      if(!rounds.length)return {
+        status:'ok',events:[],sources:[],errors:[],unmatched:[],
+        diagnostics:{availabilityEvents:0,lineupEvents:0,selectionEvents:0,requestCount:0,reason:'no-finished-gameweek'}
+      };
+      const collected=[],sources=[],errors=[],skipped=[];
+      let requestCount=0;
+      for(const round of rounds){
+        try{
+          const live=await getEventLive(round.id);
+          requestCount+=1;
+          const out=fplLiveSelectionEvents(team,players,Number(round.id),live?.elements,{deadlineTime:round.deadline_time});
+          if(out.skipped)skipped.push(`${round.id}:${out.skipped}`);
+          if(out.events.length){collected.push(...out.events);sources.push(FPL_EVENT_LIVE(round.id))}
+        }catch(error){errors.push(`round ${round.id}: ${error?.message||String(error)}`)}
+      }
+      const events=mergeRoleEvidence(collected);
+      return {
+        status:errors.length&&!events.length?'error':(errors.length?'partial':'ok'),
+        events,sources,errors,unmatched:[],
+        diagnostics:{
+          availabilityEvents:0,lineupEvents:0,selectionEvents:events.length,requestCount,
+          roundsRead:rounds.map(r=>Number(r.id)),skippedRounds:skipped
+        }
+      };
+    }
+  }),
+  Object.freeze({
+    id:'pl-announced-xi',version:'pulse-teamlists-v1',capabilities:['lineup'],
+    enabled:env=>String(env.STRUCTURED_FEED_DISABLED||'')!=='1'&&String(env.ANNOUNCED_XI_DISABLED||'')!=='1',
+    async collect({team,players}){
+      const empty=(reason,extra={})=>({
+        status:'ok',events:[],sources:[],errors:[],unmatched:[],
+        diagnostics:{availabilityEvents:0,lineupEvents:0,requestCount:0,reason,...extra}
+      });
+      const bootstrap=await getBootstrap();
+      const next=(bootstrap?.events||[]).find(e=>e?.is_next)||(bootstrap?.events||[]).find(e=>!e?.finished);
+      if(!next)return empty('no-upcoming-gameweek');
+      const teamRow=(bootstrap?.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
+      if(!teamRow)return empty('club-not-in-bootstrap');
+      let requestCount=0;
+      const fixturesResponse=await fetch(FPL_EVENT_FIXTURES(next.id),{headers:{Accept:'application/json'},signal:feedSignal()});
+      requestCount+=1;
+      if(!fixturesResponse.ok)throw new Error(`FPL fixtures HTTP ${fixturesResponse.status}`);
+      const fixtures=await fixturesResponse.json();
+      const fixture=(Array.isArray(fixtures)?fixtures:[]).find(f=>f?.team_h===teamRow.id||f?.team_a===teamRow.id);
+      if(!fixture)return empty('no-fixture-this-gameweek',{gameweek:Number(next.id)});
+      // A finished match is the post-match provider's territory. confirmed_start
+      // pins start probability at ~0.995, so replaying it over a completed
+      // fixture would assert the NEXT match's lineup from the last one's.
+      if(fixture.finished===true)return empty('fixture-already-finished',{gameweek:Number(next.id)});
+      const pulseId=Number(fixture.pulse_id)||0;
+      if(!pulseId)return empty('no-pulse-id-yet',{gameweek:Number(next.id)});
+      const response=await fetch(PULSE_FIXTURE(pulseId),{headers:{Accept:'application/json',Origin:PULSE_ORIGIN},signal:feedSignal()});
+      requestCount+=1;
+      if(!response.ok)throw new Error(`Pulse fixture HTTP ${response.status} for ${pulseId}`);
+      const payload=await response.json();
+      const lists=payload?.teamLists||payload?.teamList||[];
+      // Team sheets appear roughly an hour before kickoff. Before that the
+      // feed is legitimately empty; that is a wait, not a failure.
+      if(!Array.isArray(lists)||!lists.length)return empty('awaiting-team-sheet',{gameweek:Number(next.id),pulseId,requestCount});
+      const {list,matched}=pulseTeamListForRoster(lists,players);
+      if(!list)return empty('team-sheet-did-not-match-roster',{gameweek:Number(next.id),pulseId,rosterMatches:matched,requestCount});
+      const events=announcedXiEvents(team,players,list,{
+        fixtureId:pulseId,kickoff:fixture.kickoff_time||null,round:Number(next.id),
+        at:Date.now(),source:PULSE_FIXTURE(pulseId)
+      });
+      return {
+        status:'ok',events,sources:[PULSE_FIXTURE(pulseId)],errors:[],unmatched:[],
+        diagnostics:{
+          availabilityEvents:0,lineupEvents:events.length,requestCount,
+          gameweek:Number(next.id),pulseId,rosterMatches:matched,
+          starters:events.filter(e=>e.type==='confirmed_start').length,
+          benched:events.filter(e=>e.type==='confirmed_bench').length
+        }
       };
     }
   })
@@ -1966,6 +2209,10 @@ async function runStructuredProviders(context,adapters=STRUCTURED_PROVIDER_ADAPT
       providers,
       availabilityEvents:events.filter(event=>event.evidenceClass==='availability').length,
       lineupEvents:events.filter(event=>event.evidenceClass==='lineup').length,
+      // Selection evidence lands in two channels: repeated observations sit in
+      // 'selection' and a single most-recent benching sits in 'manager', so
+      // counting one channel alone would under-report the feed's real yield.
+      selectionEvents:events.filter(event=>['selection','manager'].includes(event.evidenceClass)).length,
       requestCount:results.reduce((sum,result)=>sum+Number(result.diagnostics?.requestCount||0),0)
     }
   };
@@ -2694,6 +2941,7 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       structuredEvents:structuredEvents.length,
       structuredAvailabilityEvents:structuredFeed.diagnostics?.availabilityEvents||0,
       structuredLineupEvents:structuredFeed.diagnostics?.lineupEvents||0,
+      structuredSelectionEvents:structuredFeed.diagnostics?.selectionEvents||0,
       structuredProviders:structuredFeed.providers||[],
       structuredFeedErrors:(structuredFeed.errors||[]).slice(0,10),
       structuredFeedUnmatched:(structuredFeed.unmatched||[]).slice(0,40),
