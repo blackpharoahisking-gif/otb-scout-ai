@@ -2131,13 +2131,13 @@ const STRUCTURED_PROVIDER_ADAPTERS=Object.freeze([
       if(!fixturesResponse.ok)throw new Error(`FPL fixtures HTTP ${fixturesResponse.status}`);
       const fixtures=await fixturesResponse.json();
       const fixture=(Array.isArray(fixtures)?fixtures:[]).find(f=>f?.team_h===teamRow.id||f?.team_a===teamRow.id);
-      if(!fixture)return empty('no-fixture-this-gameweek',{gameweek:Number(next.id)});
+      if(!fixture)return empty('no-fixture-this-gameweek',{gameweek:Number(next.id),requestCount});
       // A finished match is the post-match provider's territory. confirmed_start
       // pins start probability at ~0.995, so replaying it over a completed
       // fixture would assert the NEXT match's lineup from the last one's.
-      if(fixture.finished===true)return empty('fixture-already-finished',{gameweek:Number(next.id)});
+      if(fixture.finished===true)return empty('fixture-already-finished',{gameweek:Number(next.id),requestCount});
       const pulseId=Number(fixture.pulse_id)||0;
-      if(!pulseId)return empty('no-pulse-id-yet',{gameweek:Number(next.id)});
+      if(!pulseId)return empty('no-pulse-id-yet',{gameweek:Number(next.id),requestCount});
       const response=await fetch(PULSE_FIXTURE(pulseId),{headers:{Accept:'application/json',Origin:PULSE_ORIGIN},signal:feedSignal()});
       requestCount+=1;
       if(!response.ok)throw new Error(`Pulse fixture HTTP ${response.status} for ${pulseId}`);
