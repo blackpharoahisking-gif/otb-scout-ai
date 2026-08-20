@@ -65,7 +65,7 @@ const MUTABLE_ARTICLE_RE = /(?:team-news|fitness-update|injury-update|press-conf
 // excludes legal/corporate boilerplate without changing the ranking of real
 // club news pages.
 const NON_ARTICLE_BOILERPLATE_RE = /(?:^|\/)(?:accessibility(?:-statement)?|msa-statement|modern-slavery(?:-act)?(?:-statement)?|privacy(?:-policy|-notice|-portal)?|terms(?:-of-use|-and-conditions)?|conditions-of-use|contact(?:-us)?|legal(?:-notice|-information)?|cookies?(?:-policy|-notice)?|corporate-(?:information|governance)|company-(?:information|details)|policies-and-reports|careers?|subscribe|partners?|about-us|club-information|attending-matches)(?:\/|$)/i;
-const NON_ARTICLE_LISTING_RE = /(?:^|\/)(?:listing|category)(?:\/|$)|\/(?:all|latest)-(?:news|stories)(?:\/|$)|\/(?:news|mens-news|club-news|media-article\/news)\/?$/i;
+const NON_ARTICLE_LISTING_RE = /(?:^|\/)(?:listing|category)(?:\/|$)|\/(?:all|latest)-(?:news|stories)(?:\/|$)|\/(?:news|mens-news|club-news|media-article\/news)\/?$|\/news\/(?:all|men|club|first-team|latest|top-stories)(?:\/\d+)?\/?$/i;
 const NON_ARTICLE_ROSTER_RE = /(?:^|\/)(?:first-team-men-squad|mens-first-team-squad|players|teams|squad)(?:\/|$)/i;
 const NON_ARTICLE_LOW_VALUE_RE = /how-to-watch|(?:^|\/)watch-|watch-live|live-stream|full-90|90-minutes|highlights?|gallery|photos|tv-guide|broadcast|listen-live|quiz|competition-|matchday-guide|where-to-watch|(?:^|[-\/])(?:third-)?kit(?:[-\/]|$)|shirt|retail|merchandise|programmes?|season-pass|tickets?|general-sale|now-on-sale|seat-move|loyalty-points|mascot|supporters?-club|fan-club|fantasy-premier-league-prices|fpl-prices|cup(?:-[a-z0-9]+){0,4}-draw|cup-games-confirmed|draw-details|will-face-either|round-(?:one|two|three|four|five|six|seven|\d+)-of-the-[a-z0-9-]*cup|fixture-details|fixtures?-confirmed|possible-opponents|partnership|sponsor|charity|giveaway|flutter|betting|beer|bratwurst/i;
 
@@ -1113,7 +1113,8 @@ function scoreLink(url,host,currentYear){
   if(NON_ARTICLE_LOW_VALUE_RE.test(p))return {score:-99,reason:'low-value-path'};
   if(!isMensFirstTeamSource(url,''))return {score:-99,reason:'non-mens-path'};
   if(/\/news\//.test(p))score+=7;
-  if(/article|story|interview|press-conference|team-news|fitness-update|injury-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|pre-season|preseason|friendly|match-report|injury|contract/.test(p))score+=6;
+  const editorialKeywordMatch=/article|story|interview|press-conference|team-news|fitness-update|injury-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|pre-season|preseason|friendly|match-report|injury|contract/.test(p);
+  if(editorialKeywordMatch)score+=6;
   if(new RegExp(`/${currentYear}/`).test(p))score+=1;
   if(new RegExp(`/${currentYear-1}/`).test(p))score-=2;
   const depth=p.split('/').filter(Boolean).length;if(depth>=2)score+=1;
@@ -1126,9 +1127,19 @@ function scoreLink(url,host,currentYear){
   if(/preview|fixtures|highlights|\/watch-|watch--|match-gallery|photos/.test(p))score-=8;
 
   // Strong first-team editorial signals.
-  if(/breaking-down|what-will-he-bring|ready-to-be-your|first-team|manager|press-conference|training|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|signing|new-signing|joins?|signed|transfer|loan|return/.test(p))score+=8;
+  const strongEditorialMatch=/breaking-down|what-will-he-bring|ready-to-be-your|first-team|manager|press-conference|training|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|signing|new-signing|joins?|signed|transfer|loan|return/.test(p);
+  if(strongEditorialMatch)score+=8;
   if(p==='/'||/\/news\/?$/.test(p))score-=12;
-  return {score,reason:score>1?'candidate':'low-score',depth};
+  // RC-fix Aug 2026: the generic `/news/` (+7) and path-depth (+1) bonuses
+  // above are, on their own, enough to clear the old score>1 bar with ZERO
+  // genuine editorial keyword match -- meaning any not-yet-blocklisted junk
+  // slug under /news/ (calendar tools, access guides, lifestyle features,
+  // headshot/memorabilia pages, pagination hubs) could pass as a "candidate"
+  // and permanently occupy the scarce per-club article budget. A URL must
+  // now carry a real positive editorial signal to ever be treated as a
+  // candidate, not just structural path shape.
+  const editorial=editorialKeywordMatch||strongEditorialMatch;
+  return {score,reason:(score>1&&editorial)?'candidate':'low-score',depth,editorial};
 }
 
 /**
@@ -1144,12 +1155,15 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
   const host=hostOf(base),currentYear=new Date().getUTCFullYear();
   const scored=links.map((url,index)=>({url,index,time:Number(times?.get?.(url))||null,seen:seenUrls.has(url),...scoreLink(url,host,currentYear)}));
 
-  let selected=scored.filter(x=>x.score>1),pass='strict';
+  // Strict pass requires BOTH a passing score and a genuine positive
+  // editorial signal (see scoreLink) -- the generic /news/ + depth
+  // structural bonus is not, by itself, enough to qualify a candidate.
+  let selected=scored.filter(x=>x.score>1&&x.editorial),pass='strict';
   if(!selected.length){selected=scored.filter(x=>x.score>-99&&(x.depth||0)>=2&&x.score>-6);pass='relaxed'}
 
   // IMPORTANT: the relaxed pass must stay relaxed. v2.0 accidentally reapplied
   // score>1 here, which made "relaxed" effectively strict again.
-  const eligible=pass==='relaxed'?selected:selected.filter(x=>x.score>1);
+  const eligible=pass==='relaxed'?selected:selected.filter(x=>x.score>1&&x.editorial);
   const coverage=Number(timestampCoverage)||0,useTimestamp=coverage>=RECENCY_COVERAGE_MIN;
   const unseenFirst=(a,b)=>(a.seen===b.seen?0:(a.seen?1:-1));
 
@@ -1237,7 +1251,8 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
 
   const host=hostOf(landing?.url||url);
   const year=new Date().getUTCFullYear();
-  let staticEligible=(landing?.links||[]).filter(l=>scoreLink(l,host,year).score>1);
+  const isEligible=(l,h)=>{const s=scoreLink(l,h,year);return s.score>1&&s.editorial};
+  let staticEligible=(landing?.links||[]).filter(l=>isEligible(l,host));
   let candidateCount=staticEligible.length;
   let staticUnprocessed=staticEligible.filter(l=>!processedUrls.has(l)).length;
   record.candidatesFromFetch=candidateCount;
@@ -1262,7 +1277,7 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
         timeSources:new Map([...(landing.timeSources?.entries?.()||[]),...sitemap.sources]),
         timestampCoverage:Math.max(Number(landing.timestampCoverage||0),sitemap.links.length?sitemap.times.size/sitemap.links.length:0)
       };
-      staticEligible=landing.links.filter(l=>scoreLink(l,hostOf(landing.url),year).score>1);
+      staticEligible=landing.links.filter(l=>isEligible(l,hostOf(landing.url)));
       candidateCount=staticEligible.length;
       staticUnprocessed=staticEligible.filter(l=>!processedUrls.has(l)).length;
       record.sitemapCandidates=candidateCount-record.staticCandidates;
@@ -1310,7 +1325,7 @@ async function discoverLanding(env,url,budget,{force=false,processedUrls=new Set
         record.embeddedCards=Math.max(record.embeddedCards,Number(landing.embeddedCards||0));
         record.embeddedBreakdown=rendered.embeddedBreakdown||record.embeddedBreakdown;
 
-        const renderedEligible=landing.links.filter(l=>scoreLink(l,hostOf(landing.url),year).score>1);
+        const renderedEligible=landing.links.filter(l=>isEligible(l,hostOf(landing.url)));
         record.renderedCandidates=renderedEligible.length;
         record.renderedUnprocessedCandidates=renderedEligible.filter(l=>!processedUrls.has(l)).length;
       }catch(e){

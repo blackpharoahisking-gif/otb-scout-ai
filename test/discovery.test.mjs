@@ -158,3 +158,50 @@ test('valid first-team news remains selectable after hardening',()=>{
   const selected=selectArticleLinks(base,links,8,new Map(),0);
   assert.deepEqual([...selected.candidates],['https://club.example/news/2026/august/10/player-returns-to-training']);
 });
+
+// RC-fix Aug 2026: /news/ (+7) and path-depth (+1) alone used to clear the
+// score>1 bar with zero genuine editorial keyword match, so any as-yet-
+// unblocklisted junk slug under /news/ was treated as a real candidate and
+// permanently occupied a club's scarce discovery budget (confirmed live for
+// Arsenal: a calendar-import tool, a stadium access guide, a squad-headshots
+// page and a women's-team feature whose slug carried a player's name rather
+// than a generic team-designation word all outranked genuine team-news).
+test('structural /news/ shape alone no longer creates a candidate without a real editorial signal',()=>{
+  const host='club.example',year=2026;
+  for(const path of [
+    '/news/2026/august/10/a-look-inside-the-new-fan-zone-at-the-stadium',
+    '/news/2026/august/10/2026-27-squad-photocall-headshots',
+    '/news/2026/august/10/a-day-in-the-life-of-alessia-russo',
+    '/news/2026/august/10/sync-matchday-dates-to-your-phone-calendar',
+  ]){
+    const scored=scoreLink(`https://${host}${path}`,host,year);
+    assert.equal(scored.editorial,false,`${path} must not carry an editorial signal`);
+    assert.equal(scored.reason,'low-score',`${path} must not be treated as a candidate`);
+  }
+});
+
+test('genuine editorial keywords still carry the editorial signal',()=>{
+  const host='club.example',year=2026;
+  const scored=scoreLink(`https://${host}/news/2026/august/10/player-returns-to-training`,host,year);
+  assert.equal(scored.editorial,true);
+  assert.equal(scored.reason,'candidate');
+});
+
+test('news category/pagination hub URLs are hard-excluded, not treated as articles',()=>{
+  const host='club.example',year=2026;
+  for(const path of ['/news/all/1','/news/men/1','/news/club/1','/news/first-team','/news/latest/2'])
+    assert.equal(scoreLink(`https://${host}${path}`,host,year).score,-99,path);
+});
+
+test('a mix of structurally-plausible junk and one genuine article yields only the genuine article',()=>{
+  const base='https://club.example/news';
+  const links=[
+    'https://club.example/news/2026/august/10/a-look-inside-the-new-fan-zone-at-the-stadium',
+    'https://club.example/news/2026/august/10/2026-27-squad-photocall-headshots',
+    'https://club.example/news/2026/august/10/a-day-in-the-life-of-alessia-russo',
+    'https://club.example/news/all/1',
+    'https://club.example/news/2026/august/10/manager-confirms-team-news-ahead-of-weekend-fixture'
+  ];
+  const selected=selectArticleLinks(base,links,8,new Map(),0);
+  assert.deepEqual([...selected.candidates],['https://club.example/news/2026/august/10/manager-confirms-team-news-ahead-of-weekend-fixture']);
+});
