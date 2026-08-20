@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.27.0-rc5.0.29-lineup-selection-feeds';
+const WORKER_BUILD = 'v2.27.1-rc5.0.30-forced-scan-persistence';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -3099,7 +3099,19 @@ async function scanTeamGuarded(env,team,{profile='foreground'}={}){
 
 async function cacheFirstTeamReport(env,team,ctx,{force=false}={}){
   team=String(team||'').toUpperCase();
-  if(force)return scanTeamGuarded(env,team,{profile:'foreground'});
+  if(force){
+    /* A forced scan renders pages and reads articles, so it routinely outruns
+       the caller's HTTP timeout. Without waitUntil the request context is torn
+       down the moment the client gives up and the scan dies before it persists
+       -- while still holding the club's scan lock for its full TTL. The user
+       then retries, gets 'a scan for this club was already in progress', and
+       the report never advances. Observed three times in a row against BHA.
+       The stale-refresh path below already had this protection; the forced
+       path, which is the one a person actually triggers from the UI, did not. */
+    const scan=scanTeamGuarded(env,team,{profile:'foreground'});
+    ctx?.waitUntil?.(scan.catch(()=>{}));
+    return scan;
+  }
 
   const cached=await env.ROLE_KV.get(`latest:${team}`,'json');
   if(!cached)return scanTeamGuarded(env,team,{profile:'foreground'});
