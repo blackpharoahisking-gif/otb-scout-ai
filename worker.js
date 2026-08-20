@@ -1113,7 +1113,15 @@ function scoreLink(url,host,currentYear){
   if(NON_ARTICLE_LOW_VALUE_RE.test(p))return {score:-99,reason:'low-value-path'};
   if(!isMensFirstTeamSource(url,''))return {score:-99,reason:'non-mens-path'};
   if(/\/news\//.test(p))score+=7;
-  const editorialKeywordMatch=/article|story|interview|press-conference|team-news|fitness-update|injury-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|pre-season|preseason|friendly|match-report|injury|contract/.test(p);
+  // RC-fix Aug 2026: these keywords now sit inside \b...\b boundaries. Bare
+  // substrings previously matched inside unrelated words -- e.g. `pens?`
+  // matched "pen" inside "opening"/"reopening", and `sign(?:s|ed|ing)?`
+  // matched "sign" inside "design"/"resign"/"assign" -- which handed a kit-
+  // design or stadium-history feature a false positive editorial signal and
+  // let it through the new candidate gate. Confirmed live: a forced Arsenal
+  // rescan against this exact regex (pre-boundary) selected a stadium
+  // opening-day retrospective solely because "opening" contains "pen".
+  const editorialKeywordMatch=/\b(?:article|story|interview|press-conference|team-news|fitness-update|injury-update|transfer|sign(?:s|ed|ing)?|joins?|join-|completes?|welcome|agree(?:s|d)?|announce(?:s|d|ment)?|departs?|leaves?|arrives?|seals?|pens?|commits?|extends?|new-deal|new-contract|loan|loan-deal|loan-move|returns?|back-in-training|available|unavailable|ruled-out|sidelined|doubtful|starting-xi|confirmed-line-up|line-up|lineup|squad-news|pre-season|preseason|friendly|match-report|injury|contract)\b/.test(p);
   if(editorialKeywordMatch)score+=6;
   if(new RegExp(`/${currentYear}/`).test(p))score+=1;
   if(new RegExp(`/${currentYear-1}/`).test(p))score-=2;
@@ -1127,7 +1135,7 @@ function scoreLink(url,host,currentYear){
   if(/preview|fixtures|highlights|\/watch-|watch--|match-gallery|photos/.test(p))score-=8;
 
   // Strong first-team editorial signals.
-  const strongEditorialMatch=/breaking-down|what-will-he-bring|ready-to-be-your|first-team|manager|press-conference|training|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|signing|new-signing|joins?|signed|transfer|loan|return/.test(p);
+  const strongEditorialMatch=/\b(?:breaking-down|what-will-he-bring|ready-to-be-your|first-team|manager|press-conference|training|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|signing|new-signing|joins?|signed|transfer|loan|return)\b/.test(p);
   if(strongEditorialMatch)score+=8;
   if(p==='/'||/\/news\/?$/.test(p))score-=12;
   // RC-fix Aug 2026: the generic `/news/` (+7) and path-depth (+1) bonuses
@@ -1181,13 +1189,13 @@ function selectArticleLinks(base,links,limit,times=new Map(),timestampCoverage=0
   // Transaction/news priority lane. Reserve up to two places for URLs whose
   // slugs strongly indicate transfers, loans, availability or first-team role.
   const firstTeamEligible=eligible.filter(x=>isMensFirstTeamSource(x.url,''));
-  const priorityLane=firstTeamEligible.filter(x=>/signing|new-signing|joins?|signed|transfer|loan|departure|leaves?|returns?|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|breaking-down|what-will-he-bring|ready-to-be-your/.test(decodeURIComponent(new URL(x.url).pathname).toLowerCase()))
+  const priorityLane=firstTeamEligible.filter(x=>/\b(?:signing|new-signing|joins?|signed|transfer|loan|departure|leaves?|returns?|injury|fitness|team-news|squad-news|starting-xi|line-up|lineup|breaking-down|what-will-he-bring|ready-to-be-your)\b/.test(decodeURIComponent(new URL(x.url).pathname).toLowerCase()))
     .sort((a,b)=>unseenFirst(a,b)||(useTimestamp?(Number(b.time)||0)-(Number(a.time)||0):0)||b.score-a.score||a.index-b.index);
 
   const unseenPriority=priorityLane.filter(x=>!x.seen);
   if(unseenPriority.length)add(unseenPriority[0]);
 
-  const seenTransaction=priorityLane.find(x=>x.seen && /signing|new-signing|joins?|signed|transfer|loan|departure|leaves?|returns?/.test(decodeURIComponent(new URL(x.url).pathname).toLowerCase()));
+  const seenTransaction=priorityLane.find(x=>x.seen && /\b(?:signing|new-signing|joins?|signed|transfer|loan|departure|leaves?|returns?)\b/.test(decodeURIComponent(new URL(x.url).pathname).toLowerCase()));
   if(seenTransaction)add(seenTransaction);
 
   for(const x of priorityLane){

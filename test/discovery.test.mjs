@@ -193,6 +193,34 @@ test('news category/pagination hub URLs are hard-excluded, not treated as articl
     assert.equal(scoreLink(`https://${host}${path}`,host,year).score,-99,path);
 });
 
+// RC-fix Aug 2026 follow-up: confirmed live against arsenal.com immediately
+// after the editorial-signal fix deployed. A forced rescan still selected
+// "emirates-stadiums-opening-day-by-those-who-were-there" because the bare
+// `pens?` keyword matched "pen" inside "opening" with no word boundary.
+// `sign(?:s|ed|ing)?` had the identical exposure against "design"/"resign".
+test('bare editorial keywords no longer match as substrings inside unrelated words',()=>{
+  const host='club.example',year=2026;
+  for(const path of [
+    '/news/2026/august/10/emirates-stadiums-opening-day-by-those-who-were-there',
+    '/news/2026/august/10/stadium-reopening-timeline-for-away-fans',
+    '/news/2026/august/10/club-badge-design-unveiled-for-new-season',
+    '/news/2026/august/10/club-crest-redesign-explained',
+  ]){
+    const scored=scoreLink(`https://${host}${path}`,host,year);
+    assert.equal(scored.editorial,false,`${path} must not carry an editorial signal`);
+    assert.equal(scored.reason,'low-score',path);
+  }
+  // The real keywords must still match as whole words/hyphenated compounds.
+  for(const path of [
+    '/news/2026/august/10/striker-signs-new-long-term-deal',
+    '/news/2026/august/10/manager-confirms-fitness-update-on-defender',
+    '/news/2026/august/10/midfielder-returns-to-training',
+  ]){
+    const scored=scoreLink(`https://${host}${path}`,host,year);
+    assert.equal(scored.editorial,true,`${path} must still carry an editorial signal`);
+  }
+});
+
 test('a mix of structurally-plausible junk and one genuine article yields only the genuine article',()=>{
   const base='https://club.example/news';
   const links=[
