@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.28.0-rc5.0.31-departed-competitor-guard';
+const WORKER_BUILD = 'v2.29.0-rc5.0.32-squad-evidence-loop';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -212,7 +212,7 @@ const TEAM_ALIASES = {
 };
 
 const ROLE_VALUES = new Set(['GK','CB','FB','DM','CM','AM','LW','RW','ST']);
-const EVENT_VALUES = new Set(['observed_role','confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','rotation_warning','suspension','departure','signing','loan_in','loan_out','injury','return','manager_positive','manager_negative']);
+const EVENT_VALUES = new Set(['observed_role','observed_bench','confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','rotation_warning','suspension','departure','signing','loan_in','loan_out','injury','return','manager_positive','manager_negative']);
 
 const EVIDENCE_POLICY = Object.freeze({
   confirmed_start:{channel:'lineup',tier:1,halfLifeHours:18,ttlHours:30,maxMinuteImpact:35,direct:true},
@@ -222,6 +222,12 @@ const EVIDENCE_POLICY = Object.freeze({
   minutes_restricted:{channel:'availability',tier:1,halfLifeHours:48,ttlHours:96,maxMinuteImpact:45,direct:true},
   fitness_doubt:{channel:'availability',tier:2,halfLifeHours:36,ttlHours:72,maxMinuteImpact:25,direct:true},
   observed_role:{channel:'selection',tier:2,halfLifeHours:240,ttlHours:720,maxMinuteImpact:12,direct:true},
+  /* Mirror of observed_role. A non-start previously arrived as
+     rotation_warning on the MANAGER channel, which retains only the single
+     most recent event per player, so three consecutive benchings counted once
+     while three starts counted three times. Same channel and decay, opposite
+     sign, so the last three observations decide whichever way they point. */
+  observed_bench:{channel:'selection',tier:2,halfLifeHours:240,ttlHours:720,maxMinuteImpact:12,direct:true},
   rotation_warning:{channel:'manager',tier:2,halfLifeHours:72,ttlHours:120,maxMinuteImpact:12,direct:true},
   manager_positive:{channel:'manager',tier:2,halfLifeHours:96,ttlHours:168,maxMinuteImpact:10,direct:true},
   manager_negative:{channel:'manager',tier:2,halfLifeHours:96,ttlHours:168,maxMinuteImpact:10,direct:true},
@@ -2001,7 +2007,7 @@ function fplLiveSelectionEvents(team,players,round,liveElements,{deadlineTime=nu
       continue;
     }
     if(minutes>0){
-      events.push(selectionEvent({team,player,round,type:'rotation_warning',confidence:.85,at,source:FPL_EVENT_LIVE(round),
+      events.push(selectionEvent({team,player,round,type:'observed_bench',confidence:.85,at,source:FPL_EVENT_LIVE(round),
         reason:`Official Premier League match record: ${player.name} did not start gameweek ${round} and came off the bench for ${minutes} minutes.`}));
       continue;
     }
@@ -2010,7 +2016,7 @@ function fplLiveSelectionEvents(team,players,round,liveElements,{deadlineTime=nu
        the availability provider, so adding a rotation signal on top would
        double-count one injury as a separate selection decision. */
     if(String(player.status||'a').toLowerCase()!=='a')continue;
-    events.push(selectionEvent({team,player,round,type:'rotation_warning',confidence:.7,at,source:FPL_EVENT_LIVE(round),
+    events.push(selectionEvent({team,player,round,type:'observed_bench',confidence:.7,at,source:FPL_EVENT_LIVE(round),
       reason:`Official Premier League match record: ${player.name} was available but did not play in gameweek ${round}.`}));
   }
   return {events,skipped:null};
@@ -3784,7 +3790,7 @@ function officialPlayerEvidence(report,player){
     const type=String(e.type||e.rawType||'official update').replace(/_/g,' ');
     let signal='neutral';
     if(['confirmed_start','observed_role','manager_positive'].includes(e.type))signal='positive';
-    if(['confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension','manager_negative','rotation_warning','injury'].includes(e.type))signal='negative';
+    if(['confirmed_bench','observed_bench','unavailable','fitness_doubt','minutes_restricted','suspension','manager_negative','rotation_warning','injury'].includes(e.type))signal='negative';
     const tier=freshPublisherTier(report?.club||player.club,source,e.reason||type);
     const item={
       id:`official-${hashString(`${player.playerId}:${e.id||index}:${source}`)}`,title:`${report?.club||player.club}: ${type}`,
@@ -4387,6 +4393,24 @@ export default {
       if(u.pathname==='/api/role-latest'){
         if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
         return json({status:'ok',generatedAt:new Date().toISOString(),teams:await allLatest(env)},200,env);
+      }
+      /* Bulk cached read so the engine can pull evidence for a whole squad in
+         one request. Cache only: never scans, never touches browser budget,
+         so it is safe to call on every client refresh. */
+      if(u.pathname==='/api/scout/latest'){
+        const requested=[...new Set(String(u.searchParams.get('teams')||'').split(',').map(x=>x.trim().toUpperCase()).filter(Boolean))];
+        if(!requested.length)return json({status:'error',error:'teams is required'},400,env);
+        if(requested.length>20)return json({status:'error',error:'at most 20 teams per request'},400,env);
+        const unsupported=requested.filter(code=>!CLUB_SOURCES[code]);
+        if(unsupported.length)return json({status:'error',error:`unsupported team code(s): ${unsupported.join(', ')}`},400,env);
+        const teams={},missing=[];
+        await Promise.all(requested.map(async code=>{
+          const cached=await env.ROLE_KV.get(`latest:${code}`,'json').catch(()=>null);
+          if(cached)teams[code]=await withCurrentClubEvents(env,code,{...cached,status:'ok',cache:'HIT'});
+          else missing.push(code);
+        }));
+        return json({status:'ok',generatedAt:new Date().toISOString(),schemaVersion:SCHEMA_VERSION,workerBuild:WORKER_BUILD,
+          requested:requested.length,returned:Object.keys(teams).length,missing,teams},200,env);
       }
       if(u.pathname==='/api/scout/club-events'){
         const team=String(u.searchParams.get('team')||'').toUpperCase();

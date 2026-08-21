@@ -43,20 +43,27 @@ test('a start becomes observed_role and its confidence tracks minutes played',()
   assert.equal(gomez.confidence,.82,'started but withdrawn early is weaker start evidence');
 });
 
-test('a substitute appearance becomes a rotation warning, not a start',()=>{
+test('a substitute appearance is recorded as a non-start on the same channel as a start',()=>{
   const out=fplLiveSelectionEvents('BHA',players,3,live([[1,90,1],[2,90,1],[3,20,0],[4,0,0],[5,0,0]]));
   const gomez=out.events.find(e=>e.affectedApiId===3);
-  assert.equal(gomez.type,'rotation_warning');
-  assert.equal(gomez.evidenceClass,'manager');
+  const dunk=out.events.find(e=>e.affectedApiId===2);
+  assert.equal(gomez.type,'observed_bench');
+  // The channel is the whole point: 'manager' retains only the latest event per
+  // player, so three benchings used to count once against three starts counting
+  // three times. Non-starts must accumulate exactly as starts do.
+  assert.equal(gomez.evidenceClass,'selection');
+  assert.equal(gomez.evidenceClass,dunk.evidenceClass,'a start and a non-start must share a channel');
+  assert.equal(gomez.halfLifeHours,dunk.halfLifeHours,'and decay at the same rate');
   assert.equal(gomez.confidence,.85);
   assert.match(gomez.reason,/came off the bench for 20 minutes/);
 });
 
-test('an available player who did not play is a weaker rotation warning',()=>{
+test('an available player who did not play is a weaker non-start signal',()=>{
   const out=fplLiveSelectionEvents('BHA',players,3,live([[1,90,1],[2,90,1],[3,90,1],[4,0,0],[5,0,0]]));
   const tzimas=out.events.find(e=>e.affectedApiId===5);
-  assert.equal(tzimas.type,'rotation_warning');
-  assert.equal(tzimas.confidence,.7);
+  assert.equal(tzimas.type,'observed_bench');
+  assert.equal(tzimas.evidenceClass,'selection');
+  assert.equal(tzimas.confidence,.7,'weaker than an unused bench appearance: could be squad omission');
 });
 
 test('an already-unavailable player is never given a rotation warning on top',()=>{
