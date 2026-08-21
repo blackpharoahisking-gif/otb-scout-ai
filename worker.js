@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.35.0-rc5.0.38-mens-document-gate';
+const WORKER_BUILD = 'v2.36.0-rc5.0.39-departure-beneficiary';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -2508,7 +2508,21 @@ function validateEvents(team,players,events,sourceDocuments,stats=null){
     if(allowedExact.size&&!allowedExact.has(canonicalUrl(source))){reject('notASuppliedDocument');continue}
     if(e.type==='injury'&&normal(e.subject)===normal(p.name)){reject('selfReferential');continue}
     if(e.type==='loan_in'&&normal(e.subject)===normal(p.name)){reject('selfReferential');continue} // arrival threatens incumbent; affected is incumbent
-    if(e.type==='loan_out'&&normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName)){reject('subjectMismatch');continue} // outbound loan should name departing current player
+    /* loan_out normalises to `departure`, which the engine scores k=+0.4 FOR
+       THE AFFECTED PLAYER -- a boost for whoever inherits the minutes. So
+       `affected` is the beneficiary, exactly as the extraction prompt states
+       ("For departure/injury events, affected is the beneficiary"), and the
+       departing player belongs in `subject`.
+       This line previously required subject === affected, the inverse of the
+       loan_in rule directly above and of the prompt the model is given. A
+       model that followed its instructions was rejected: Leeds proposed three
+       events on 21 Aug and two died here as subjectMismatch. Making a
+       departing player his own beneficiary would also have handed him the
+       +0.4 boost, which is backwards.
+       Self-reference is now what gets rejected, matching loan_in. The
+       requirement that the beneficiary be NAMED IN THE SOURCE TEXT still
+       applies below, so no beneficiary is ever inferred from squad knowledge. */
+    if(['loan_out','departure'].includes(e.type)&&(normal(e.subject)===normal(p.name)||normal(e.subject)===normal(p.fullName))){reject('selfReferential');continue}
     if(['confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension'].includes(e.type)
        && normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName)){reject('subjectMismatch');continue}
 

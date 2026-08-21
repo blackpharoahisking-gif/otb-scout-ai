@@ -176,3 +176,48 @@ test('the url marker still catches what it always caught',()=>{
   assert.equal(isMensFirstTeamSource('https://club.example/academy/news/report',''),false);
   assert.equal(isMensFirstTeamSource('https://club.example/news/2026/august/10/team-news',''),true);
 });
+
+/* Leeds, 21 Aug: the model proposed 3 events and the validator accepted 0 --
+   subjectMismatch 2, affectedNotNamedInText 1. loan_out required
+   subject === affected, the inverse of the loan_in rule beside it and of the
+   prompt the model is handed ("For departure/injury events, affected is the
+   beneficiary"). loan_out normalises to `departure`, scored k=+0.4 FOR THE
+   AFFECTED, so subject === affected would have boosted the departing player. */
+
+const LOAN_DOC=[{url:ARTICLE,publishedAt:Date.now()-3600000,dateSource:'typed-slug',
+  text:'Sebastiaan Bornauw joins Hamburg SV on loan. Lewis Dunk is expected to take on more minutes at the back in his absence.'}];
+
+test('a departure names the departing player as subject and the beneficiary as affected',()=>{
+  const stats={};
+  const out=validateEvents('BHA',players,[{type:'loan_out',subject:'Sebastiaan Bornauw',affected:'Dunk',
+    overlap:.8,hierarchy:.7,confidence:.9,source:ARTICLE,reason:'Bornauw left on loan, freeing minutes.'}],LOAN_DOC,stats);
+  assert.equal(out.length,1,'the shape the prompt asks for must be accepted');
+  assert.equal(stats.selfReferential,0);
+  assert.equal(out[0].type,'departure','loan_out normalises to departure');
+  assert.equal(out[0].affected,'Dunk','the beneficiary, who inherits the minutes');
+  assert.match(out[0].subject,/Bornauw/);
+});
+
+test('a departing player cannot be his own beneficiary',()=>{
+  const stats={};
+  const out=validateEvents('BHA',players,[{type:'loan_out',subject:'Dunk',affected:'Dunk',
+    overlap:.8,hierarchy:.7,confidence:.9,source:ARTICLE,reason:'Self-referential departure.'}],LOAN_DOC,stats);
+  assert.equal(out.length,0,'that would hand the departing player a +0.4 boost');
+  assert.equal(stats.selfReferential,1);
+});
+
+test('a beneficiary absent from the article text is still refused',()=>{
+  const stats={};
+  // Vuskovic is on the roster fixture but is NOT named in the article text.
+  const out=validateEvents('BHA',players,[{type:'loan_out',subject:'Sebastiaan Bornauw',affected:'Vuskovic',
+    overlap:.8,hierarchy:.7,confidence:.9,source:ARTICLE,reason:'Beneficiary inferred, not stated.'}],LOAN_DOC,stats);
+  assert.equal(out.length,0,'no beneficiary may be inferred from squad knowledge');
+  assert.equal(stats.affectedNotNamedInText,1);
+});
+
+test('an incoming loan still may not threaten the arriving player himself',()=>{
+  const stats={};
+  validateEvents('BHA',players,[{type:'loan_in',subject:'Dunk',affected:'Dunk',
+    overlap:.8,hierarchy:.7,confidence:.9,source:ARTICLE,reason:'Self-referential arrival.'}],LOAN_DOC,stats);
+  assert.equal(stats.selfReferential,1,'the loan_in rule is unchanged');
+});
