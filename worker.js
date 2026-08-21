@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.33.0-rc5.0.36-doc-visibility';
+const WORKER_BUILD = 'v2.34.0-rc5.0.37-schema-fallback';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -2353,33 +2353,75 @@ RULES:
 - Insufficient evidence must produce no event. But do NOT withhold an event the rules above permit: an article that plainly states selection, fitness, availability or a completed transfer for a CURRENT FPL player SHOULD produce one. Returning an empty list when such a statement is present is an error.
 
 OFFICIAL MATERIAL:\n${docs}`;
-  const run=env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast',{
-    messages:[{role:'system',content:'Extract conservative, source-grounded Premier League team-role events as JSON. Never invent facts.'},{role:'user',content:prompt}],
-    response_format:{type:'json_schema',json_schema:{name:'otb_role_events',strict:true,schema:extractionSchema()}},
-    max_tokens:AI_MAX_OUTPUT_TOKENS,
-    temperature:0
-  });
   const limit=Math.max(1000,Math.min(60000,Number(timeoutMs)||DEFAULT_AI_TIMEOUT_MS));
-  let timer;
-  const settled=await Promise.race([
-    run.then(value=>({value}),error=>({error})),
-    new Promise(resolve=>{timer=setTimeout(()=>resolve({timedOut:true}),limit)})
-  ]);
-  if(timer)clearTimeout(timer);
+  const callModel=async useSchema=>{
+    const options={
+      messages:[
+        {role:'system',content:'Extract conservative, source-grounded Premier League team-role events as JSON. Never invent facts.'},
+        {role:'user',content:useSchema?prompt:prompt+'\n\nReturn ONLY a JSON object shaped {"events":[...]} — no prose, no commentary and no markdown fence.'}
+      ],
+      max_tokens:AI_MAX_OUTPUT_TOKENS,
+      temperature:0
+    };
+    if(useSchema)options.response_format={type:'json_schema',json_schema:{name:'otb_role_events',strict:true,schema:extractionSchema()}};
+    let timer;
+    const settled=await Promise.race([
+      env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast',options).then(value=>({value}),error=>({error})),
+      new Promise(resolve=>{timer=setTimeout(()=>resolve({timedOut:true}),limit)})
+    ]);
+    if(timer)clearTimeout(timer);
+    return settled;
+  };
+  /* Tolerate a fenced or prose-wrapped reply when the grammar is not enforcing
+     shape for us. Falls back to the first balanced object in the text. */
+  const parsePayload=raw=>{
+    let out=raw?.response ?? raw;
+    if(typeof out!=='string')return out;
+    const fenced=out.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const body=(fenced?fenced[1]:out).trim();
+    try{return JSON.parse(body)}catch{}
+    const first=body.indexOf('{'),last=body.lastIndexOf('}');
+    if(first>=0&&last>first){try{return JSON.parse(body.slice(first,last+1))}catch{}}
+    return null;
+  };
+
+  let settled=await callModel(true);
   if(settled.timedOut)return {events:[],status:'timeout',elapsedMs:Date.now()-started,error:`Workers AI exceeded ${limit}ms`};
   if(settled.error)return {events:[],status:'error',elapsedMs:Date.now()-started,error:settled.error?.message||String(settled.error)};
-  let out=settled.value?.response ?? settled.value;
-  if(typeof out==='string'){
-    try{out=JSON.parse(out)}
-    catch{return {events:[],status:'parse-error',elapsedMs:Date.now()-started,error:'Workers AI returned invalid JSON'}}
+  let out=parsePayload(settled.value);
+  let schemaFallbackUsed=false,schemaFallbackReason=null;
+
+  /* Strict json_schema decoding on this model can settle on {"events":[]} --
+     the shortest completion that satisfies the contract -- even when the
+     supplied text plainly carries selection evidence. Every layer around this
+     call was verified and exonerated while it kept returning an empty array,
+     so an empty structured result is retried ONCE without the grammar. The
+     reply still passes through validateEvents unchanged, so no guardrail is
+     traded away for the extra recall. */
+  if(out&&Array.isArray(out.events)&&out.events.length===0){
+    schemaFallbackReason='structured-call-returned-empty';
+  }else if(!out||!Array.isArray(out.events)){
+    schemaFallbackReason='structured-call-returned-no-events-array';
+  }
+  if(schemaFallbackReason){
+    const retry=await callModel(false);
+    if(!retry.timedOut&&!retry.error){
+      const retryOut=parsePayload(retry.value);
+      if(retryOut&&Array.isArray(retryOut.events)&&retryOut.events.length){
+        out=retryOut;schemaFallbackUsed=true;
+      }
+    }
   }
   /* out.events missing is NOT the same as the model finding nothing, and
      returning [] with status 'ok' for both made them indistinguishable. */
   if(!out||typeof out!=='object'||!Array.isArray(out.events)){
     return {events:[],status:'malformed',elapsedMs:Date.now()-started,
-      error:`Workers AI response had no events array (received ${out===null?'null':typeof out})`};
+      error:`Workers AI response had no events array (received ${out===null?'null':typeof out})`,
+      schemaFallbackUsed,schemaFallbackReason};
   }
-  return {events:out.events,status:'ok',elapsedMs:Date.now()-started,error:null,docCount:documents.length,promptChars:prompt.length,docChars:docs.length,maxOutputTokens:AI_MAX_OUTPUT_TOKENS};
+  return {events:out.events,status:'ok',elapsedMs:Date.now()-started,error:null,
+    docCount:documents.length,promptChars:prompt.length,docChars:docs.length,
+    maxOutputTokens:AI_MAX_OUTPUT_TOKENS,schemaFallbackUsed,schemaFallbackReason};
 }
 
 function isPreseasonOrFriendlySource(url,text=''){
@@ -3042,6 +3084,8 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       aiDocCount:aiResult.docCount??null,
       aiMaxOutputTokens:aiResult.maxOutputTokens??null,
       aiElapsedMs:aiResult.elapsedMs??null,
+      aiSchemaFallbackUsed:aiResult.schemaFallbackUsed??null,
+      aiSchemaFallbackReason:aiResult.schemaFallbackReason??null,
       structuredProviders:structuredFeed.providers||[],
       structuredFeedErrors:(structuredFeed.errors||[]).slice(0,10),
       structuredFeedUnmatched:(structuredFeed.unmatched||[]).slice(0,40),
