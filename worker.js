@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.31.0-rc5.0.34-extraction-recall';
+const WORKER_BUILD = 'v2.32.0-rc5.0.35-ai-context-budget';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -52,8 +52,21 @@ const DEFAULT_BROWSER_BUDGET = 3;  // max Browser Run calls per scan (see notes:
 const DEFAULT_BROWSER_SPACING_MS = 2500; // Browser Run enforces a per-second fill rate, not a burst allowance
 const DEFAULT_SCAN_BUDGET_MS = 45000;
 const DEFAULT_AI_TIMEOUT_MS = 20000;
-const AI_DOC_CHARS = 7000;
-const AI_TOTAL_DOC_CHARS = 48000;
+/* @cf/meta/llama-3.3-70b-instruct-fp8-fast has a 24,000 TOKEN context window,
+   and that budget covers the response as well as the prompt. At ~3.5 chars per
+   token, 48,000 characters of article text was ~13,700 tokens of documents
+   alone, before ~2,600 tokens of rules -- leaving almost nothing for a reply
+   and no margin for the constrained-decoding grammar. Sized so prompt plus a
+   full response sits comfortably inside the window instead of against it. */
+const AI_DOC_CHARS = 4500;
+const AI_TOTAL_DOC_CHARS = 28000;
+/* Workers AI defaults max_tokens to 256. The extraction schema permits up to
+   30 events and ONE event costs roughly 150 tokens, most of it the source URL
+   it is required to quote back verbatim. The model could not emit a populated
+   response even when it found evidence: under a strict json_schema the
+   shortest completion that satisfies the contract is {"events":[]}, which is
+   exactly what came back -- eight articles, aiStatus ok, zero proposed. */
+const AI_MAX_OUTPUT_TOKENS = 4000;
 const BACKGROUND_SCAN_BUDGET_MS = 26000; // HTTP waitUntil is cancelled after 30s
 const BACKGROUND_AI_TIMEOUT_MS = 7000;
 const BACKGROUND_MAX_ARTICLES = 4;
@@ -2343,6 +2356,7 @@ OFFICIAL MATERIAL:\n${docs}`;
   const run=env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast',{
     messages:[{role:'system',content:'Extract conservative, source-grounded Premier League team-role events as JSON. Never invent facts.'},{role:'user',content:prompt}],
     response_format:{type:'json_schema',json_schema:{name:'otb_role_events',strict:true,schema:extractionSchema()}},
+    max_tokens:AI_MAX_OUTPUT_TOKENS,
     temperature:0
   });
   const limit=Math.max(1000,Math.min(60000,Number(timeoutMs)||DEFAULT_AI_TIMEOUT_MS));
@@ -2365,7 +2379,7 @@ OFFICIAL MATERIAL:\n${docs}`;
     return {events:[],status:'malformed',elapsedMs:Date.now()-started,
       error:`Workers AI response had no events array (received ${out===null?'null':typeof out})`};
   }
-  return {events:out.events,status:'ok',elapsedMs:Date.now()-started,error:null,docCount:documents.length,promptChars:prompt.length};
+  return {events:out.events,status:'ok',elapsedMs:Date.now()-started,error:null,docCount:documents.length,promptChars:prompt.length,docChars:docs.length,maxOutputTokens:AI_MAX_OUTPUT_TOKENS};
 }
 
 function isPreseasonOrFriendlySource(url,text=''){
@@ -3006,6 +3020,13 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       structuredLineupEvents:structuredFeed.diagnostics?.lineupEvents||0,
       structuredSelectionEvents:structuredFeed.diagnostics?.selectionEvents||0,
       extraction:extractionStats,
+      // Prompt sizing travels with the yield: a context overrun is invisible
+      // from the outside and reads exactly like a model that found nothing.
+      aiPromptChars:aiResult.promptChars??null,
+      aiDocChars:aiResult.docChars??null,
+      aiDocCount:aiResult.docCount??null,
+      aiMaxOutputTokens:aiResult.maxOutputTokens??null,
+      aiElapsedMs:aiResult.elapsedMs??null,
       structuredProviders:structuredFeed.providers||[],
       structuredFeedErrors:(structuredFeed.errors||[]).slice(0,10),
       structuredFeedUnmatched:(structuredFeed.unmatched||[]).slice(0,40),
