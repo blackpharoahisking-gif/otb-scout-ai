@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.30.0-rc5.0.33-extraction-yield';
+const WORKER_BUILD = 'v2.31.0-rc5.0.34-extraction-recall';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -2279,11 +2279,31 @@ async function aiExtract(env,team,clubName,players,documents,rosterDelta,{timeou
     return `SOURCE ${i+1}: ${d.url}\nSOURCE_PUBLISHED_AT: ${Number(d.publishedAt)?new Date(Number(d.publishedAt)).toISOString():'unknown'}\nSOURCE_DATE_ORIGIN: ${d.dateSource||'unknown'}\n${body}`;
   }).join('\n\n');
   const prompt=`You are the OTB football role-intelligence extractor. Analyse only the supplied official-club text and FPL roster evidence for ${clubName} (${team}).
-Return only current, source-grounded structured events that can materially change EXPECTED MINUTES for players registered in FPL.
+Return current, source-grounded structured events that can materially change EXPECTED MINUTES for players registered in FPL.
 
 CURRENT FPL PLAYERS: ${playerList}
 ROSTER ADDED: ${rosterDelta.added.map(p=>p.name).join(', ')||'none'}
 ROSTER MISSING SINCE LAST SNAPSHOT: ${rosterDelta.missing.map(p=>p.name).join(', ')||'none'}
+
+WHAT YOU ARE LOOKING FOR
+Official club articles routinely carry exactly the evidence this task wants: match reports naming who started, manager press-conference quotes about selection and fitness, injury updates, and confirmed transfers. When such a statement is present about a CURRENT FPL player, extract it. Withholding a well-supported event is as much a failure as inventing one.
+
+WORKED EXAMPLES
+
+Text: "Fabian Hurzeler confirmed Lewis Dunk will captain the side against Tromso, with Pascal Struijk keeping his place alongside him."
+Event: {"type":"observed_role","subject":"Dunk","affected":"Dunk","overlap":0.9,"hierarchy":0.9,"confidence":0.9,"source":"<the SOURCE url this text came from>","reason":"Manager confirmed he captains the side and keeps his place."}
+Why: explicit selection language about a named current player. A second event for Struijk ("keeping his place") is equally valid.
+
+Text: "The midfielder will be assessed ahead of the weekend after picking up a knock in training."
+Event: {"type":"fitness_doubt","subject":"<that player>","affected":"<that player>","overlap":1,"hierarchy":1,"confidence":0.6,"source":"<the SOURCE url>","reason":"To be assessed after a training knock; fitness uncertain."}
+Why: explicit fitness uncertainty about a named current player.
+
+Text: "Danny Welbeck has completed a permanent move to Chelsea."
+Event: {"type":"departure","subject":"Danny Welbeck","affected":"<the current FPL forward named in the SAME article who benefits>","overlap":0.8,"hierarchy":0.7,"confidence":1,"source":"<the SOURCE url>","reason":"Welbeck departed permanently, freeing minutes in attack."}
+Why: a confirmed departure. Only name an affected player if that player appears in the same article text.
+
+Text: "Read our matchday guide and see how to watch Saturday's fixture."
+Event: none. Fixture, TV and ticket guides carry no role evidence.
 
 RULES:
 - Use observed_role ONLY for SELECTION or MINUTES language: started, named in the starting XI, played 90 minutes, was deployed at, lined up at, first choice, kept his place, benched, rested, substituted on/off, came off after X minutes. Repeated recent lineup evidence should be stronger than a single mention.
@@ -2316,7 +2336,8 @@ RULES:
 - productionImpact is optional and should normally be 0. Use a small non-zero value only when the source explicitly establishes a sustained tactical role that plausibly changes per-minute production.
 - Include a concise reason citing the concrete evidence (for example: started two consecutive friendlies at RW, manager named him first choice, competitor signed). Include the exact source URL and an ISO evidenceDate when available.
 - The source field MUST be one of the SOURCE URLs supplied above, copied exactly.
-- Return no event when evidence is insufficient.
+- Return no event when evidence is insufficient, when the text is a fixture/TV/ticket/kit/commercial page, or when the claim would rest on squad knowledge rather than the supplied text.
+- Insufficient evidence must produce no event. But do NOT withhold an event the rules above permit: an article that plainly states selection, fitness, availability or a completed transfer for a CURRENT FPL player SHOULD produce one. Returning an empty list when such a statement is present is an error.
 
 OFFICIAL MATERIAL:\n${docs}`;
   const run=env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast',{
@@ -2338,7 +2359,13 @@ OFFICIAL MATERIAL:\n${docs}`;
     try{out=JSON.parse(out)}
     catch{return {events:[],status:'parse-error',elapsedMs:Date.now()-started,error:'Workers AI returned invalid JSON'}}
   }
-  return {events:Array.isArray(out?.events)?out.events:[],status:'ok',elapsedMs:Date.now()-started,error:null};
+  /* out.events missing is NOT the same as the model finding nothing, and
+     returning [] with status 'ok' for both made them indistinguishable. */
+  if(!out||typeof out!=='object'||!Array.isArray(out.events)){
+    return {events:[],status:'malformed',elapsedMs:Date.now()-started,
+      error:`Workers AI response had no events array (received ${out===null?'null':typeof out})`};
+  }
+  return {events:out.events,status:'ok',elapsedMs:Date.now()-started,error:null,docCount:documents.length,promptChars:prompt.length};
 }
 
 function isPreseasonOrFriendlySource(url,text=''){
