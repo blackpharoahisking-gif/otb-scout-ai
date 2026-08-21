@@ -7,12 +7,12 @@ const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
   .replace(/^import\s+\{\s*WorkflowEntrypoint\s*\}\s+from\s+'cloudflare:workers';\s*/m,'')
   .replace(/export class FreshReviewWorkflow/, 'class FreshReviewWorkflow')
   .replace(/export default\s*\{/, 'const workerDefault = {')
-  +'\n;globalThis.__x={validateEvents,extractionSchema};';
+  +'\n;globalThis.__x={validateEvents,extractionSchema,isMensFirstTeamSource,femaleSubjectDominant};';
 class WorkflowEntrypoint{constructor(ctx,env){this.ctx=ctx;this.env=env}}
 const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto,WorkflowEntrypoint};
 vm.createContext(context);
 vm.runInContext(source,context,{filename:'worker.js'});
-const {validateEvents,extractionSchema}=context.__x;
+const {validateEvents,extractionSchema,isMensFirstTeamSource,femaleSubjectDominant}=context.__x;
 
 const players=[
   {id:11,name:'Dunk',fullName:'Lewis Dunk',fplPosition:'DEF'},
@@ -110,4 +110,69 @@ test('a transfer claim the article text does not corroborate is still refused',(
     [{...docs[0],text:'An article that never mentions the affected player at all.'}],stats);
   assert.equal(out.length,0);
   assert.equal(stats.affectedNotNamedInText,1);
+});
+
+/* Arsenal's 03:12 scan read exactly two documents: a 14,531-character
+   pre-season interview with Renee Slegers -- the WOMEN'S manager -- and a
+   training photo gallery. The extractor returning zero from those was CORRECT.
+   Nothing filtered the documents handed to it for men's first-team relevance,
+   and a piece titled only with a person's name carries no URL marker to catch,
+   exactly like a-day-in-the-life-of-alessia-russo earlier in the same session. */
+
+const WOMENS_INTERVIEW=(
+  'Renee Slegers sat down before the new campaign to reflect on where her side stands. '+
+  'She said she has been pleased with what she saw in pre-season, and that her players '+
+  'have taken on her ideas quickly. She singled out the captain, saying she has led by '+
+  'example and that her attitude in training has set the tone. She added that she expects '+
+  'her squad to compete on every front, and that she will name her strongest available '+
+  'eleven for the opener. She confirmed that her goalkeeper will start, and she praised '+
+  'her defenders for how they adapted. She believes her team can improve again this year. '+
+  'She noted that her preparation has gone to plan and that she is happy with her group. '+
+  'She wants her side to start well and she said she has told her players exactly that.'
+);
+const MENS_REPORT=(
+  'Fabian Hurzeler named an unchanged side and said he was pleased with his players. '+
+  'He confirmed that his captain kept his place at the back, and he praised him for how '+
+  'he organised the defence. He said his goalkeeper had earned his place, and that he '+
+  'expects him to start again. He added that he will assess his squad before he settles '+
+  'on his eleven, and he suggested his forward is close to a return after his injury. '+
+  'He was asked about his plans and he said he wants his team to keep his standards high. '+
+  'He noted that his preparation has gone to plan and that he is happy with his group. '+
+  'He wants his side to start well and he said he has told his players exactly that.'
+);
+
+test('a womens-team interview is kept out of the mens extractor',()=>{
+  assert.equal(WOMENS_INTERVIEW.length>=600,true,'fixture must be long enough to be judged');
+  assert.equal(femaleSubjectDominant(WOMENS_INTERVIEW),true);
+  assert.equal(isMensFirstTeamSource('https://www.arsenal.com/news/renee-slegers-big-pre-season-interview',WOMENS_INTERVIEW),false,
+    'the exact article that consumed most of Arsenal\'s document budget');
+});
+
+test('a mens match report is unaffected',()=>{
+  assert.equal(femaleSubjectDominant(MENS_REPORT),false);
+  assert.equal(isMensFirstTeamSource('https://www.brightonandhovealbion.com/media-article/hurzeler-on-the-defence',MENS_REPORT),true);
+});
+
+test('a mens article mentioning the womens team in passing is not tripped',()=>{
+  const passing=MENS_REPORT+' He also congratulated the club on a strong start for her side in the league.';
+  assert.equal(femaleSubjectDominant(passing),false,'one mention must not disqualify a mens article');
+  assert.equal(isMensFirstTeamSource('https://club.example/media-article/hurzeler-preview',passing),true);
+});
+
+test('short text is never judged on pronouns',()=>{
+  assert.equal(femaleSubjectDominant('She started. She scored. She was excellent. She led.'),false,
+    'too little text to infer a subject reliably');
+  assert.equal(femaleSubjectDominant(''),false);
+});
+
+test('womens competition names are refused on their own',()=>{
+  const pad='x'.repeat(700);
+  assert.equal(isMensFirstTeamSource('https://club.example/news/report',`Result from the WSL this weekend. ${pad}`),false);
+  assert.equal(isMensFirstTeamSource('https://club.example/news/report',`A tie in the Women's Champions League. ${pad}`),false);
+});
+
+test('the url marker still catches what it always caught',()=>{
+  assert.equal(isMensFirstTeamSource('https://club.example/womens/news/report',''),false);
+  assert.equal(isMensFirstTeamSource('https://club.example/academy/news/report',''),false);
+  assert.equal(isMensFirstTeamSource('https://club.example/news/2026/august/10/team-news',''),true);
 });

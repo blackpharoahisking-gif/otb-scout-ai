@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.34.0-rc5.0.37-schema-fallback';
+const WORKER_BUILD = 'v2.35.0-rc5.0.38-mens-document-gate';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -331,11 +331,30 @@ function cleanText(s){return String(s||'').replace(/\s+/g,' ').trim()}
  *  makes cross-document boilerplate detection possible. */
 function cleanLines(s){return String(s||'').replace(/[ \t\u00a0]+/g,' ').replace(/\n{2,}/g,'\n').split('\n').map(l=>l.trim()).filter(Boolean).join('\n')}
 function normal(s){return cleanText(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9 ]/g,'')}
+/* A women's-team article names women, not "the women's team". URL markers
+   cannot catch a piece titled only with a person's name -- seen twice this
+   session: a-day-in-the-life-of-alessia-russo, and Arsenal handing the
+   extractor a 14,531-character Renee Slegers pre-season interview as one of
+   only two documents it read. Pronoun dominance needs no per-club roster and
+   generalises to every club: a substantial article about women is written in
+   she/her. Deliberately conservative, so a men's piece that mentions the
+   women's team in passing does not trip it. */
+function femaleSubjectDominant(text=''){
+  const t=' '+String(text||'').toLowerCase()+' ';
+  if(t.length<600)return false;
+  const female=(t.match(/\b(?:she|her|hers|herself)\b/g)||[]).length;
+  const male=(t.match(/\b(?:he|him|his|himself)\b/g)||[]).length;
+  if(female<6)return false;
+  return female>male*1.5;
+}
 function isMensFirstTeamSource(url,text=''){
   const u=String(url||'').toLowerCase();
   const t=normal(text||'');
   if(/(?:^|[-_/])(?:women'?s?|academy|[mw]?u21s?|[mw]?u18s?|[mw]?u19s?|[mw]?u23s?|under-21s?|under-18s?|under-23s?|girls?|ladies|lioness(?:es)?)(?:[-_/]|$)/.test(u))return false;
   if(/\bwomen'?s team\b|\bwomen'?s first team\b|\bwomen'?s side\b|\bgirls'? academy\b|\bacademy side\b|\bunder-23s?\b|\bunder-21s?\b|\bunder-18s?\b|\bu23s?\b|\bu21s?\b|\bu18s?\b|\bladies\b/.test(t))return false;
+  // Competition names that only ever denote women's football.
+  if(/\bwsl\b|\bwomens super league\b|\bwomens champions league\b|\bwomens fa cup\b|\bwomens euros?\b|\bbarclays womens\b/.test(t))return false;
+  if(text&&femaleSubjectDominant(text))return false;
   return true;
 }
 function isAggregatorTransactionSource(url){
@@ -2837,7 +2856,15 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
 
   const retrieved=documents.filter(d=>d.text&&d.text.length>0);
   const useful=documents.filter(d=>d.text&&d.text.length>=AI_MIN_DOC_CHARS);
-  const articleDocs=useful.filter(d=>d.kind==='article');
+  /* Nothing filtered the documents handed to the extractor for men's
+     first-team relevance. The URL check inside scoreLink runs with EMPTY text
+     so it can only catch generic path markers; by this point the article body
+     is available and can be judged properly. Without this the scarce article
+     budget is spent on women's-team content, and any event extracted from it
+     would be attributed to the men's squad. */
+  const articleDocsAll=useful.filter(d=>d.kind==='article');
+  const articleDocs=articleDocsAll.filter(d=>isMensFirstTeamSource(d.url,d.text));
+  const nonMensDocumentsDropped=articleDocsAll.length-articleDocs.length;
   const recencySummary=buildRecencySummary(discovery,articleDocs);
   const currentClubEvents=fastPathClubEvents(team,club.name,articleDocs);
   const priorClubEvents=await loadClubEventLedger(env,team);
@@ -3082,6 +3109,7 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       aiPromptChars:aiResult.promptChars??null,
       aiDocChars:aiResult.docChars??null,
       aiDocCount:aiResult.docCount??null,
+      nonMensDocumentsDropped,
       aiMaxOutputTokens:aiResult.maxOutputTokens??null,
       aiElapsedMs:aiResult.elapsedMs??null,
       aiSchemaFallbackUsed:aiResult.schemaFallbackUsed??null,
