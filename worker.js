@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.32.0-rc5.0.35-ai-context-budget';
+const WORKER_BUILD = 'v2.33.0-rc5.0.36-doc-visibility';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -3020,6 +3020,21 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       structuredLineupEvents:structuredFeed.diagnostics?.lineupEvents||0,
       structuredSelectionEvents:structuredFeed.diagnostics?.selectionEvents||0,
       extraction:extractionStats,
+      /* What the model actually SEES. Every layer above this was verified and
+         exonerated while this stayed assumed. If none of the supplied
+         documents contain selection or availability language, a zero is the
+         model behaving CORRECTLY and the real fault is upstream in which
+         articles discovery chose -- a completely different repair. URLs and
+         lengths only; no article text is exposed. */
+      aiDocuments:(Array.isArray(modelInput)?modelInput:[]).slice(0,12).map(d=>{
+        const text=String(d?.text||'');
+        return {
+          url:d?.url||null,chars:text.length,
+          hasSelectionLanguage:/\b(?:start(?:s|ed|ing)?|line[- ]?up|lined up|xi|bench(?:ed)?|rested|substitut|kept his place|first choice|recalled|dropped|omitted)\b/i.test(text),
+          hasAvailabilityLanguage:/\b(?:injur|fit(?:ness)?|doubt|ruled out|unavailable|sidelined|assessed|knock|suspend|miss(?:es|ed)?\b|return(?:s|ed|ing)?)\b/i.test(text),
+          hasNamedPlayer:(roster?.current?.players||[]).some(pl=>normal(text).includes(normal(pl.name))),
+        };
+      }),
       // Prompt sizing travels with the yield: a context overrun is invisible
       // from the outside and reads exactly like a model that found nothing.
       aiPromptChars:aiResult.promptChars??null,
