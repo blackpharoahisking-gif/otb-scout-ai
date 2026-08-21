@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.36.0-rc5.0.39-departure-beneficiary';
+const WORKER_BUILD = 'v2.37.0-rc5.0.40-fixture-code-join';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -2174,27 +2174,37 @@ const STRUCTURED_PROVIDER_ADAPTERS=Object.freeze([
       // pins start probability at ~0.995, so replaying it over a completed
       // fixture would assert the NEXT match's lineup from the last one's.
       if(fixture.finished===true)return empty('fixture-already-finished',{gameweek:Number(next.id),requestCount});
+      /* pulse_id is never populated in this dataset -- confirmed 21 Aug on a
+         fixture that had already kicked off and carried a 2-0 scoreline, so
+         this provider could never fire on it. The fixtures feed also carries
+         `code` (e.g. 2645195), which is the Premier League's own match code
+         and the id Pulselive is keyed on. Prefer pulse_id when present, fall
+         back to code, and record which one was used so a failure downstream
+         is attributable to the join key rather than to the team sheet. */
       const pulseId=Number(fixture.pulse_id)||0;
-      if(!pulseId)return empty('no-pulse-id-yet',{gameweek:Number(next.id),requestCount});
-      const response=await fetch(PULSE_FIXTURE(pulseId),{headers:{Accept:'application/json',Origin:PULSE_ORIGIN},signal:feedSignal()});
+      const fixtureCode=Number(fixture.code)||0;
+      const joinId=pulseId||fixtureCode;
+      const joinSource=pulseId?'pulse_id':(fixtureCode?'fixture_code':null);
+      if(!joinId)return empty('no-fixture-join-id',{gameweek:Number(next.id),requestCount});
+      const response=await fetch(PULSE_FIXTURE(joinId),{headers:{Accept:'application/json',Origin:PULSE_ORIGIN},signal:feedSignal()});
       requestCount+=1;
-      if(!response.ok)throw new Error(`Pulse fixture HTTP ${response.status} for ${pulseId}`);
+      if(!response.ok)throw new Error(`Pulse fixture HTTP ${response.status} for ${joinId} (via ${joinSource})`);
       const payload=await response.json();
       const lists=payload?.teamLists||payload?.teamList||[];
       // Team sheets appear roughly an hour before kickoff. Before that the
       // feed is legitimately empty; that is a wait, not a failure.
-      if(!Array.isArray(lists)||!lists.length)return empty('awaiting-team-sheet',{gameweek:Number(next.id),pulseId,requestCount});
+      if(!Array.isArray(lists)||!lists.length)return empty('awaiting-team-sheet',{gameweek:Number(next.id),pulseId:joinId,joinSource,requestCount});
       const {list,matched}=pulseTeamListForRoster(lists,players);
-      if(!list)return empty('team-sheet-did-not-match-roster',{gameweek:Number(next.id),pulseId,rosterMatches:matched,requestCount});
+      if(!list)return empty('team-sheet-did-not-match-roster',{gameweek:Number(next.id),pulseId:joinId,joinSource,rosterMatches:matched,requestCount});
       const events=announcedXiEvents(team,players,list,{
-        fixtureId:pulseId,kickoff:fixture.kickoff_time||null,round:Number(next.id),
-        at:Date.now(),source:PULSE_FIXTURE(pulseId)
+        fixtureId:joinId,kickoff:fixture.kickoff_time||null,round:Number(next.id),
+        at:Date.now(),source:PULSE_FIXTURE(joinId)
       });
       return {
-        status:'ok',events,sources:[PULSE_FIXTURE(pulseId)],errors:[],unmatched:[],
+        status:'ok',events,sources:[PULSE_FIXTURE(joinId)],errors:[],unmatched:[],
         diagnostics:{
           availabilityEvents:0,lineupEvents:events.length,requestCount,
-          gameweek:Number(next.id),pulseId,rosterMatches:matched,
+          gameweek:Number(next.id),pulseId:joinId,joinSource,rosterMatches:matched,
           starters:events.filter(e=>e.type==='confirmed_start').length,
           benched:events.filter(e=>e.type==='confirmed_bench').length
         }
