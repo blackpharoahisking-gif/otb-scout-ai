@@ -7,12 +7,12 @@ const source=readFileSync(new URL('../worker.js',import.meta.url),'utf8')
   .replace(/^import\s+\{\s*WorkflowEntrypoint\s*\}\s+from\s+'cloudflare:workers';\s*/m,'')
   .replace(/export class FreshReviewWorkflow/, 'class FreshReviewWorkflow')
   .replace(/export default\s*\{/, 'const workerDefault = {')
-  +'\n;globalThis.__lineupTest={fplLiveSelectionEvents,pulseTeamListForRoster,announcedXiEvents,recentFinishedEvents,STRUCTURED_PROVIDER_CATALOG};';
+  +'\n;globalThis.__lineupTest={fplLiveSelectionEvents,pulseTeamListForRoster,announcedXiEvents,recentFinishedEvents,STRUCTURED_PROVIDER_CATALOG,suppressDepartedCompetitorEvidence,unavailableCompetitorNames};';
 class WorkflowEntrypoint{constructor(ctx,env){this.ctx=ctx;this.env=env}}
 const context={URL,Date,Map,Set,RegExp,Object,Array,String,Number,Math,JSON,console,crypto:globalThis.crypto,WorkflowEntrypoint};
 vm.createContext(context);
 vm.runInContext(source,context,{filename:'worker.js'});
-const {fplLiveSelectionEvents,pulseTeamListForRoster,announcedXiEvents,recentFinishedEvents,STRUCTURED_PROVIDER_CATALOG}=context.__lineupTest;
+const {fplLiveSelectionEvents,pulseTeamListForRoster,announcedXiEvents,recentFinishedEvents,STRUCTURED_PROVIDER_CATALOG,suppressDepartedCompetitorEvidence,unavailableCompetitorNames}=context.__lineupTest;
 
 const players=[
   {id:1,name:'Verbruggen',fullName:'Bart Verbruggen',status:'a'},
@@ -133,4 +133,63 @@ test('announced-XI evidence expires within its policy window',()=>{
   const hours=(Date.parse(event.expiresAt)-at)/3600000;
   assert.equal(hours,30,'confirmed_start policy ttl is 30 hours');
   assert.equal(event.halfLifeHours,18);
+});
+
+/* The 21 Aug review argued against Kinsky's start "due to Vicario's
+   availability" while the same report already knew Vicario had joined Juventus
+   on loan. The role-competition path is goalkeeper-only and fires only when a
+   story does NOT name our player, so a story about the departed keeper in a
+   "first choice / starting" context reads as a threat to his replacement. */
+
+const spursReport={
+  club:'Tottenham Hotspur',
+  clubEvents:[{type:'departure',subject:'Spence'},{type:'loan_out',subject:'Yang'}],
+  events:[
+    {type:'unavailable',rawType:'unavailable',subject:'Vicario',reason:'Has joined Juventus on loan for the rest of the season.'},
+    {type:'fitness_doubt',rawType:'fitness_doubt',subject:'Dragusin',reason:'Knock - 75% chance of playing.'},
+  ],
+};
+const peerItem=(relatedPlayer,signal)=>({
+  id:'news-x',title:'Spurs goalkeeper latest',summary:'first choice for the season',
+  hierarchyInference:true,relatedPlayer,signal,authorityTier:1,decisionRelevant:true,decisionEligible:true,
+});
+
+test('a departed competitor is recognised by full name and by surname',()=>{
+  const gone=unavailableCompetitorNames(spursReport);
+  assert.equal(gone.has('vicario'),true);
+  assert.equal(gone.has('spence'),true,'permanent departures count');
+  assert.equal(gone.has('yang'),true,'loans out count');
+  assert.equal(gone.has('dragusin'),false,'a fitness doubt is still 75% likely to play, so he remains genuine competition');
+  assert.equal(gone.has('kinsky'),false);
+});
+
+test('a negative inference resting on a departed competitor stops driving the verdict',()=>{
+  const [item]=suppressDepartedCompetitorEvidence([peerItem('Guglielmo Vicario','negative')],spursReport);
+  assert.equal(item.decisionEligible,false,'must not count as decision evidence');
+  assert.equal(item.decisionRelevant,false);
+  assert.match(item.suppressedReason,/Vicario/);
+  assert.match(item.suppressedReason,/no longer available/);
+});
+
+test('a positive inference about the same departure still counts',()=>{
+  const [item]=suppressDepartedCompetitorEvidence([peerItem('Guglielmo Vicario','positive')],spursReport);
+  assert.equal(item.decisionEligible,true,'"the competitor left" is real evidence in our player\'s favour');
+  assert.equal(item.suppressedReason,undefined);
+});
+
+test('a competitor who is still at the club is untouched',()=>{
+  const [item]=suppressDepartedCompetitorEvidence([peerItem('Martin Dubravka','negative')],spursReport);
+  assert.equal(item.decisionEligible,true,'Dubravka is genuine live competition and must keep counting');
+});
+
+test('direct evidence about the player himself is never suppressed',()=>{
+  const direct={id:'news-y',hierarchyInference:false,relatedPlayer:'Guglielmo Vicario',signal:'negative',decisionRelevant:true,decisionEligible:true};
+  const [item]=suppressDepartedCompetitorEvidence([direct],spursReport);
+  assert.equal(item.decisionEligible,true);
+});
+
+test('a report with no departures leaves every item alone',()=>{
+  const items=[peerItem('Guglielmo Vicario','negative')];
+  assert.equal(suppressDepartedCompetitorEvidence(items,{})[0].decisionEligible,true);
+  assert.equal(suppressDepartedCompetitorEvidence(items,null)[0].decisionEligible,true);
 });

@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.27.1-rc5.0.30-forced-scan-persistence';
+const WORKER_BUILD = 'v2.28.0-rc5.0.31-departed-competitor-guard';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -4057,11 +4057,55 @@ function enforceFreshVerdict(context,player,evidence,draft){
   };
 }
 
+/* A competitor who has left the club, or who is himself unavailable, cannot
+   take anyone's place this week.
+
+   Observed 21 Aug 2026: the review raised a Tier 1 NEGATIVE signal against
+   Kinsky's start "due to Vicario's availability" -- while the structured feed
+   inside the very same report already carried "Vicario: has joined Juventus on
+   loan for the rest of the season". The role-competition path only fires for
+   goalkeepers and only when the story does NOT mention our player, so a story
+   about a departed keeper in a "first choice / starting" context reads as a
+   threat to the man who replaced him. That is systematic, not a one-off, and
+   it argued against a starting goalkeeper hours before a deadline.
+
+   Only NEGATIVE inferences are suppressed. "The competitor is leaving" is real
+   evidence in our player's favour and must keep counting. */
+function unavailableCompetitorNames(report){
+  const names=new Set();
+  const add=value=>{
+    const full=normal(value);if(!full)return;
+    names.add(full);
+    const surname=full.split(' ').filter(Boolean).at(-1);
+    if(surname&&surname.length>=3)names.add(surname);
+  };
+  for(const e of Array.isArray(report?.clubEvents)?report.clubEvents:[]){
+    if(['departure','loan_out'].includes(String(e?.type)))add(e.subject),add(e.affected);
+  }
+  for(const e of Array.isArray(report?.events)?report.events:[]){
+    if(['unavailable','suspension'].includes(String(e?.rawType||e?.type)))add(e.subject),add(e.affected);
+  }
+  return names;
+}
+function suppressDepartedCompetitorEvidence(items,report){
+  const gone=unavailableCompetitorNames(report);
+  if(!gone.size)return items||[];
+  return (items||[]).map(item=>{
+    if(item?.hierarchyInference!==true||item?.signal!=='negative')return item;
+    const peer=normal(item.relatedPlayer);
+    if(!peer)return item;
+    const surname=peer.split(' ').filter(Boolean).at(-1)||'';
+    if(!gone.has(peer)&&!(surname&&gone.has(surname)))return item;
+    return {...item,decisionRelevant:false,decisionEligible:false,
+      suppressedReason:`Role-competition inference rests on ${item.relatedPlayer}, who the official feed reports is no longer available to this club.`};
+  });
+}
+
 async function researchFreshPlayer(env,context,player){
   const [report,news]=await Promise.all([
     env.ROLE_KV.get(`latest:${player.club}`,'json').catch(()=>null),googleNewsEvidence(env,player)
   ]);
-  const merged=[...officialPlayerEvidence(report,player),...(news.items||[])];
+  const merged=suppressDepartedCompetitorEvidence([...officialPlayerEvidence(report,player),...(news.items||[])],report);
   const dedup=new Map();for(const item of merged){const key=freshStoryFingerprint(item);if(!dedup.has(key)||dedup.get(key).authorityTier>item.authorityTier)dedup.set(key,item)}
   const evidence=[...dedup.values()].map(item=>item.decisionEligible===undefined?freshAnnotateEvidence(item):item).sort((a,b)=>Number(b.decisionEligible)-Number(a.decisionEligible)||a.authorityTier-b.authorityTier||Number(b.preferredSource)-Number(a.preferredSource)||b.weight-a.weight||Date.parse(b.relevantDate||0)-Date.parse(a.relevantDate||0)).slice(0,8);
   const ai=await aiFreshPlayerReview(env,context,player,evidence);
