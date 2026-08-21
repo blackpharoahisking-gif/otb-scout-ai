@@ -39,7 +39,7 @@ const SCHEMA_VERSION = '1.36.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.29.0-rc5.0.32-squad-evidence-loop';
+const WORKER_BUILD = 'v2.30.0-rc5.0.33-extraction-yield';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -2358,32 +2358,57 @@ function normalizeFriendlyEvidenceEvent(e){
     directImpact:false,selectionCertainty:null};
 }
 
-function validateEvents(team,players,events,sourceDocuments){
+/* Every rejection below used to be a bare `continue`. Eight Brighton articles
+   were read successfully with aiStatus ok and produced zero role events, and
+   nothing anywhere could say whether the model proposed nothing or proposed
+   plenty that this gauntlet threw away. Same silent-zero shape as the club
+   calendar. Each gate now names itself. */
+function validateEvents(team,players,events,sourceDocuments,stats=null){
   const byName=new Map;for(const p of players){byName.set(normal(p.name),p);byName.set(normal(p.fullName),p)}const out=[];
-  const canonicalUrl=u=>{try{const x=new URL(String(u||''));x.hash='';return x.toString()}catch{return String(u||'')}};
+  const drop={proposed:Array.isArray(events)?events.length:0,unknownPlayer:0,unknownType:0,subjectMismatch:0,
+    malformedSource:0,offHost:0,notASuppliedDocument:0,selfReferential:0,affectedNotNamedInText:0,tooOld:0,duplicate:0,accepted:0};
+  const reject=key=>{drop[key]=(drop[key]||0)+1};
+  /* Citation matching has to defeat hallucination without punishing
+     formatting. A model that cites the right article with a trailing slash, a
+     stray query string or different host casing has not invented anything --
+     dropping it silently loses real evidence. Compare host plus path with all
+     of that normalised away; the anti-hallucination property (it must be a
+     document we actually supplied) is unchanged. */
+  const canonicalUrl=u=>{
+    try{
+      const x=new URL(String(u||''));
+      return x.hostname.replace(/^www\./,'').toLowerCase()+x.pathname.replace(/\/+$/,'').toLowerCase();
+    }catch{return String(u||'').trim().toLowerCase()}
+  };
   const docs=Array.isArray(sourceDocuments)?sourceDocuments:[];
   const sourceMeta=new Map(docs.map(d=>[canonicalUrl(d.url),{publishedAt:Number(d.publishedAt)||null,dateSource:d.dateSource||null,text:String(d.text||'')}]));
   const allowedExact=new Set(sourceMeta.keys());
   const allowedHosts=new Set(docs.map(d=>hostOf(d.url)).filter(Boolean));
-  for(const e of events||[]){const p=byName.get(normal(e.affected));if(!p||!EVENT_VALUES.has(e.type))continue;
-    const roleOptional=['confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension'].includes(e.type);
-    if(!roleOptional&&!ROLE_VALUES.has(e.role))continue;
+  for(const e of events||[]){
+    const p=byName.get(normal(e.affected));
+    if(!p){reject('unknownPlayer');continue}
+    if(!EVENT_VALUES.has(e.type)){reject('unknownType');continue}
+    /* A missing position is no longer fatal. The extraction schema lists
+       `role` as OPTIONAL, then this line dropped every event that omitted it
+       -- so a manager quote or a plain "he started", which carry no position
+       by nature, could never survive. The model was being punished for
+       following its own contract. eventRole was already nullable downstream. */
     const eventRole=ROLE_VALUES.has(e.role)?e.role:null;
     // observed_role describes the subject's OWN selection, so subject and
     // affected must be the same player. When they differ the model has
     // described a competitor being selected, which is a threat to `affected`,
     // not a boost -- and the sign would come out backwards.
-    if(e.type==='observed_role'&&normal(e.subject)&&normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName))continue;
-    const source=String(e.source||'');if(!/^https?:\/\//i.test(source))continue;
+    if(e.type==='observed_role'&&normal(e.subject)&&normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName)){reject('subjectMismatch');continue}
+    const source=String(e.source||'');if(!/^https?:\/\//i.test(source)){reject('malformedSource');continue}
     // Guard against a hallucinated URL: the citation must point at a document
     // that was actually supplied to the model.
-    if(allowedHosts.size&&!allowedHosts.has(hostOf(source)))continue;
-    if(allowedExact.size&&!allowedExact.has(canonicalUrl(source)))continue;
-    if(e.type==='injury'&&normal(e.subject)===normal(p.name))continue;
-    if(e.type==='loan_in'&&normal(e.subject)===normal(p.name))continue; // arrival threatens incumbent; affected is incumbent
-    if(e.type==='loan_out'&&normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName))continue; // outbound loan should name departing current player
+    if(allowedHosts.size&&!allowedHosts.has(hostOf(source))){reject('offHost');continue}
+    if(allowedExact.size&&!allowedExact.has(canonicalUrl(source))){reject('notASuppliedDocument');continue}
+    if(e.type==='injury'&&normal(e.subject)===normal(p.name)){reject('selfReferential');continue}
+    if(e.type==='loan_in'&&normal(e.subject)===normal(p.name)){reject('selfReferential');continue} // arrival threatens incumbent; affected is incumbent
+    if(e.type==='loan_out'&&normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName)){reject('subjectMismatch');continue} // outbound loan should name departing current player
     if(['confirmed_start','confirmed_bench','unavailable','fitness_doubt','minutes_restricted','suspension'].includes(e.type)
-       && normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName))continue;
+       && normal(e.subject)!==normal(p.name)&&normal(e.subject)!==normal(p.fullName)){reject('subjectMismatch');continue}
 
     const meta=sourceMeta.get(canonicalUrl(source))||{};
     const authoritativeMs=Number(meta.publishedAt)||null;
@@ -2392,9 +2417,9 @@ function validateEvents(team,players,events,sourceDocuments){
     if(['signing','departure','loan_in','loan_out','injury','return'].includes(e.type)){
       const sourceNorm=normal(meta.text||'');
       const affectedNamed=sourceNorm.includes(normal(p.name)) || (p.fullName&&sourceNorm.includes(normal(p.fullName)));
-      if(!affectedNamed)continue;
+      if(!affectedNamed){reject('affectedNotNamedInText');continue}
     }
-    if(Number.isFinite(evidenceTime)&&Date.now()-evidenceTime>120*86400000&&!['departure','signing'].includes(e.type))continue;
+    if(Number.isFinite(evidenceTime)&&Date.now()-evidenceTime>120*86400000&&!['departure','signing'].includes(e.type)){reject('tooOld');continue}
     let normalizedType=e.type==='loan_in'?'signing':(e.type==='loan_out'?'departure':e.type);
     let policy=EVIDENCE_POLICY[e.type]||EVIDENCE_POLICY[normalizedType]||{channel:'other',tier:4,halfLifeHours:168,ttlHours:336,maxMinuteImpact:8,direct:false};
 
@@ -2414,7 +2439,11 @@ function validateEvents(team,players,events,sourceDocuments){
     const effectiveMs=authoritativeMs||Date.now();
     out.push({id:`auto-${hashString([team,normalizedType,e.subject,p.name,e.role,source,e.evidenceDate].join('|'))}`,createdAt:Date.now(),team,type:normalizedType,rawType:preseasonLineup?normalizedType:e.type,sourceType:e.type,subject:cleanText(e.subject).slice(0,120),role:eventRole,affected:p.name,affectedApiId:p.id,overlap:clamp(e.overlap,0,1),hierarchy:clamp(e.hierarchy,0,1),confidence:clamp(e.confidence,0,1),source,reason:cleanText(e.reason).slice(0,320),evidenceDate,evidenceDateSource:meta.dateSource||null,evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.98,effectiveFrom:new Date(effectiveMs).toISOString(),expiresAt:new Date(effectiveMs+policy.ttlHours*3600000).toISOString(),halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,directImpact:!!policy.direct,preseasonCalibrated:preseason,verificationStatus:'official-source',minutesCap:Number.isFinite(Number(e.minutesCap))?clamp(Number(e.minutesCap),0,90):null,directAvailability:Number.isFinite(Number(e.directAvailability))?clamp(Number(e.directAvailability),0,1):null,selectionCertainty:preseasonLineup?null:(Number.isFinite(Number(e.selectionCertainty))?clamp(Number(e.selectionCertainty),0,1):null),productionImpact:Number.isFinite(Number(e.productionImpact))?clamp(Number(e.productionImpact),-.25,.25):0,fixtureId:cleanText(e.fixtureId).slice(0,80)||null,competition:cleanText(e.competition).slice(0,80)||null,kickoff:cleanText(e.kickoff).slice(0,40)||null,gameweek:Number.isFinite(Number(e.gameweek))?Number(e.gameweek):null,auto:true,worker:true,oop:(p.fplPosition==='DEF'&&['LW','RW','AM','ST'].includes(e.role))||(p.fplPosition==='MID'&&['FB','CB'].includes(e.role))});
   }
-  const seen=new Set;return out.filter(e=>{const k=[e.type,normal(e.subject),normal(e.affected),e.role,e.source].join('|');if(seen.has(k))return false;seen.add(k);return true});
+  const seen=new Set;
+  const deduped=out.filter(e=>{const k=[e.type,normal(e.subject),normal(e.affected),e.role,e.source].join('|');if(seen.has(k)){reject('duplicate');return false}seen.add(k);return true});
+  drop.accepted=deduped.length;
+  if(stats&&typeof stats==='object')Object.assign(stats,drop);
+  return deduped;
 }
 
 /* ---------------------------------------------------- calibration ledger */
@@ -2810,7 +2839,8 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
     try{await saveDepartureEvidence(env,team,departureEvents)}catch{}
   }
 
-  const modelEvents=validateEvents(team,roster.current.players,raw,modelInput);
+  const extractionStats={};
+  const modelEvents=validateEvents(team,roster.current.players,raw,modelInput,extractionStats);
   const structuredFeed=await structuredFeedPromise;
   const structuredEvents=Array.isArray(structuredFeed.events)?structuredFeed.events:[];
   if(['error','partial'].includes(structuredFeed.status)){
@@ -2948,6 +2978,7 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       structuredAvailabilityEvents:structuredFeed.diagnostics?.availabilityEvents||0,
       structuredLineupEvents:structuredFeed.diagnostics?.lineupEvents||0,
       structuredSelectionEvents:structuredFeed.diagnostics?.selectionEvents||0,
+      extraction:extractionStats,
       structuredProviders:structuredFeed.providers||[],
       structuredFeedErrors:(structuredFeed.errors||[]).slice(0,10),
       structuredFeedUnmatched:(structuredFeed.unmatched||[]).slice(0,40),
