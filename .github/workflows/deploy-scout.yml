@@ -61,13 +61,18 @@ jobs:
       - name: Verify live Scout build
         shell: bash
         run: |
+          EXPECTED_BUILD="$(sed -n "s/^const WORKER_BUILD = '\([^']*\)';/\1/p" worker.js)"
+          EXPECTED_SCHEMA="$(sed -n "s/^const SCHEMA_VERSION = '\([^']*\)';/\1/p" worker.js)"
+          test -n "$EXPECTED_BUILD"
+          test -n "$EXPECTED_SCHEMA"
+          export EXPECTED_BUILD EXPECTED_SCHEMA
           for attempt in {1..12}; do
             if health_json="$(curl --fail --silent --show-error "$HEALTH_URL")"; then
               if HEALTH_JSON="$health_json" node -e '
                 const health = JSON.parse(process.env.HEALTH_JSON);
                 const valid = health.status === "ok"
-                  && health.workerBuild === "v2.25.3-rc5.0.26-evidence-quality"
-                  && health.schemaVersion === "1.36.0"
+                  && health.workerBuild === process.env.EXPECTED_BUILD
+                  && health.schemaVersion === process.env.EXPECTED_SCHEMA
                   && health.structuredFeedAvailable === true
                   && health.freshReviewAvailable === true
                   && health.freshReviewVersion === "1.2.0"

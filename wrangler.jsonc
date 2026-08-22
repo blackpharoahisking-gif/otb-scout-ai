@@ -17,8 +17,9 @@
     // A cold scan only happens after a CACHE_FORMAT bump; warm scans finish
     // in well under half this.
     "SCAN_BUDGET_MS": "120000",
-    // Clubs refreshed per cron tick. 0 genuinely disables the sweep (fixed in
-    // v1.8 — the previous expression silently forced a minimum of 1).
+    // Clubs receiving the expensive official-site/AI scan per cron tick.
+    // The lightweight structured feed still covers all clubs. 0 genuinely
+    // disables article scans (fixed in v1.8; it previously forced minimum 1).
     "CRON_TEAMS_PER_RUN": "2",
     // CORS. Replace with your actual Pages origin. Requests with no Origin
     // header (address bar, curl) are still allowed so debugging works.

@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.38.0 — RC5.0.41 active-gameweek announced-XI resolution and structured sweep
 // v2.25.3 — RC5.0.26 conservative evidence-quality hardening
 // v2.25.1 — RC5.0.24 key-only Fresh Review authentication
 // v2.25.0 — RC5.5.0 durable background review + per-user Access identity
@@ -35,11 +36,11 @@
 import { WorkflowEntrypoint } from 'cloudflare:workers';
 
 const FPL_BOOTSTRAP = 'https://fantasy.premierleague.com/api/bootstrap-static/';
-const SCHEMA_VERSION = '1.36.0';
+const SCHEMA_VERSION = '1.37.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.37.0-rc5.0.40-fixture-code-join';
+const WORKER_BUILD = 'v2.38.0-rc5.0.41-live-lineup-sweep';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -1502,12 +1503,20 @@ async function getBootstrap(){
   return data;
 }
 
+function fplPlayersForTeam(data,teamRow){
+  const pos=Object.fromEntries((data?.element_types||[]).map(x=>[x.id,x.singular_name_short]));
+  return (data?.elements||[]).filter(p=>p.team===teamRow?.id).map(p=>({
+    id:p.id,name:p.web_name,fullName:`${p.first_name||''} ${p.second_name||''}`.trim(),
+    fplPosition:pos[p.element_type]||'',status:p.status,chance:p.chance_of_playing_next_round,
+    news:p.news||'',price:(p.now_cost||0)/10,minutes:p.minutes||0,starts:p.starts||0
+  }));
+}
+
 async function fplContext(env,team){
   const data=await getBootstrap();const teamRow=(data.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
   if(!teamRow)throw new Error(`Club ${team} is not present in the current FPL bootstrap.`);
-  const pos=Object.fromEntries((data.element_types||[]).map(x=>[x.id,x.singular_name_short]));
   const currentRound=Number((data.events||[]).find(e=>e.is_current)?.id)||Number((data.events||[]).filter(e=>e.finished).pop()?.id)||0;
-  const players=(data.elements||[]).filter(p=>p.team===teamRow.id).map(p=>({id:p.id,name:p.web_name,fullName:`${p.first_name||''} ${p.second_name||''}`.trim(),fplPosition:pos[p.element_type]||'',status:p.status,chance:p.chance_of_playing_next_round,news:p.news||'',price:(p.now_cost||0)/10,minutes:p.minutes||0,starts:p.starts||0}));
+  const players=fplPlayersForTeam(data,teamRow);
   const key=`roster:${team}`;let previous=null;try{previous=JSON.parse(await env.ROLE_KV.get(key)||'null')}catch{}
   const current={team,teamName:teamRow.name,fetchedAt:new Date().toISOString(),currentRound,players};
   await env.ROLE_KV.put(key,JSON.stringify(current),{expirationTtl:60*60*24*120});
@@ -1887,7 +1896,7 @@ async function loadDepartureEvidence(env,team){
 /* -------------------------------- provider-neutral structured football feed */
 
 /* Structured providers are supplemental adapters. They can state direct
-   availability or confirmed lineup facts for the same FPL player, but they
+   availability or official match-selection facts for the same FPL player, but they
    never infer tactical roles, beneficiaries, competitors, role probabilities
    or xMin. Provider failures are isolated and a failed refresh never replaces
    a previously valid cached feed.
@@ -1897,15 +1906,20 @@ async function loadDepartureEvidence(env,team){
    prototyped but are not production adapters because their published terms
    prohibit automated extraction. A licensed adapter can be added to the
    registry below without changing normalization or scan/carry-forward logic. */
-const STRUCTURED_FEED_VERSION='provider-neutral-v1';
+const STRUCTURED_FEED_VERSION='provider-neutral-v2';
 const STRUCTURED_FEED_CACHE_TTL=60*60*24*14;
+const STRUCTURED_READ_REFRESH_MINUTES=20;
+const STRUCTURED_SWEEP_BATCH_SIZE=4;
 const STRUCTURED_PROVIDER_CATALOG=Object.freeze([
   Object.freeze({id:'fpl-bootstrap',version:'bootstrap-static-v1',capabilities:['availability'],authority:'official-current-state'}),
   Object.freeze({id:'fpl-live-starts',version:'event-live-v1',capabilities:['selection'],authority:'official-match-record'}),
-  Object.freeze({id:'pl-announced-xi',version:'pulse-teamlists-v1',capabilities:['lineup'],authority:'official-team-sheet'})
+  Object.freeze({id:'pl-announced-xi',version:'pulse-teamlists-v2',capabilities:['lineup'],authority:'official-team-sheet'})
 ]);
 
-function structuredFeedCacheKey(team){return 'structured-feed:v2:'+team}
+/* v3 deliberately invalidates the v2 cache: v2 could contain a completed
+   match's announced XI as a direct confirmed_start/confirmed_bench override,
+   which would pin the following gameweek instead of informing it. */
+function structuredFeedCacheKey(team){return 'structured-feed:v3:'+team}
 
 function fplAvailabilityFact(player){
   const status=String(player?.status||'').toLowerCase();
@@ -1949,39 +1963,191 @@ function fplStructuredAvailabilityEvents(team,players,fetchedAt=new Date().toISO
 }
 
 /* ---------------------------------------------- lineup + selection feeds */
-/* Until now every structured event came from bootstrap availability, so the
-   two highest-weighted evidence types in the whole policy table --
-   confirmed_start and confirmed_bench (k=+/-4) -- had nothing feeding them,
-   and a club could play a match without producing one selection signal.
-   Two providers close that: the official post-match record (who actually
-   started) and the official pre-kickoff team sheet (who is about to). */
+/* The official match record and pre-kickoff team sheet both describe what the
+   manager selected in one fixture. They are observation evidence for future
+   projections, never a direct promise about the following fixture. */
 
 const FPL_EVENT_LIVE=round=>`https://fantasy.premierleague.com/api/event/${round}/live/`;
 const FPL_EVENT_FIXTURES=round=>`https://fantasy.premierleague.com/api/fixtures/?event=${round}`;
 const PULSE_FIXTURE=pulseId=>`https://footballapi.pulselive.com/football/fixtures/${pulseId}`;
+const PULSE_COMP_SEASONS='https://footballapi.pulselive.com/football/competitions/1/compseasons?page=0&pageSize=20';
+const PULSE_GAMEWEEKS=seasonId=>`https://footballapi.pulselive.com/football/compseasons/${seasonId}/gameweeks?page=0&pageSize=100`;
+const PULSE_ROUND_FIXTURES=(seasonId,gameweekId)=>`https://footballapi.pulselive.com/football/fixtures?comp=1&compSeasons=${seasonId}&gameweeks=${gameweekId}&page=0&pageSize=100&sort=asc`;
 const PULSE_ORIGIN='https://www.premierleague.com';
 const SELECTION_ROUNDS=3; // resolveRoleIntelEvents keeps at most 3 selection events per player
+const TEAM_SHEET_BEFORE_MS=3*60*60*1000;
+const TEAM_SHEET_AFTER_MS=8*60*60*1000;
 /* These feeds run inside the scan budget, so a provider that hangs would eat
    the whole allowance and starve article reading. Every request is bounded. */
 const FEED_TIMEOUT_MS=6000;
 function feedSignal(){try{return AbortSignal.timeout(FEED_TIMEOUT_MS)}catch{return undefined}}
 
 const LIVE_MEMO=new Map();
+const FIXTURES_MEMO=new Map();
+const PULSE_MEMO=new Map();
 const LIVE_MEMO_MS=90000;
 const LIVE_MEMO_MAX=6;
+const FEED_MEMO_MS=90000;
+const FEED_MEMO_MAX=20;
 
-/* A cron sweep scans clubs one at a time but every club reads the SAME live
-   round payload. Without memoisation that is one ~300KB fetch and parse per
-   club per round -- sixty requests a tick for identical bytes. */
+async function memoizedJson(map,key,url,{fetchFn=fetch,headers={Accept:'application/json'},ttlMs=FEED_MEMO_MS,max=FEED_MEMO_MAX,errorLabel='feed'}={}){
+  const now=Date.now(),hit=map.get(key);
+  if(hit&&now-hit.at<ttlMs){
+    if(hit.promise)return hit.promise;
+    return hit.data;
+  }
+  const promise=(async()=>{
+    const response=await fetchFn(url,{headers,signal:feedSignal()});
+    if(!response.ok)throw new Error(`${errorLabel} HTTP ${response.status}`);
+    return response.json();
+  })();
+  if(map.size>=max)map.delete(map.keys().next().value);
+  map.set(key,{at:now,promise});
+  try{
+    const data=await promise;
+    map.set(key,{at:Date.now(),data});
+    return data;
+  }catch(error){
+    if(map.get(key)?.promise===promise)map.delete(key);
+    throw error;
+  }
+}
+
+/* Every club reads the SAME live round payload. Without memoisation that is
+   one ~300KB fetch and parse per club per round -- dozens of requests per tick
+   for identical bytes. */
 async function getEventLive(round,fetchFn=fetch){
-  const key=String(round),now=Date.now(),hit=LIVE_MEMO.get(key);
-  if(hit&&now-hit.at<LIVE_MEMO_MS)return hit.data;
-  const r=await fetchFn(FPL_EVENT_LIVE(round),{headers:{Accept:'application/json'},signal:feedSignal()});
-  if(!r.ok)throw new Error(`FPL live HTTP ${r.status} for round ${round}`);
-  const data=await r.json();
-  if(LIVE_MEMO.size>=LIVE_MEMO_MAX)LIVE_MEMO.delete(LIVE_MEMO.keys().next().value);
-  LIVE_MEMO.set(key,{at:now,data});
-  return data;
+  return memoizedJson(LIVE_MEMO,String(round),FPL_EVENT_LIVE(round),{
+    fetchFn,ttlMs:LIVE_MEMO_MS,max:LIVE_MEMO_MAX,errorLabel:`FPL live for round ${round}`
+  });
+}
+
+async function getEventFixtures(round,fetchFn=fetch){
+  return memoizedJson(FIXTURES_MEMO,String(round),FPL_EVENT_FIXTURES(round),{
+    fetchFn,errorLabel:`FPL fixtures for round ${round}`
+  });
+}
+
+function pulseRows(payload){
+  if(Array.isArray(payload))return payload;
+  if(Array.isArray(payload?.content))return payload.content;
+  return [];
+}
+
+function seasonYears(value){
+  const match=String(value||'').match(/\b(20\d{2})\D+(\d{2}|20\d{2})\b/);
+  if(!match)return null;
+  const start=Number(match[1]);
+  const end=match[2].length===2?Math.floor(start/100)*100+Number(match[2]):Number(match[2]);
+  return [start,end];
+}
+
+function pulseSeasonForLabel(payload,label){
+  const rows=pulseRows(payload),wanted=seasonYears(label);
+  if(!wanted)return rows[0]||null;
+  return rows.find(row=>{
+    const years=seasonYears([row?.label,row?.name,row?.description].filter(Boolean).join(' '));
+    return years&&years[0]===wanted[0]&&years[1]===wanted[1];
+  })||null;
+}
+
+function pulseGameweekForRound(payload,round){
+  const wanted=Number(round);
+  return pulseRows(payload).find(row=>{
+    const explicit=Number(row?.gameweek??row?.gameweekNumber??row?.number);
+    if(Number.isFinite(explicit))return explicit===wanted;
+    const match=String(row?.label||row?.name||'').match(/\b(\d{1,2})\b/);
+    return match?Number(match[1])===wanted:false;
+  })||null;
+}
+
+function pulseKickoffMillis(fixture){
+  const millis=Number(fixture?.kickoff?.millis??fixture?.kickoffMillis);
+  if(Number.isFinite(millis)&&millis>0)return millis;
+  const parsed=Date.parse(fixture?.kickoff?.label||fixture?.kickoff||fixture?.kickoff_time||fixture?.date||'');
+  return Number.isFinite(parsed)?parsed:null;
+}
+
+function pulseFixtureTeamIds(fixture){
+  const ids=[];
+  for(const side of fixture?.teams||[]){
+    for(const value of [side?.team?.id,side?.teamId,side?.team?.club?.id]){
+      const id=Number(value);if(Number.isFinite(id))ids.push(id);
+    }
+  }
+  return [...new Set(ids)];
+}
+
+function pulseFixtureTeamNames(fixture){
+  return (fixture?.teams||[]).flatMap(side=>[
+    side?.team?.name,side?.team?.shortName,side?.team?.club?.name,side?.name
+  ]).filter(Boolean).map(normal);
+}
+
+/** Pure: join an FPL fixture to the actual Pulse fixture row. FPL's `code`
+ *  looks like a provider id but is a different namespace, so it is never used
+ *  as a Pulse URL. The join is both sides plus kickoff. */
+function pulseFixtureForFplFixture(payload,{teamRow,opponentRow,kickoff}={}){
+  const targetId=Number(teamRow?.pulse_id),opponentId=Number(opponentRow?.pulse_id);
+  const targetNames=[teamRow?.name,teamRow?.short_name].filter(Boolean).map(normal);
+  const opponentNames=[opponentRow?.name,opponentRow?.short_name].filter(Boolean).map(normal);
+  const kickoffMs=Date.parse(kickoff||'');
+  const ranked=[];
+  for(const fixture of pulseRows(payload)){
+    const ids=pulseFixtureTeamIds(fixture),names=pulseFixtureTeamNames(fixture);
+    const idMatch=Number.isFinite(targetId)&&Number.isFinite(opponentId)&&ids.includes(targetId)&&ids.includes(opponentId);
+    const nameMatch=targetNames.some(name=>names.includes(name))&&opponentNames.some(name=>names.includes(name));
+    if(!idMatch&&!nameMatch)continue;
+    const pulseKickoff=pulseKickoffMillis(fixture);
+    const kickoffMatch=!Number.isFinite(kickoffMs)||pulseKickoff===null||Math.abs(pulseKickoff-kickoffMs)<=15*60*1000;
+    if(!kickoffMatch)continue;
+    ranked.push({fixture,score:(idMatch?10:5)+(pulseKickoff===null?0:3)});
+  }
+  ranked.sort((a,b)=>b.score-a.score);
+  return ranked[0]?.fixture||null;
+}
+
+function fplFixtureForTeam(fixtures,teamId){
+  return (Array.isArray(fixtures)?fixtures:[]).find(f=>Number(f?.team_h)===Number(teamId)||Number(f?.team_a)===Number(teamId))||null;
+}
+
+function fplOpponentTeamId(fixture,teamId){
+  if(Number(fixture?.team_h)===Number(teamId))return Number(fixture?.team_a);
+  if(Number(fixture?.team_a)===Number(teamId))return Number(fixture?.team_h);
+  return null;
+}
+
+function lineupTargetEvent(bootstrap){
+  const events=(bootstrap?.events||[]).filter(e=>Number.isFinite(Number(e?.id)));
+  return events.find(e=>e?.is_current===true&&e?.finished!==true)
+    ||events.filter(e=>e?.finished!==true).sort((a,b)=>Number(a.id)-Number(b.id))[0]
+    ||null;
+}
+
+function teamSheetWindow(kickoff,now=Date.now()){
+  const kickoffMs=Date.parse(kickoff||'');
+  if(!Number.isFinite(kickoffMs))return {open:false,reason:'invalid-kickoff',kickoffMs:null};
+  if(now<kickoffMs-TEAM_SHEET_BEFORE_MS)return {open:false,reason:'before-team-sheet-window',kickoffMs};
+  if(now>kickoffMs+TEAM_SHEET_AFTER_MS)return {open:false,reason:'after-team-sheet-window',kickoffMs};
+  return {open:true,reason:'inside-team-sheet-window',kickoffMs};
+}
+
+async function getPulseRoundFixtures(round,seasonLabel,fetchFn=fetch){
+  const headers={Accept:'application/json',Origin:PULSE_ORIGIN};
+  const seasons=await memoizedJson(PULSE_MEMO,'seasons',PULSE_COMP_SEASONS,{fetchFn,headers,errorLabel:'Pulse competition seasons'});
+  const season=pulseSeasonForLabel(seasons,seasonLabel);
+  if(!season?.id)throw new Error(`Pulse season not found for ${seasonLabel||'current season'}`);
+  const gameweeks=await memoizedJson(PULSE_MEMO,`gameweeks:${season.id}`,PULSE_GAMEWEEKS(season.id),{fetchFn,headers,errorLabel:`Pulse gameweeks for season ${season.id}`});
+  const gameweek=pulseGameweekForRound(gameweeks,round);
+  if(!gameweek?.id)throw new Error(`Pulse gameweek ${round} not found in season ${season.id}`);
+  const fixtures=await memoizedJson(PULSE_MEMO,`round-fixtures:${season.id}:${gameweek.id}`,PULSE_ROUND_FIXTURES(season.id,gameweek.id),{fetchFn,headers,errorLabel:`Pulse fixtures for gameweek ${round}`});
+  return {fixtures,seasonId:Number(season.id),gameweekId:Number(gameweek.id)};
+}
+
+async function getPulseFixture(pulseId,fetchFn=fetch){
+  return memoizedJson(PULSE_MEMO,`fixture:${pulseId}`,PULSE_FIXTURE(pulseId),{
+    fetchFn,headers:{Accept:'application/json',Origin:PULSE_ORIGIN},errorLabel:`Pulse fixture ${pulseId}`
+  });
 }
 
 function recentFinishedEvents(bootstrap,limit=SELECTION_ROUNDS){
@@ -1991,29 +2157,40 @@ function recentFinishedEvents(bootstrap,limit=SELECTION_ROUNDS){
     .slice(0,limit);
 }
 
-function selectionEvent({team,player,round,type,confidence,reason,at,source}){
+function recentSelectionEvents(bootstrap,limit=SELECTION_ROUNDS){
+  return (bootstrap?.events||[])
+    .filter(e=>(e?.finished===true||(e?.is_current===true&&e?.finished!==true))&&Number.isFinite(Number(e?.id)))
+    .sort((a,b)=>Number(b.id)-Number(a.id))
+    .slice(0,limit);
+}
+
+function selectionEvidenceId(team,round,fixtureId,playerId){
+  return 'structured-'+hashString([team,'pl-selection',round,fixtureId||'round',playerId].join('|'));
+}
+
+function selectionEvent({team,player,round,type,confidence,reason,at,source,fixtureId=null,kickoff=null,provider='fpl-live-starts',evidenceDateSource='fpl-event-live'}){
   const policy=EVIDENCE_POLICY[type]||EVIDENCE_POLICY.observed_role;
   return {
-    // Round is part of the identity so consecutive gameweeks accumulate as
-    // separate observations instead of overwriting one another.
-    id:'structured-'+hashString([team,'fpl-live-starts',type,round,player.id].join('|')),
-    createdAt:at,team,type,rawType:type,originType:'structured_fpl_selection',
+    // Provider-neutral identity lets the pre-kickoff sheet and post-match
+    // record describe the same selection once instead of double-counting it.
+    id:selectionEvidenceId(team,round,fixtureId,player.id),
+    createdAt:at,team,type,rawType:type,originType:provider==='pl-announced-xi'?'structured_announced_xi':'structured_fpl_selection',
     subject:player.name,role:null,affected:player.name,affectedApiId:player.id,structuredPlayerId:null,
     overlap:1,hierarchy:1,confidence,source,reason,
-    evidenceDate:new Date(at).toISOString(),evidenceDateSource:'fpl-event-live',
+    evidenceDate:new Date(at).toISOString(),evidenceDateSource,
     evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:.9,
     effectiveFrom:new Date(at).toISOString(),
     expiresAt:new Date(at+policy.ttlHours*3600000).toISOString(),
     halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,
     directImpact:false,preseasonCalibrated:false,verificationStatus:'structured-feed',
     minutesCap:null,directAvailability:null,selectionCertainty:null,productionImpact:0,
-    fixtureId:null,competition:'Premier League',kickoff:null,gameweek:round,
-    auto:true,worker:true,structuredFeed:true,provider:'fpl-live-starts',oop:false
+    fixtureId:fixtureId===null?null:String(fixtureId),competition:'Premier League',kickoff:kickoff||null,gameweek:round,
+    auto:true,worker:true,structuredFeed:true,provider,oop:false
   };
 }
 
 /** Pure: turns one round of official live stats into selection evidence. */
-function fplLiveSelectionEvents(team,players,round,liveElements,{deadlineTime=null}={}){
+function fplLiveSelectionEvents(team,players,round,liveElements,{deadlineTime=null,kickoffTime=null,fixtureId=null}={}){
   const stats=new Map();
   for(const el of liveElements||[]){
     const id=Number(el?.id);
@@ -2026,7 +2203,7 @@ function fplLiveSelectionEvents(team,players,round,liveElements,{deadlineTime=nu
      single minute, treat it as no data rather than inventing fifteen benchings
      out of an absence. */
   if(!roster.some(p=>Number(stats.get(Number(p.id))?.minutes)>0))return {events:[],skipped:'no-minutes-recorded'};
-  const at=Date.parse(deadlineTime||'')||Date.now();
+  const at=Date.parse(kickoffTime||deadlineTime||'')||Date.now();
   const events=[];
   for(const player of roster){
     const row=stats.get(Number(player.id));
@@ -2034,12 +2211,12 @@ function fplLiveSelectionEvents(team,players,round,liveElements,{deadlineTime=nu
     const minutes=Number(row.minutes)||0,starts=Number(row.starts)||0;
     if(starts>=1){
       const confidence=minutes>=85?.95:minutes>=60?.9:.82;
-      events.push(selectionEvent({team,player,round,type:'observed_role',confidence,at,source:FPL_EVENT_LIVE(round),
+      events.push(selectionEvent({team,player,round,type:'observed_role',confidence,at,source:FPL_EVENT_LIVE(round),fixtureId,kickoff:kickoffTime,
         reason:`Official Premier League match record: ${player.name} started gameweek ${round} and played ${minutes} minutes.`}));
       continue;
     }
     if(minutes>0){
-      events.push(selectionEvent({team,player,round,type:'observed_bench',confidence:.85,at,source:FPL_EVENT_LIVE(round),
+      events.push(selectionEvent({team,player,round,type:'observed_bench',confidence:.85,at,source:FPL_EVENT_LIVE(round),fixtureId,kickoff:kickoffTime,
         reason:`Official Premier League match record: ${player.name} did not start gameweek ${round} and came off the bench for ${minutes} minutes.`}));
       continue;
     }
@@ -2048,7 +2225,7 @@ function fplLiveSelectionEvents(team,players,round,liveElements,{deadlineTime=nu
        the availability provider, so adding a rotation signal on top would
        double-count one injury as a separate selection decision. */
     if(String(player.status||'a').toLowerCase()!=='a')continue;
-    events.push(selectionEvent({team,player,round,type:'observed_bench',confidence:.7,at,source:FPL_EVENT_LIVE(round),
+    events.push(selectionEvent({team,player,round,type:'observed_bench',confidence:.7,at,source:FPL_EVENT_LIVE(round),fixtureId,kickoff:kickoffTime,
       reason:`Official Premier League match record: ${player.name} was available but did not play in gameweek ${round}.`}));
   }
   return {events,skipped:null};
@@ -2081,28 +2258,17 @@ function announcedXiEvents(team,players,teamList,{fixtureId=null,kickoff=null,ro
     const player=name?rosterPlayerForSubject(players,name):null;
     if(!player||seen.has(player.id))return;
     seen.add(player.id);
-    const policy=EVIDENCE_POLICY[type];
-    const started=type==='confirmed_start';
-    events.push({
-      id:'structured-'+hashString([team,'pl-announced-xi',fixtureId||round||'',player.id].join('|')),
-      createdAt:at,team,type,rawType:type,originType:'structured_announced_xi',
-      subject:player.name,role:null,affected:player.name,affectedApiId:player.id,structuredPlayerId:null,
-      overlap:1,hierarchy:1,confidence:.99,source,
-      reason:`Official Premier League team sheet: ${player.name} was named ${started?'in the starting eleven':'among the substitutes'}.`,
-      evidenceDate:new Date(at).toISOString(),evidenceDateSource:'pulse-teamlists',
-      evidenceClass:policy.channel,authorityTier:policy.tier,sourceAuthority:1,
-      effectiveFrom:new Date(at).toISOString(),
-      expiresAt:new Date(at+policy.ttlHours*3600000).toISOString(),
-      halfLifeHours:policy.halfLifeHours,maxMinuteImpact:policy.maxMinuteImpact,
-      directImpact:true,preseasonCalibrated:false,verificationStatus:'structured-feed',
-      minutesCap:null,directAvailability:started?1:null,selectionCertainty:.99,productionImpact:0,
-      fixtureId:fixtureId?String(fixtureId):null,competition:'Premier League',
-      kickoff:kickoff||null,gameweek:round,
-      auto:true,worker:true,structuredFeed:true,provider:'pl-announced-xi',oop:false
+    const started=type==='observed_role';
+    const event=selectionEvent({
+      team,player,round,type,confidence:.99,at,source,fixtureId,kickoff,
+      provider:'pl-announced-xi',evidenceDateSource:'pulse-teamlists',
+      reason:`Official Premier League team sheet: ${player.name} was named ${started?'in the starting eleven':'among the substitutes'}.`
     });
+    event.sourceAuthority=1;
+    events.push(event);
   };
-  for(const entry of teamList?.lineup||[])push(entry,'confirmed_start');
-  for(const entry of teamList?.substitutes||[])push(entry,'confirmed_bench');
+  for(const entry of teamList?.lineup||[])push(entry,'observed_role');
+  for(const entry of teamList?.substitutes||[])push(entry,'observed_bench');
   return events;
 }
 
@@ -2121,20 +2287,31 @@ const STRUCTURED_PROVIDER_ADAPTERS=Object.freeze([
   Object.freeze({
     id:'fpl-live-starts',version:'event-live-v1',capabilities:['selection'],
     enabled:env=>String(env.STRUCTURED_FEED_DISABLED||'')!=='1'&&String(env.LIVE_STARTS_DISABLED||'')!=='1',
-    async collect({team,players}){
-      const bootstrap=await getBootstrap();
-      const rounds=recentFinishedEvents(bootstrap);
+    async collect({team,players,bootstrap:providedBootstrap,fetchFn=fetch}){
+      const bootstrap=providedBootstrap||await getBootstrap();
+      const rounds=recentSelectionEvents(bootstrap);
       if(!rounds.length)return {
         status:'ok',events:[],sources:[],errors:[],unmatched:[],
-        diagnostics:{availabilityEvents:0,lineupEvents:0,selectionEvents:0,requestCount:0,reason:'no-finished-gameweek'}
+        diagnostics:{availabilityEvents:0,lineupEvents:0,selectionEvents:0,requestCount:0,reason:'no-current-or-finished-gameweek'}
+      };
+      const teamRow=(bootstrap?.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
+      if(!teamRow)return {
+        status:'ok',events:[],sources:[],errors:[],unmatched:[],
+        diagnostics:{availabilityEvents:0,lineupEvents:0,selectionEvents:0,requestCount:0,reason:'club-not-in-bootstrap'}
       };
       const collected=[],sources=[],errors=[],skipped=[];
       let requestCount=0;
       for(const round of rounds){
         try{
-          const live=await getEventLive(round.id);
+          const fixtures=await getEventFixtures(round.id,fetchFn);
           requestCount+=1;
-          const out=fplLiveSelectionEvents(team,players,Number(round.id),live?.elements,{deadlineTime:round.deadline_time});
+          const fixture=fplFixtureForTeam(fixtures,teamRow.id);
+          if(!fixture){skipped.push(`${round.id}:no-fixture`);continue}
+          const live=await getEventLive(round.id,fetchFn);
+          requestCount+=1;
+          const out=fplLiveSelectionEvents(team,players,Number(round.id),live?.elements,{
+            deadlineTime:round.deadline_time,kickoffTime:fixture.kickoff_time||null,fixtureId:fixture.id??null
+          });
           if(out.skipped)skipped.push(`${round.id}:${out.skipped}`);
           if(out.events.length){collected.push(...out.events);sources.push(FPL_EVENT_LIVE(round.id))}
         }catch(error){errors.push(`round ${round.id}: ${error?.message||String(error)}`)}
@@ -2151,62 +2328,70 @@ const STRUCTURED_PROVIDER_ADAPTERS=Object.freeze([
     }
   }),
   Object.freeze({
-    id:'pl-announced-xi',version:'pulse-teamlists-v1',capabilities:['lineup'],
+    id:'pl-announced-xi',version:'pulse-teamlists-v2',capabilities:['lineup'],
     enabled:env=>String(env.STRUCTURED_FEED_DISABLED||'')!=='1'&&String(env.ANNOUNCED_XI_DISABLED||'')!=='1',
-    async collect({team,players}){
+    async collect({env,team,players,bootstrap:providedBootstrap,fetchedAt,fetchFn=fetch}){
       const empty=(reason,extra={})=>({
         status:'ok',events:[],sources:[],errors:[],unmatched:[],
         diagnostics:{availabilityEvents:0,lineupEvents:0,requestCount:0,reason,...extra}
       });
-      const bootstrap=await getBootstrap();
-      const next=(bootstrap?.events||[]).find(e=>e?.is_next)||(bootstrap?.events||[]).find(e=>!e?.finished);
-      if(!next)return empty('no-upcoming-gameweek');
+      const bootstrap=providedBootstrap||await getBootstrap();
+      const target=lineupTargetEvent(bootstrap);
+      if(!target)return empty('no-current-or-upcoming-gameweek');
       const teamRow=(bootstrap?.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
       if(!teamRow)return empty('club-not-in-bootstrap');
       let requestCount=0;
-      const fixturesResponse=await fetch(FPL_EVENT_FIXTURES(next.id),{headers:{Accept:'application/json'},signal:feedSignal()});
+      const fixtures=await getEventFixtures(target.id,fetchFn);
       requestCount+=1;
-      if(!fixturesResponse.ok)throw new Error(`FPL fixtures HTTP ${fixturesResponse.status}`);
-      const fixtures=await fixturesResponse.json();
-      const fixture=(Array.isArray(fixtures)?fixtures:[]).find(f=>f?.team_h===teamRow.id||f?.team_a===teamRow.id);
-      if(!fixture)return empty('no-fixture-this-gameweek',{gameweek:Number(next.id),requestCount});
-      // A finished match is the post-match provider's territory. confirmed_start
-      // pins start probability at ~0.995, so replaying it over a completed
-      // fixture would assert the NEXT match's lineup from the last one's.
-      if(fixture.finished===true)return empty('fixture-already-finished',{gameweek:Number(next.id),requestCount});
-      /* pulse_id is never populated in this dataset -- confirmed 21 Aug on a
-         fixture that had already kicked off and carried a 2-0 scoreline, so
-         this provider could never fire on it. The fixtures feed also carries
-         `code` (e.g. 2645195), which is the Premier League's own match code
-         and the id Pulselive is keyed on. Prefer pulse_id when present, fall
-         back to code, and record which one was used so a failure downstream
-         is attributable to the join key rather than to the team sheet. */
-      const pulseId=Number(fixture.pulse_id)||0;
-      const fixtureCode=Number(fixture.code)||0;
-      const joinId=pulseId||fixtureCode;
-      const joinSource=pulseId?'pulse_id':(fixtureCode?'fixture_code':null);
-      if(!joinId)return empty('no-fixture-join-id',{gameweek:Number(next.id),requestCount});
-      const response=await fetch(PULSE_FIXTURE(joinId),{headers:{Accept:'application/json',Origin:PULSE_ORIGIN},signal:feedSignal()});
+      const fixture=fplFixtureForTeam(fixtures,teamRow.id);
+      if(!fixture)return empty('no-fixture-this-gameweek',{gameweek:Number(target.id),requestCount});
+      if(fixture.finished===true)return empty('fixture-already-finished',{gameweek:Number(target.id),requestCount});
+      const window=teamSheetWindow(fixture.kickoff_time,Date.parse(fetchedAt||'')||Date.now());
+      if(!window.open)return empty(window.reason,{
+        gameweek:Number(target.id),fplFixtureId:Number(fixture.id),kickoff:fixture.kickoff_time||null,requestCount
+      });
+      const opponentId=fplOpponentTeamId(fixture,teamRow.id);
+      const opponentRow=(bootstrap?.teams||[]).find(t=>Number(t?.id)===opponentId)||null;
+      if(!opponentRow)return empty('opponent-not-in-bootstrap',{gameweek:Number(target.id),requestCount});
+
+      /* FPL fixture.code and Pulse fixture.id are different namespaces. Resolve
+         the active season's internal gameweek, then join its fixture list on
+         both Pulse team ids and kickoff before requesting the detail record. */
+      const pulseRound=await getPulseRoundFixtures(Number(target.id),env?.SEASON||'2026/27',fetchFn);
+      requestCount+=3;
+      const pulseFixture=pulseFixtureForFplFixture(pulseRound.fixtures,{
+        teamRow,opponentRow,kickoff:fixture.kickoff_time||null
+      });
+      const pulseId=Number(pulseFixture?.id)||0;
+      if(!pulseId)return empty('pulse-fixture-not-found',{
+        gameweek:Number(target.id),fplFixtureId:Number(fixture.id),pulseSeasonId:pulseRound.seasonId,
+        pulseGameweekId:pulseRound.gameweekId,requestCount
+      });
+      const payload=await getPulseFixture(pulseId,fetchFn);
       requestCount+=1;
-      if(!response.ok)throw new Error(`Pulse fixture HTTP ${response.status} for ${joinId} (via ${joinSource})`);
-      const payload=await response.json();
       const lists=payload?.teamLists||payload?.teamList||[];
       // Team sheets appear roughly an hour before kickoff. Before that the
       // feed is legitimately empty; that is a wait, not a failure.
-      if(!Array.isArray(lists)||!lists.length)return empty('awaiting-team-sheet',{gameweek:Number(next.id),pulseId:joinId,joinSource,requestCount});
+      if(!Array.isArray(lists)||!lists.length)return empty('awaiting-team-sheet',{
+        gameweek:Number(target.id),fplFixtureId:Number(fixture.id),pulseId,requestCount
+      });
       const {list,matched}=pulseTeamListForRoster(lists,players);
-      if(!list)return empty('team-sheet-did-not-match-roster',{gameweek:Number(next.id),pulseId:joinId,joinSource,rosterMatches:matched,requestCount});
+      if(!list)return empty('team-sheet-did-not-match-roster',{
+        gameweek:Number(target.id),fplFixtureId:Number(fixture.id),pulseId,rosterMatches:matched,requestCount
+      });
       const events=announcedXiEvents(team,players,list,{
-        fixtureId:joinId,kickoff:fixture.kickoff_time||null,round:Number(next.id),
-        at:Date.now(),source:PULSE_FIXTURE(joinId)
+        fixtureId:fixture.id??null,kickoff:fixture.kickoff_time||null,round:Number(target.id),
+        at:Date.parse(fetchedAt||'')||Date.now(),source:PULSE_FIXTURE(pulseId)
       });
       return {
-        status:'ok',events,sources:[PULSE_FIXTURE(joinId)],errors:[],unmatched:[],
+        status:'ok',events,sources:[PULSE_FIXTURE(pulseId)],errors:[],unmatched:[],
         diagnostics:{
           availabilityEvents:0,lineupEvents:events.length,requestCount,
-          gameweek:Number(next.id),pulseId:joinId,joinSource,rosterMatches:matched,
-          starters:events.filter(e=>e.type==='confirmed_start').length,
-          benched:events.filter(e=>e.type==='confirmed_bench').length
+          gameweek:Number(target.id),fplFixtureId:Number(fixture.id),pulseId,
+          pulseSeasonId:pulseRound.seasonId,pulseGameweekId:pulseRound.gameweekId,
+          joinSource:'pulse-season-gameweek-teams-kickoff',rosterMatches:matched,
+          starters:events.filter(e=>e.type==='observed_role').length,
+          benched:events.filter(e=>e.type==='observed_bench').length
         }
       };
     }
@@ -2256,20 +2441,48 @@ async function runStructuredProviders(context,adapters=STRUCTURED_PROVIDER_ADAPT
     diagnostics:{
       providers,
       availabilityEvents:events.filter(event=>event.evidenceClass==='availability').length,
-      lineupEvents:events.filter(event=>event.evidenceClass==='lineup').length,
-      // Selection evidence lands in two channels: repeated observations sit in
-      // 'selection' and a single most-recent benching sits in 'manager', so
-      // counting one channel alone would under-report the feed's real yield.
-      selectionEvents:events.filter(event=>['selection','manager'].includes(event.evidenceClass)).length,
+      lineupEvents:events.filter(event=>event.provider==='pl-announced-xi').length,
+      selectionEvents:events.filter(event=>event.evidenceClass==='selection').length,
       requestCount:results.reduce((sum,result)=>sum+Number(result.diagnostics?.requestCount||0),0)
     }
   };
 }
 
-async function structuredFeedForTeam(env,team,players,{profile='foreground',force=false}={}){
+function carryForwardFailedStructuredProviders(result,previous,now=Date.now()){
+  if(result?.status!=='partial')return result;
+  const failedProviders=new Set((result.providers||[]).filter(p=>p.status==='error').map(p=>p.id));
+  if(!failedProviders.size)return result;
+  const carried=(previous?.events||[]).filter(event=>{
+    const expiry=Date.parse(event?.expiresAt||'');
+    return failedProviders.has(event?.provider)&&(!Number.isFinite(expiry)||expiry>now);
+  });
+  if(!carried.length)return result;
+  const events=mergeRoleEvidence([...carried,...result.events]);
+  return {
+    ...result,events,sources:[...new Set([...(previous?.sources||[]),...(result.sources||[])])],
+    diagnostics:{
+      ...(result.diagnostics||{}),
+      availabilityEvents:events.filter(event=>event.evidenceClass==='availability').length,
+      lineupEvents:events.filter(event=>event.provider==='pl-announced-xi').length,
+      selectionEvents:events.filter(event=>event.evidenceClass==='selection').length,
+      carriedForwardEvents:carried.length,carriedForwardProviders:[...failedProviders]
+    }
+  };
+}
+
+async function structuredFeedForTeam(env,team,players,{profile='foreground',force=false,bootstrap=null}={}){
   const fetchedAt=new Date().toISOString();
-  const result=await runStructuredProviders({env,team,players,profile,force,fetchedAt});
-  // A provider outage must never overwrite the last valid normalized feed.
+  let result=await runStructuredProviders({env,team,players,profile,force,fetchedAt,bootstrap});
+  // Carry only the failed provider's still-valid lane. A transient Pulse/FPL
+  // outage must not erase a team sheet or prior match observation merely
+  // because another provider returned successfully in the same refresh.
+  if(result.status==='partial'){
+    try{
+      const previous=await env.ROLE_KV.get(structuredFeedCacheKey(team),'json');
+      result=carryForwardFailedStructuredProviders(result,previous);
+    }catch{}
+  }
+  // A total provider outage never overwrites the last valid normalized feed.
   if(result.status!=='error'){
     try{await env.ROLE_KV.put(structuredFeedCacheKey(team),JSON.stringify(result),{expirationTtl:STRUCTURED_FEED_CACHE_TTL})}catch{}
   }
@@ -2293,6 +2506,67 @@ async function cachedStructuredFeedForTeam(env,team){
     ...cached,status:'cached',events,cache:'HIT',ageMinutes:ageMinutes===null?null:Math.round(ageMinutes),
     diagnostics:{...(cached.diagnostics||{}),cache:'HIT',ageMinutes:ageMinutes===null?null:Math.round(ageMinutes)}
   };
+}
+
+const STRUCTURED_REFRESH_INFLIGHT=new Map();
+
+/** Cache-first on reads, with a bounded refresh only when the small structured
+ *  cache is missing or stale. This never invokes article discovery, Browser
+ *  Run or Workers AI. It lets a newly deployed cache generation populate on
+ *  the first Engine request instead of waiting for the next cron boundary. */
+async function currentStructuredFeedForTeam(env,team){
+  const cached=await cachedStructuredFeedForTeam(env,team);
+  const shouldRefresh=String(env.STRUCTURED_FEED_DISABLED||'')!=='1'
+    &&(cached.status==='cache-miss'||cached.ageMinutes===null||cached.ageMinutes>=STRUCTURED_READ_REFRESH_MINUTES);
+  if(!shouldRefresh)return cached;
+  if(STRUCTURED_REFRESH_INFLIGHT.has(team))return STRUCTURED_REFRESH_INFLIGHT.get(team);
+  const pending=(async()=>{
+    try{
+      const bootstrap=await getBootstrap();
+      const teamRow=(bootstrap?.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
+      if(!teamRow)throw new Error(`Club ${team} is not present in the current FPL bootstrap.`);
+      const refreshed=await structuredFeedForTeam(env,team,fplPlayersForTeam(bootstrap,teamRow),{
+        profile:'foreground',bootstrap
+      });
+      return refreshed.status==='error'&&cached.status!=='cache-miss'
+        ? {...cached,refreshError:(refreshed.errors||[]).join(' | ')||'structured refresh failed'}
+        : refreshed;
+    }catch(error){
+      return cached.status==='cache-miss'
+        ? {...cached,status:'error',errors:[error?.message||String(error)]}
+        : {...cached,refreshError:error?.message||String(error)};
+    }finally{STRUCTURED_REFRESH_INFLIGHT.delete(team)}
+  })();
+  STRUCTURED_REFRESH_INFLIGHT.set(team,pending);
+  return pending;
+}
+
+async function sweepStructuredFeeds(env){
+  const started=Date.now(),at=new Date().toISOString();
+  if(String(env.STRUCTURED_FEED_DISABLED||'')==='1')return {status:'disabled',at,teams:0,elapsedMs:0};
+  const bootstrap=await getBootstrap();
+  const teams=Object.keys(CLUB_SOURCES),rows=[];
+  for(let offset=0;offset<teams.length;offset+=STRUCTURED_SWEEP_BATCH_SIZE){
+    const batch=teams.slice(offset,offset+STRUCTURED_SWEEP_BATCH_SIZE);
+    rows.push(...await Promise.all(batch.map(async team=>{
+      try{
+        const teamRow=(bootstrap?.teams||[]).find(t=>teamCodeFromFplTeam(t)===team);
+        if(!teamRow)throw new Error('club not in FPL bootstrap');
+        const result=await structuredFeedForTeam(env,team,fplPlayersForTeam(bootstrap,teamRow),{
+          profile:'scheduled',bootstrap
+        });
+        return {team,status:result.status,events:(result.events||[]).length,errors:(result.errors||[]).slice(0,3)};
+      }catch(error){return {team,status:'error',events:0,errors:[error?.message||String(error)]}}
+    })));
+  }
+  const failures=rows.filter(row=>row.status==='error');
+  const result={
+    status:failures.length===rows.length?'error':(failures.length?'partial':'ok'),at,
+    teams:rows.length,failures:failures.length,events:rows.reduce((sum,row)=>sum+row.events,0),
+    elapsedMs:Date.now()-started,results:rows
+  };
+  await env.ROLE_KV.put('structured-sweep:lastrun',JSON.stringify(result),{expirationTtl:604800});
+  return result;
 }
 /* ------------------------------------------------------------- extraction */
 
@@ -3047,7 +3321,7 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
     }
   }
 
-  if(structuredEvents.length)evidenceNote+=` The structured feed contributed ${structuredEvents.length} direct event(s); no tactical role or beneficiary was inferred.`;
+  if(structuredEvents.length)evidenceNote+=` The structured feed contributed ${structuredEvents.length} official event(s); no tactical role or beneficiary was inferred.`;
 
   try{await saveDiscoveryLedger(env,team,[...priorProcessed,...processedThisScan])}catch{}
 
@@ -3143,7 +3417,6 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
       structuredFeedUnmatched:(structuredFeed.unmatched||[]).slice(0,40),
       structuredFeed:structuredFeed.diagnostics||{},
       aiStatus:aiResult.status,
-      aiElapsedMs:aiResult.elapsedMs,
       aiError:aiResult.error||null,
       rawCompetitionEvents:Array.isArray(raw)?raw.filter(e=>['signing','departure','loan_in','loan_out','injury','return'].includes(e?.type)).length:0,
       acceptedCompetitionEvents:modelEvents.filter(e=>['signing','departure','injury','return'].includes(e?.type)).length,
@@ -3249,16 +3522,41 @@ async function scanTeam(env,team,{force=false,profile='foreground'}={}){
  */
 async function withCurrentClubEvents(env,team,report){
   if(!report)return report;
-  const [clubEvents,directEvents]=await Promise.all([
+  const [clubEvents,directEvents,structuredFeed]=await Promise.all([
     loadClubEventLedger(env,team).catch(()=>null),
-    loadDepartureEvidence(env,team).catch(()=>null)
+    loadDepartureEvidence(env,team).catch(()=>null),
+    currentStructuredFeedForTeam(env,team).catch(()=>null)
   ]);
   const next={...report};
   if(clubEvents!==null)next.clubEvents=clubEvents;
   const base=(Array.isArray(report.events)?report.events:[])
-    .filter(e=>!String(e?.originType||'').startsWith('confirmed_'))
+    // Structured facts have their own current cache. Keeping the frozen copy
+    // from latest:${team} would retain v2's unsafe direct-lineup event and
+    // would also hide a just-published team sheet until the next article scan.
+    .filter(e=>!e?.structuredFeed&&!String(e?.originType||'').startsWith('confirmed_'))
     .map(normalizeFriendlyEvidenceEvent);
-  next.events=directEvents!==null?mergeRoleEvidence([...base,...directEvents]):mergeRoleEvidence(base);
+  const currentStructured=Array.isArray(structuredFeed?.events)?structuredFeed.events:[];
+  next.events=mergeRoleEvidence([
+    ...base,...currentStructured,...(directEvents!==null?directEvents:[])
+  ]);
+  if(structuredFeed){
+    const nonStructuredErrors=(report.sourceErrors||[]).filter(error=>!String(error).startsWith('Structured feed:'));
+    next.sourceErrors=[
+      ...nonStructuredErrors,...(structuredFeed.errors||[]).map(error=>`Structured feed: ${error}`)
+    ].slice(0,10);
+    next.sourcesScanned=[...new Set([...(report.sourcesScanned||[]),...(structuredFeed.sources||[])])];
+    next.diagnostics={
+      ...(report.diagnostics||{}),structuredFeedStatus:structuredFeed.status,
+      structuredEvents:currentStructured.length,
+      structuredAvailabilityEvents:structuredFeed.diagnostics?.availabilityEvents||0,
+      structuredLineupEvents:structuredFeed.diagnostics?.lineupEvents||0,
+      structuredSelectionEvents:structuredFeed.diagnostics?.selectionEvents||0,
+      structuredProviders:structuredFeed.providers||[],
+      structuredFeedErrors:(structuredFeed.errors||[]).slice(0,10),
+      structuredFeedUnmatched:(structuredFeed.unmatched||[]).slice(0,40),
+      structuredFeed:structuredFeed.diagnostics||{}
+    };
+  }
   return next;
 }
 
@@ -4584,9 +4882,9 @@ export default {
         if(!adminAuthorised(request,env))return json({status:'error',error:'unauthorised'},401,env);
         return json({status:'ok',generatedAt:new Date().toISOString(),teams:await allLatest(env)},200,env);
       }
-      /* Bulk cached read so the engine can pull evidence for a whole squad in
-         one request. Cache only: never scans, never touches browser budget,
-         so it is safe to call on every client refresh. */
+      /* Bulk cache-first read so the engine can pull evidence for a whole squad
+         in one request. Missing/stale structured data may make one bounded
+         official-feed refresh; it never scans articles or touches Browser/AI. */
       if(u.pathname==='/api/scout/latest'){
         const requested=[...new Set(String(u.searchParams.get('teams')||'').split(',').map(x=>x.trim().toUpperCase()).filter(Boolean))];
         if(!requested.length)return json({status:'error',error:'teams is required'},400,env);
@@ -4731,12 +5029,32 @@ export default {
   },
   async scheduled(event,env,ctx){
     env = await withD1(env);
-    ctx.waitUntil((async()=>{try{const mr=await refreshMarketData(env);if(mr.status!=='fresh'&&mr.status!=='disabled')await env.ROLE_KV.put('market:lastrun',JSON.stringify({at:new Date().toISOString(),...mr}),{expirationTtl:604800})}catch(e){await env.ROLE_KV.put('market:error',JSON.stringify({at:new Date().toISOString(),error:e?.message||String(e)}),{expirationTtl:604800})}
-      try{await resolveCalibration(env,{limit:200})}catch{}const configured=Number(env.CRON_TEAMS_PER_RUN);
+    ctx.waitUntil((async()=>{
+      try{
+        const mr=await refreshMarketData(env);
+        if(mr.status!=='fresh'&&mr.status!=='disabled')await env.ROLE_KV.put('market:lastrun',JSON.stringify({at:new Date().toISOString(),...mr}),{expirationTtl:604800});
+      }catch(e){await env.ROLE_KV.put('market:error',JSON.stringify({at:new Date().toISOString(),error:e?.message||String(e)}),{expirationTtl:604800})}
+      // Lightweight official-data sweep across every club. Shared request
+      // memos collapse each round payload and fixture detail, and this path
+      // never invokes article discovery, Browser Run or Workers AI.
+      try{await sweepStructuredFeeds(env)}
+      catch(e){await env.ROLE_KV.put('structured-sweep:error',JSON.stringify({at:new Date().toISOString(),error:e?.message||String(e)}),{expirationTtl:604800})}
+      try{await resolveCalibration(env,{limit:200})}catch{}
+      const configured=Number(env.CRON_TEAMS_PER_RUN);
       // 0 must genuinely disable the sweep. The old expression was
       // Math.max(1,...Number(x)||1), so 0 became 1 and the documented
-      // escape hatch did nothing.
+      // escape hatch did nothing. It disables expensive article scans only;
+      // the bounded structured-data sweep above remains active.
       if(Number.isFinite(configured)&&configured<=0)return;
-      const teams=Object.keys(CLUB_SOURCES),key='cron:cursor',cursor=Number(await env.ROLE_KV.get(key)||0),count=Math.min(4,Math.max(1,Number.isFinite(configured)?configured:4));for(let i=0;i<count;i++){const team=teams[(cursor+i)%teams.length];try{await scanTeamGuarded(env,team,{profile:'scheduled'})}catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}}await env.ROLE_KV.put(key,String((cursor+count)%teams.length));})());
+      const teams=Object.keys(CLUB_SOURCES),key='cron:cursor';
+      const cursor=Number(await env.ROLE_KV.get(key)||0);
+      const count=Math.min(4,Math.max(1,Number.isFinite(configured)?configured:4));
+      for(let i=0;i<count;i++){
+        const team=teams[(cursor+i)%teams.length];
+        try{await scanTeamGuarded(env,team,{profile:'scheduled'})}
+        catch(e){await env.ROLE_KV.put(`error:${team}`,JSON.stringify({at:new Date().toISOString(),error:e.message}),{expirationTtl:86400})}
+      }
+      await env.ROLE_KV.put(key,String((cursor+count)%teams.length));
+    })());
   }
 };
