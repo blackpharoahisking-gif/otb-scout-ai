@@ -123,7 +123,7 @@ test('Pulse season and internal gameweek ids are resolved explicitly',()=>{
     {id:840,label:'English Premier League Season 2025/2026'},
     {id:841,label:'English Premier League Season 2026/2027'},
   ]};
-  const gameweeks={content:[{id:19761,gameweek:1},{id:19762,gameweek:2}]};
+  const gameweeks={compSeason:{id:841},gameweeks:[{id:19761,gameweek:1},{id:19762,gameweek:2}]};
   assert.equal(pulseSeasonForLabel(seasons,'2026/27').id,841);
   assert.equal(pulseGameweekForRound(gameweeks,1).id,19761);
 });
@@ -294,7 +294,7 @@ test('announced-XI adapter resolves Everton via the active Pulse gameweek',async
     if(String(url).includes('/competitions/1/compseasons'))return response({content:[
       {id:841,label:'English Premier League Season 2026/2027'}
     ]});
-    if(String(url).includes('/compseasons/841/gameweeks'))return response({content:[
+    if(String(url).includes('/compseasons/841/gameweeks'))return response({compSeason:{id:841},gameweeks:[
       {id:19761,gameweek:1}
     ]});
     if(String(url).includes('/football/fixtures?'))return response({content:[

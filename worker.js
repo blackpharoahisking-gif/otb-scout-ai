@@ -1,4 +1,5 @@
 // OTB Role Intelligence + Fresh Squad Review Worker
+// v2.38.1 — RC5.0.42 Pulse gameweek envelope support
 // v2.38.0 — RC5.0.41 active-gameweek announced-XI resolution and structured sweep
 // v2.25.3 — RC5.0.26 conservative evidence-quality hardening
 // v2.25.1 — RC5.0.24 key-only Fresh Review authentication
@@ -40,7 +41,7 @@ const SCHEMA_VERSION = '1.37.0';
 // Single source of truth. This string was previously duplicated in the report
 // payload and the /api/health response, which is exactly how a deployment
 // smoke test ends up verifying one build while the other reports another.
-const WORKER_BUILD = 'v2.38.0-rc5.0.41-live-lineup-sweep';
+const WORKER_BUILD = 'v2.38.1-rc5.0.42-pulse-gameweek-shape';
 // Public verification key for Marcus's signed Fresh Review owner capability.
 // This is intentionally public: the Ed25519 private signing key and issued
 // bearer capability never enter Worker configuration, Git history or HTML.
@@ -1906,20 +1907,19 @@ async function loadDepartureEvidence(env,team){
    prototyped but are not production adapters because their published terms
    prohibit automated extraction. A licensed adapter can be added to the
    registry below without changing normalization or scan/carry-forward logic. */
-const STRUCTURED_FEED_VERSION='provider-neutral-v2';
+const STRUCTURED_FEED_VERSION='provider-neutral-v2.1';
 const STRUCTURED_FEED_CACHE_TTL=60*60*24*14;
 const STRUCTURED_READ_REFRESH_MINUTES=20;
 const STRUCTURED_SWEEP_BATCH_SIZE=4;
 const STRUCTURED_PROVIDER_CATALOG=Object.freeze([
   Object.freeze({id:'fpl-bootstrap',version:'bootstrap-static-v1',capabilities:['availability'],authority:'official-current-state'}),
   Object.freeze({id:'fpl-live-starts',version:'event-live-v1',capabilities:['selection'],authority:'official-match-record'}),
-  Object.freeze({id:'pl-announced-xi',version:'pulse-teamlists-v2',capabilities:['lineup'],authority:'official-team-sheet'})
+  Object.freeze({id:'pl-announced-xi',version:'pulse-teamlists-v3',capabilities:['lineup'],authority:'official-team-sheet'})
 ]);
 
-/* v3 deliberately invalidates the v2 cache: v2 could contain a completed
-   match's announced XI as a direct confirmed_start/confirmed_bench override,
-   which would pin the following gameweek instead of informing it. */
-function structuredFeedCacheKey(team){return 'structured-feed:v3:'+team}
+/* v4 invalidates both unsafe v2 direct-lineup rows and the short-lived v3
+   payloads produced before Pulse's {gameweeks:[...]} envelope was handled. */
+function structuredFeedCacheKey(team){return 'structured-feed:v4:'+team}
 
 function fplAvailabilityFact(player){
   const status=String(player?.status||'').toLowerCase();
@@ -2030,7 +2030,9 @@ async function getEventFixtures(round,fetchFn=fetch){
 
 function pulseRows(payload){
   if(Array.isArray(payload))return payload;
-  if(Array.isArray(payload?.content))return payload.content;
+  for(const key of ['content','gameweeks','fixtures','compSeasons']){
+    if(Array.isArray(payload?.[key]))return payload[key];
+  }
   return [];
 }
 
@@ -2328,7 +2330,7 @@ const STRUCTURED_PROVIDER_ADAPTERS=Object.freeze([
     }
   }),
   Object.freeze({
-    id:'pl-announced-xi',version:'pulse-teamlists-v2',capabilities:['lineup'],
+    id:'pl-announced-xi',version:'pulse-teamlists-v3',capabilities:['lineup'],
     enabled:env=>String(env.STRUCTURED_FEED_DISABLED||'')!=='1'&&String(env.ANNOUNCED_XI_DISABLED||'')!=='1',
     async collect({env,team,players,bootstrap:providedBootstrap,fetchedAt,fetchFn=fetch}){
       const empty=(reason,extra={})=>({
