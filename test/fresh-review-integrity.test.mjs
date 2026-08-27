@@ -18,6 +18,13 @@ test('high-start positive evidence is confirmation, not opportunity',()=>{
   assert.equal(fixed.status,'GREEN');
 });
 
+test('70%+ positive evidence is agreement, including captain confirmation',()=>{
+  const bruno=player({name:'B.Fernandes',pStart:.82,xMins:75,rationale:'Tier 1 official evidence supports OTB assumption.'});
+  const fixed=repairFreshPlayerReview(bruno);
+  assert.equal(fixed.classification,'AGREE');
+  assert.equal(fixed.status,'GREEN');
+});
+
 test('low-start authoritative positive evidence is strong upgrade',()=>{
   const kinsky=player({name:'Kinsky',pStart:.41,xMins:37,classification:'UPGRADE',status:'OPPORTUNITY',rationale:"Tier 1 evidence contradicts OTB's 41% start band."});
   const fixed=repairFreshPlayerReview(kinsky);
@@ -30,15 +37,17 @@ test('review summary promotes the real disagreement and removes confirmations fr
   const bruno=player({name:'B.Fernandes',pStart:.82,xMins:75,rationale:'Tier 1 official evidence supports OTB assumption.'});
   const kinsky=player({name:'Kinsky',pStart:.41,xMins:37,classification:'UPGRADE',status:'OPPORTUNITY',rationale:"Tier 1 evidence contradicts OTB's 41% start band."});
   const fixed=repairFreshReview({activeChip:'NONE',playerReviews:[gabriel,bruno,kinsky]});
-  assert.equal(fixed.counts.OPPORTUNITY,2); // Bruno at 82% is still a material positive disagreement; Gabriel at 92% is confirmation.
+  assert.equal(fixed.counts.OPPORTUNITY,1);
+  assert.equal(fixed.counts.GREEN,2);
   assert.equal(fixed.playerReviews.find(r=>r.name==='Gabriel').status,'GREEN');
-  assert.match(fixed.summary.positiveDisagreement,/Kinsky|B\.Fernandes/);
-  assert.doesNotMatch(fixed.summary.positiveDisagreement,/Gabriel/);
+  assert.equal(fixed.playerReviews.find(r=>r.name==='B.Fernandes').status,'GREEN');
+  assert.match(fixed.summary.positiveDisagreement,/Kinsky/);
+  assert.doesNotMatch(fixed.summary.positiveDisagreement,/Gabriel|B\.Fernandes/);
 });
 
 test('negative evidence agreeing with an already-low start band is not called a downgrade',()=>{
   const neg={id:'n1',signal:'negative',weight:.9,authorityTier:1,decisionEligible:true,decisionRelevant:true,hierarchyInference:false};
   const row=player({name:'Rotation risk',pStart:.40,xMins:35,evidence:[neg],classification:'DOWNGRADE',status:'AMBER',rationale:'Official evidence supports the low-start expectation.'});
   assert.equal(canonicalFreshClassification(row),'AGREE');
-  assert.equal(repairFreshPlayerReview(row).status,'AMBER'); // still actionable because OTB itself has a low scoring-player start band
+  assert.equal(repairFreshPlayerReview(row).status,'AMBER');
 });
