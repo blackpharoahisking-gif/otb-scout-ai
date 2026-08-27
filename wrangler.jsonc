@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "otb-role-intelligence",
-  "main": "./role-freshness-entry.js",
+  "main": "./integrity-entry.js",
   "compatibility_date": "2026-08-14",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
