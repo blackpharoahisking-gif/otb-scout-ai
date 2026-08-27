@@ -6,6 +6,8 @@ on:
     branches: [main]
     paths:
       - worker.js
+      - role-freshness-entry.js
+      - src/role-freshness-core.js
       - wrangler.jsonc
       - package.json
       - package-lock.json
@@ -49,6 +51,8 @@ jobs:
         shell: bash
         run: |
           node --check worker.js
+          node --check role-freshness-entry.js
+          node --check src/role-freshness-core.js
           node --test test/*.test.mjs
 
       - name: Deploy current Scout main
