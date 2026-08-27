@@ -12,7 +12,10 @@ function json(body,status=200,request=null,env={}){
   const origin=request?.headers?.get?.('origin')||'';
   const allowed=String(env.ALLOWED_ORIGIN||'https://blackpharoahisking-gif.github.io');
   const cors=!origin||origin===allowed?{'access-control-allow-origin':origin||'*'}:{};
-  return new Response(JSON.stringify(body),{status,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store','access-control-allow-methods':'GET, POST, OPTIONS','access-control-allow-headers':'content-type',...cors}});
+  const noBody=status===204||status===205||status===304;
+  const headers={'cache-control':'no-store','access-control-allow-methods':'GET, POST, OPTIONS','access-control-allow-headers':'content-type',...cors};
+  if(!noBody)headers['content-type']='application/json; charset=utf-8';
+  return new Response(noBody?null:JSON.stringify(body),{status,headers});
 }
 function originAllowed(request,env){const origin=String(request.headers.get('origin')||'');return !origin||origin===String(env.ALLOWED_ORIGIN||'https://blackpharoahisking-gif.github.io')}
 async function ensureStore(env){
@@ -93,7 +96,7 @@ async function publicStatus(env,ctx,teams){
 export default {
   async fetch(request,env,ctx){
     const url=new URL(request.url);
-    if(request.method==='OPTIONS'&&url.pathname.startsWith('/api/role-freshness'))return json({status:'ok'},204,request,env);
+    if(request.method==='OPTIONS'&&url.pathname.startsWith('/api/role-freshness'))return json(null,204,request,env);
     if(url.pathname==='/api/role-freshness/status'){
       if(!originAllowed(request,env))return json({status:'error',error:'origin not allowed'},403,request,env);
       return json(await publicStatus(env,ctx,url.searchParams.get('teams')||''),200,request,env);
