@@ -7,7 +7,9 @@ on:
     paths:
       - worker.js
       - role-freshness-entry.js
+      - integrity-entry.js
       - src/role-freshness-core.js
+      - src/fresh-review-integrity.js
       - wrangler.jsonc
       - package.json
       - package-lock.json
@@ -52,7 +54,9 @@ jobs:
         run: |
           node --check worker.js
           node --check role-freshness-entry.js
+          node --check integrity-entry.js
           node --check src/role-freshness-core.js
+          node --check src/fresh-review-integrity.js
           node --test test/*.test.mjs
 
       - name: Deploy current Scout main
@@ -67,9 +71,10 @@ jobs:
         run: |
           EXPECTED_BUILD="$(sed -n "s/^const WORKER_BUILD = '\([^']*\)';/\1/p" worker.js)"
           EXPECTED_SCHEMA="$(sed -n "s/^const SCHEMA_VERSION = '\([^']*\)';/\1/p" worker.js)"
+          EXPECTED_INTEGRITY="fresh-review-decision-integrity-v1"
           test -n "$EXPECTED_BUILD"
           test -n "$EXPECTED_SCHEMA"
-          export EXPECTED_BUILD EXPECTED_SCHEMA
+          export EXPECTED_BUILD EXPECTED_SCHEMA EXPECTED_INTEGRITY
           for attempt in {1..12}; do
             if health_json="$(curl --fail --silent --show-error "$HEALTH_URL")"; then
               if HEALTH_JSON="$health_json" node -e '
@@ -80,6 +85,7 @@ jobs:
                   && health.structuredFeedAvailable === true
                   && health.freshReviewAvailable === true
                   && health.freshReviewVersion === "1.2.0"
+                  && health.freshReviewDecisionIntegrity === process.env.EXPECTED_INTEGRITY
                   && health.freshReviewAuthConfigured === true
                   && health.freshReviewAuthMode === "key-only"
                   && health.freshReviewAccessConfigured === false
@@ -87,14 +93,14 @@ jobs:
                   && health.freshReviewBackgroundMode === "cloudflare-workflow"
                   && !("apiFootballAvailable" in health);
                 if (!valid) process.exit(1);
-                console.log(`Verified ${health.workerBuild}, schema ${health.schemaVersion}`);
+                console.log(`Verified ${health.workerBuild}, schema ${health.schemaVersion}, ${health.freshReviewDecisionIntegrity}`);
               '; then
                 exit 0
               fi
             fi
             sleep 5
           done
-          echo "Scout health did not report the expected build after deployment." >&2
+          echo "Scout health did not report the expected build/integrity layer after deployment." >&2
           exit 1
 
       - name: Confirm live Fresh Review endpoint is owner-protected
