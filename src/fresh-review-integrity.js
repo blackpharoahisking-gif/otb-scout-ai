@@ -22,7 +22,10 @@ export function canonicalFreshClassification(review){
     return pStart<=0.45?'AGREE':'DOWNGRADE';
   }
   if(pStart<=0.55&&positive>=0.7)return 'STRONG UPGRADE';
-  return pStart>=0.86?'AGREE':'UPGRADE';
+  /* OTB already treats 70% as the scoring-player start-security boundary.
+     Positive evidence above that boundary confirms the working assumption;
+     it is not a decision-changing upgrade. */
+  return pStart>=0.70?'AGREE':'UPGRADE';
 }
 
 export function canonicalFreshStatus(review,classification=canonicalFreshClassification(review),activeChip='NONE'){
