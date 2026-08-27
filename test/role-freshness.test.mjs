@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {normaliseTeams,reportTimestampMs,freshnessState,refreshBudget,selectRefreshTeams,priorityScore} from '../src/role-freshness-core.js';
+
+const entry=fs.readFileSync(new URL('../role-freshness-entry.js',import.meta.url),'utf8');
 
 test('normaliseTeams keeps only supported clubs and de-duplicates',()=>{
   assert.deepEqual(normaliseTeams(['ars','AVL','ARS','xxx','  che ']),['ARS','AVL','CHE']);
@@ -44,4 +47,10 @@ test('planner priority can promote a team ahead of ordinary age',()=>{
     {team:'LIV',ageMinutes:50,priority:9,requestedAt:1,scanEligible:true},
   ];
   assert.equal(selectRefreshTeams(rows,{budget:1,now:1000000})[0],'LIV');
+});
+
+test('CORS preflight is a bodyless 204 response',()=>{
+  assert.match(entry,/const noBody=status===204\|\|status===205\|\|status===304/);
+  assert.match(entry,/new Response\(noBody\?null:JSON\.stringify\(body\)/);
+  assert.match(entry,/return json\(null,204,request,env\)/);
 });
