@@ -1,0 +1,124 @@
+name: Provision Belief Capture R2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/deploy-belief-capture.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: provision-belief-capture-production
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    name: Provision and verify Belief Capture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      BELIEF_BUCKET: otb-irrecoverable
+      BELIEF_WORKER: otb-belief-capture
+      BELIEF_HEALTH: https://otb-belief-capture.blackpharoahisking.workers.dev/api/belief-capture/v0/health
+
+    steps:
+      - name: Check out infrastructure controller
+        uses: actions/checkout@v4
+
+      - name: Check out canonical Belief Capture source
+        uses: actions/checkout@v4
+        with:
+          repository: blackpharoahisking-gif/Fpl-engine-api
+          ref: main
+          path: engine
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Confirm Cloudflare credentials are configured
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+
+      - name: Verify canonical writer source
+        shell: bash
+        run: |
+          test -f engine/belief-capture-worker.js
+          node --check engine/belief-capture-worker.js
+          grep -q "OTB_IRRECOVERABLE" engine/belief-capture-worker.js
+          grep -q "Verification is descriptive, never a veto" engine/belief-capture-worker.js
+
+      - name: Ensure irrecoverable R2 bucket exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npx --yes wrangler@4.120.1 r2 bucket list 2>&1 | grep -Fq "$BELIEF_BUCKET"; then
+            echo "R2 bucket $BELIEF_BUCKET already exists."
+          else
+            npx --yes wrangler@4.120.1 r2 bucket create "$BELIEF_BUCKET"
+          fi
+
+      - name: Build isolated writer config
+        shell: bash
+        working-directory: engine
+        run: |
+          cat > belief-capture.wrangler.jsonc <<EOF
+          {
+            "$schema": "./node_modules/wrangler/config-schema.json",
+            "name": "$BELIEF_WORKER",
+            "main": "./belief-capture-worker.js",
+            "compatibility_date": "2026-08-28",
+            "vars": {
+              "BELIEF_CAPTURE_ORIGINS": "https://blackpharoahisking-gif.github.io"
+            },
+            "r2_buckets": [
+              {
+                "binding": "OTB_IRRECOVERABLE",
+                "bucket_name": "$BELIEF_BUCKET"
+              }
+            ],
+            "observability": { "enabled": true, "head_sampling_rate": 1 }
+          }
+          EOF
+
+      - name: Deploy Belief Capture writer
+        shell: bash
+        working-directory: engine
+        run: >-
+          npx --yes wrangler@4.120.1 deploy
+          --config belief-capture.wrangler.jsonc
+          --name "$BELIEF_WORKER"
+          --message "Belief Capture provisioning via ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+
+      - name: Verify live R2 binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            if health_json="$(curl --fail --silent --show-error "$BELIEF_HEALTH")"; then
+              if HEALTH_JSON="$health_json" node -e '
+                const health=JSON.parse(process.env.HEALTH_JSON);
+                if(health.status!=="ok" || health.schema!=="otb-belief-event-v0" || health.r2!==true) process.exit(1);
+                console.log(`Belief Capture live: ${health.schema}; R2 binding=${health.r2}; authRequired=${health.authRequired}`);
+              '; then
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+          echo "Belief Capture health did not confirm the R2 binding." >&2
+          exit 1
+
+      - name: Verify bucket remains addressable
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@4.120.1 r2 bucket list 2>&1 | grep -F "$BELIEF_BUCKET"
