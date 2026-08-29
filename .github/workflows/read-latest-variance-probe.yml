@@ -1,0 +1,99 @@
+name: Read latest variance probe
+
+on:
+  push:
+    branches: [codex/read-latest-variance-probe]
+    paths:
+      - .github/workflows/read-latest-variance-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_R2_API_TOKEN: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
+      BELIEF_BUCKET: otb-irrecoverable
+    steps:
+      - name: Read latest frozen variance probe from R2
+        shell: python
+        run: |
+          import json, os, urllib.parse, urllib.request
+
+          account=os.environ['CLOUDFLARE_ACCOUNT_ID']
+          token=os.environ['CLOUDFLARE_R2_API_TOKEN']
+          bucket=os.environ['BELIEF_BUCKET']
+          base=f'https://api.cloudflare.com/client/v4/accounts/{account}/r2/buckets/{bucket}/objects'
+          headers={'Authorization':f'Bearer {token}','Accept':'application/json'}
+
+          def get_json(url):
+              req=urllib.request.Request(url,headers=headers)
+              with urllib.request.urlopen(req,timeout=30) as r:
+                  return json.loads(r.read().decode())
+
+          def get_object(key):
+              # Cloudflare requires slashes in the object key to remain literal.
+              safe=urllib.parse.quote(key,safe='/')
+              req=urllib.request.Request(f'{base}/{safe}',headers=headers)
+              with urllib.request.urlopen(req,timeout=30) as r:
+                  return json.loads(r.read().decode())
+
+          listing=get_json(base+'?'+urllib.parse.urlencode({'per_page':1000,'prefix':'belief/events/'}))
+          objects=listing.get('result') or []
+          variance=[o for o in objects if '/variance-' in str(o.get('key','')) or '-variance-' in str(o.get('key',''))]
+          variance.sort(key=lambda o:str(o.get('last_modified') or ''),reverse=True)
+
+          print('TOTAL_BELIEF_EVENTS='+str(len(objects)))
+          print('VARIANCE_EVENTS_FOUND='+str(len(variance)))
+          if not variance:
+              latest=sorted(objects,key=lambda o:str(o.get('last_modified') or ''),reverse=True)[:3]
+              print('LATEST_EVENT_METADATA='+json.dumps([{'key':x.get('key'),'last_modified':x.get('last_modified')} for x in latest],separators=(',',':')))
+              raise SystemExit('No archived variance probe event found')
+
+          latest=variance[0]
+          event=get_object(latest['key'])
+          snapshot=event.get('snapshot')
+          snapshot_ref=event.get('snapshotRef')
+          if snapshot is None and snapshot_ref:
+              snapshot=get_object(snapshot_ref)
+          if not isinstance(snapshot,dict):
+              raise SystemExit('Latest variance event has no readable snapshot')
+
+          report=snapshot.get('variancePropagation')
+          if not isinstance(report,dict):
+              raise SystemExit('Snapshot does not contain variancePropagation report')
+
+          baseline=report.get('baseline') or {}
+          post=report.get('post') or {}
+          summary={
+              'eventKey':latest.get('key'),
+              'eventLastModified':latest.get('last_modified'),
+              'capturedAt':report.get('capturedAt'),
+              'version':report.get('version'),
+              'gw':(report.get('input') or {}).get('gw'),
+              'risk':(report.get('input') or {}).get('risk'),
+              'inputHash':report.get('inputHash'),
+              'movement':report.get('movement'),
+              'baseline':{
+                  'core':baseline.get('core'),
+                  'planner':baseline.get('planner'),
+                  'verdict':{'xiSd':(baseline.get('verdict') or {}).get('xiSd')},
+                  'horizon':baseline.get('horizon'),
+                  'discovery':baseline.get('discovery'),
+                  'schedule':baseline.get('schedule'),
+              },
+              'post':{
+                  'core':post.get('core'),
+                  'planner':post.get('planner'),
+                  'verdict':{'xiSd':(post.get('verdict') or {}).get('xiSd')},
+                  'horizon':post.get('horizon'),
+                  'discovery':post.get('discovery'),
+                  'schedule':post.get('schedule'),
+              },
+              'archiveVerification':event.get('verification'),
+          }
+          print('OTB_VARIANCE_PROBE_SUMMARY='+json.dumps(summary,separators=(',',':'),sort_keys=True))
