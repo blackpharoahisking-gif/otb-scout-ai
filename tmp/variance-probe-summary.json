@@ -1,0 +1,40 @@
+{
+  "capturedAt": "2026-08-29T10:23:06.781Z",
+  "gw": 2,
+  "risk": "mean",
+  "version": "variance-propagation-v1.1",
+  "inputHash": "b0ae0521",
+  "archiveVerification": {
+    "snapshotHash": true,
+    "snapshotStored": true,
+    "reproducible": true,
+    "writerVersion": "belief-writer-v0.1"
+  },
+  "movement": {
+    "coreSd": 1.1361522959612897,
+    "coreWidth80": 1.1361522959612895,
+    "plannerGwSd": 1.1361522959612897,
+    "verdictXiSd": 1.1351143259849474,
+    "horizonSd": 1.1167385486218993,
+    "discoverySd": 1.4533678039181654,
+    "scheduleRankDelta": -0.0000007403610498002422
+  },
+  "baseline": {
+    "coreSd": 3.0988460842455496,
+    "coreWidth80": 7.942962283138193,
+    "plannerGwSd": 3.0988460842455496,
+    "verdictXiSd": 8.873607695266667,
+    "horizonSd": 6.927515410928735,
+    "discoverySd": 5.322963316443467,
+    "scheduleRankScore": 7.1544076299713275
+  },
+  "post": {
+    "coreSd": 3.5207610934462332,
+    "coreWidth80": 9.024414834721386,
+    "plannerGwSd": 3.5207610934462332,
+    "verdictXiSd": 10.072559218067466,
+    "horizonSd": 7.736223505556396,
+    "discoverySd": 7.736223505556396,
+    "scheduleRankScore": 7.154406889610278
+  }
+}
